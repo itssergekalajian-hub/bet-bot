@@ -1,17 +1,23 @@
 """
-Telegram Pro Football Syndicate Curator, Pre-Match Deep Intelligence, Lifetime PnL Tracker
-& VIP Broadcast Publisher for @Footybett (@betyyyybot)
+Telegram Pro Football Syndicate Curator, Real-Time Live Score & Stats Engine (ESPN + API-Football),
+Strict Pre-Match Veto Model, Retroactive Channel Settlement & Total P&L Publisher for @Footybett (@betyyyybot)
 
-Strict @Footybett Channel Rules:
-1. One-Time Individual Pick Publishing:
-   - Only when a brand-new APPROVED (+EV) bet is confirmed (and is NOT already finished), it is sent ONCE as an individual, clean card to @Footybett.
-   - Permanently records the bet fingerprint in `published_channel_locks.json` so the same bet or list is NEVER sent again, even across restarts or rescans.
-2. One-Time Winner Celebration:
-   - Once a published bet on @Footybett settles as WON ✅, it sends a single celebration post to @Footybett and locks `win:<bet_key>` permanently.
-3. Historical Baseline Preservation (Starting 2026-11-08):
-   - Automatically seeds and preserves yesterday's (2026-11-08) 4 winning approved bets (+2.89u) and avoided traps in `daily_ledger.json` so `/stats` always reflects all results from 2026-11-08 onward.
-4. Deep Pre-Match Intelligence Engine (via API-Football):
-   - Injuries & Suspensions (`/injuries`), Confirmed Lineups & Formations (`/fixtures/lineups`), Standings & Match Stakes (`/standings`).
+Key Upgrades in v14.0:
+1. Automatic Channel Correction & Total Won/Lost Analysis on @Footybett:
+   - Automatically checks all past & current approved picks in `daily_ledger.json` (including yesterday's 2026-11-09 picks).
+   - Grades any match that was previously stuck on PENDING (such as yesterday's 3-2 loss) and posts the missing
+     settled result card (`📊❌ FOOTYBETT PICK RESULT — SETTLED LOSS` with score & loss analysis) ONCE to @Footybett.
+   - Automatically posts a comprehensive `📊 @Footybett OFFICIAL TOTAL WON/LOST & P&L ANALYSIS` summary card to @Footybett
+     whenever a day's picks finish settling (locked via `recap:<date>:<settled_count>` so it never repeats), and includes
+     a live running All-Time Record footer on every result card.
+   - Added `/poststats` command in @betyyyybot to publish the full Won/Lost & P&L Analysis card to @Footybett on demand.
+2. 3-Day Window + Fuzzy Team Matcher + ESPN Event Summary Stats (Corners & Cards):
+   - Searches `date - 1 day`, `date`, and `date + 1 day` simultaneously to eliminate timezone/midnight kickoff mismatches.
+   - Uses `difflib.SequenceMatcher` (>= 0.72 similarity) + club alias normalization so OCR typos never block live score matching.
+   - Pulls exact corners and yellow/red cards from ESPN's public Event Summary API (`/summary?event=<id>`) so Corners and
+     Bookings bets grade live and at FT with exact counts.
+3. Strict Pre-Match Veto Engine (Blocking 3-1 -> 3-2 Traps):
+   - Defensive Vulnerability Veto, High-Tempo Shootout Veto, Rotation Veto, and Unverified Market Veto.
 """
 
 import os
@@ -19,6 +25,8 @@ import re
 import math
 import time
 import json
+import difflib
+import unicodedata
 import logging
 import threading
 import datetime
@@ -48,11 +56,7 @@ DAILY_LEDGER_FILE = os.path.join(BASE_DIR, "daily_ledger.json")
 PUBLISHED_LOCKS_FILE = os.path.join(BASE_DIR, "published_channel_locks.json")
 
 API_FOOTBALL_KEY = os.environ.get("API_FOOTBALL_KEY", "")
-
-# Target Channel where individual APPROVED bets are published ONCE for players
 PUBLISH_CHANNEL_ID = os.environ.get("PUBLISH_CHANNEL_ID", "@Footybett")
-
-# Official tracking start date (Yesterday's 4-0 sweep)
 TRACKING_START_DATE = "2026-11-08"
 
 DEFAULT_CHANNELS = [
@@ -65,6 +69,86 @@ DEFAULT_CHANNELS = [
     "betfuse_official",
     "sportybet_codes"
 ]
+
+TEAM_ALIASES: Dict[str, str] = {
+    "psg": "paris saint germain",
+    "paris sg": "paris saint germain",
+    "man city": "manchester city",
+    "man utd": "manchester united",
+    "man united": "manchester united",
+    "spurs": "tottenham hotspur",
+    "tottenham": "tottenham hotspur",
+    "wolves": "wolverhampton wanderers",
+    "wolverhampton": "wolverhampton wanderers",
+    "atletico": "atletico madrid",
+    "atl madrid": "atletico madrid",
+    "athletic bilbao": "athletic club",
+    "barca": "barcelona",
+    "inter": "inter milan",
+    "internazionale": "inter milan",
+    "inter milano": "inter milan",
+    "bayern": "bayern munich",
+    "bayern munchen": "bayern munich",
+    "dortmund": "borussia dortmund",
+    "bvb": "borussia dortmund",
+    "leverkusen": "bayer leverkusen",
+    "gladbach": "borussia monchengladbach",
+    "m'gladbach": "borussia monchengladbach",
+    "newcastle": "newcastle united",
+    "west ham": "west ham united",
+    "brighton": "brighton hove albion",
+    "nottm forest": "nottingham forest",
+    "leicester": "leicester city",
+    "ipswich": "ipswich town",
+    "bournemouth": "afc bournemouth",
+    "psv": "psv eindhoven",
+    "sporting": "sporting cp",
+    "sporting lisbon": "sporting cp",
+    "fenerbahce": "fenerbahce",
+    "galatasaray": "galatasaray",
+    "besiktas": "besiktas",
+}
+
+
+def normalize_team_str(name: str) -> str:
+    if not name:
+        return ""
+    s = "".join(c for c in unicodedata.normalize("NFD", name) if unicodedata.category(c) != "Mn")
+    s = s.lower().strip()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(
+        r"\b(fc|cf|sc|ac|afc|sk|fk|sv|tsg|rb|ud|cd|rcd|real|club|de|del|la|el|1907|1913|1909|1899|04|05)\b",
+        " ",
+        s
+    )
+    s = re.sub(r"\s+", " ", s).strip()
+    for k, v in TEAM_ALIASES.items():
+        if s == k or f" {k} " in f" {s} ":
+            return v
+    return s
+
+
+def teams_match(name_a: str, name_b: str) -> bool:
+    na = normalize_team_str(name_a)
+    nb = normalize_team_str(name_b)
+    if not na or not nb:
+        return False
+    if na == nb or na in nb or nb in na:
+        return True
+    tokens_a = {t for t in na.split() if len(t) >= 4}
+    tokens_b = {t for t in nb.split() if len(t) >= 4}
+    if tokens_a and tokens_b and (tokens_a & tokens_b):
+        return True
+    ratio = difflib.SequenceMatcher(None, na, nb).ratio()
+    return ratio >= 0.72
+
+
+def shift_date_str(date_str: str, delta_days: int) -> str:
+    try:
+        dt = datetime.datetime.strptime(date_str, "%Y-%m-%d") + datetime.timedelta(days=delta_days)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return date_str
 
 
 def load_json_set(filepath: str, default: Optional[List[Any]] = None) -> Set[Any]:
@@ -115,10 +199,12 @@ class BetSignal:
     odds: float
     source_channel: str = ""
     is_virtual_srl: bool = False
+    post_date_str: str = ""
 
 
 @dataclass
 class PreMatchDossier:
+    fixture_found: bool = False
     competition: str = "Official Competition"
     venue: str = "Home Stadium"
     match_stakes: str = "Competitive Fixture"
@@ -128,9 +214,14 @@ class PreMatchDossier:
     lineup_summary: str = "Projected Starting XIs (Official 45m pre-kickoff)"
     home_missing_count: int = 0
     away_missing_count: int = 0
+    home_goals_for_avg: float = 1.45
+    home_goals_against_avg: float = 1.15
+    away_goals_for_avg: float = 1.25
+    away_goals_against_avg: float = 1.30
     home_xg_adj: float = 0.0
     away_xg_adj: float = 0.0
     corners_adj: float = 0.0
+    veto_reason: Optional[str] = None
 
 
 @dataclass
@@ -158,18 +249,26 @@ class LedgerBetItem:
     lineup_injuries_info: str = ""
     match_status: str = "PENDING"
     score_str: str = "-"
+    live_detail: str = ""
+    loss_autopsy: str = ""
     settlement: str = "PENDING"  # PENDING, WON ✅, LOST ❌, PUSH ➖
     notified_settled: bool = False
+    notified_admin_curate: bool = False
     published_to_channel: bool = False
     published_result_to_channel: bool = False
 
 
 class DailyLedgerManager:
-    """Manages Today's Active Slate, All-Time Historical Ledger (from 2026-11-08), and Permanent @Footybett Publish Locks."""
+    """Manages Active Slates, All-Time Historical Ledger (from 2026-11-08), and Permanent @Footybett Locks."""
 
     @classmethod
     def get_today_str(cls) -> str:
         return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+    @classmethod
+    def get_yesterday_str(cls) -> str:
+        y = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)
+        return y.strftime("%Y-%m-%d")
 
     @classmethod
     def is_locked_in_channel(cls, lock_key: str) -> bool:
@@ -183,17 +282,13 @@ class DailyLedgerManager:
         save_json_set(PUBLISHED_LOCKS_FILE, locks)
 
     @classmethod
-    def get_baseline_2026_11_08_items(cls) -> Dict[str, LedgerBetItem]:
-        """
-        Seeds the verified 2026-11-08 slate (4 Approved Wins + 10 Avoided Picks) so that
-        even if daily_ledger.json was reset during an upgrade, yesterday's 4 wins (+2.89u)
-        are permanently preserved in /stats and never re-posted to @Footybett.
-        """
-        d = "2026-11-08"
-        approved_wins = [
+    def get_baseline_historical_items(cls) -> Dict[str, LedgerBetItem]:
+        """Seeds the verified 2026-11-08 (4W-0L) slate so all-time stats always start accurately from 2026-11-08."""
+        d8 = "2026-11-08"
+        items_list = [
             LedgerBetItem(
                 bet_key="atletico madrid_vs_fc barcelona_goals_over_under_under 4.5 goals",
-                date_str=d,
+                date_str=d8,
                 team_home="Atletico Madrid",
                 team_away="FC Barcelona",
                 market_type="goals_over_under",
@@ -222,7 +317,7 @@ class DailyLedgerManager:
             ),
             LedgerBetItem(
                 bet_key="fc twente_vs_ajax_1x2_fc twente or draw (1x / safe line)",
-                date_str=d,
+                date_str=d8,
                 team_home="FC Twente",
                 team_away="Ajax",
                 market_type="1x2",
@@ -251,7 +346,7 @@ class DailyLedgerManager:
             ),
             LedgerBetItem(
                 bet_key="sunderland_vs_chelsea_1x2_sunderland or draw (1x / safe line)",
-                date_str=d,
+                date_str=d8,
                 team_home="Sunderland",
                 team_away="Chelsea",
                 market_type="1x2",
@@ -280,7 +375,7 @@ class DailyLedgerManager:
             ),
             LedgerBetItem(
                 bet_key="brighton_vs_brentford_1x2_brighton or draw (1x / safe line)",
-                date_str=d,
+                date_str=d8,
                 team_home="Brighton",
                 team_away="Brentford",
                 market_type="1x2",
@@ -307,12 +402,9 @@ class DailyLedgerManager:
                 published_to_channel=True,
                 published_result_to_channel=True
             ),
-        ]
-
-        avoided_traps = [
             LedgerBetItem(
                 bet_key="atletico madrid_vs_fc barcelona_corners_over_under_over 9.5 corners",
-                date_str=d,
+                date_str=d8,
                 team_home="Atletico Madrid",
                 team_away="FC Barcelona",
                 market_type="corners_over_under",
@@ -321,7 +413,7 @@ class DailyLedgerManager:
                 odds=1.70,
                 floor_odds=1.95,
                 is_approved=False,
-                confidence_stars="❌ AVOID",
+                confidence_stars="❌ DECLINED",
                 model_prob=51.2,
                 edge_ev=-13.0,
                 recommended_units=0.0,
@@ -339,7 +431,7 @@ class DailyLedgerManager:
             ),
             LedgerBetItem(
                 bet_key="crystal palace_vs_tsg hoffenheim_corners_over_under_over 9.5 corners",
-                date_str=d,
+                date_str=d8,
                 team_home="Crystal Palace",
                 team_away="TSG Hoffenheim",
                 market_type="corners_over_under",
@@ -348,13 +440,13 @@ class DailyLedgerManager:
                 odds=1.75,
                 floor_odds=2.00,
                 is_approved=False,
-                confidence_stars="❌ AVOID (VIRTUAL SRL)",
+                confidence_stars="❌ DECLINED (VIRTUAL SRL)",
                 model_prob=0.0,
                 edge_ev=-100.0,
                 recommended_units=0.0,
                 consensus_sources=["bomb_footballsignals"],
                 rationale="Simulated Reality League (SRL) virtual AI match detected. No real players or lineups exist.",
-                evidence="Unverified Cross-League Virtual Fixture — Automatically Blocked.",
+                evidence="Unverified Cross-League Virtual Fixture — Automatically Declined.",
                 rotation_warning=None,
                 search_url="",
                 match_status="FT",
@@ -366,7 +458,7 @@ class DailyLedgerManager:
             ),
             LedgerBetItem(
                 bet_key="sparta prague_vs_afc bournemouth_goals_over_under_over 2.5 goals",
-                date_str=d,
+                date_str=d8,
                 team_home="Sparta Prague",
                 team_away="AFC Bournemouth",
                 market_type="goals_over_under",
@@ -375,13 +467,13 @@ class DailyLedgerManager:
                 odds=1.55,
                 floor_odds=2.00,
                 is_approved=False,
-                confidence_stars="❌ AVOID (VIRTUAL SRL)",
+                confidence_stars="❌ DECLINED (VIRTUAL SRL)",
                 model_prob=0.0,
                 edge_ev=-100.0,
                 recommended_units=0.0,
                 consensus_sources=["bomb_footballsignals"],
                 rationale="Simulated Reality League (SRL) virtual AI match detected. No real players or lineups exist.",
-                evidence="Unverified Cross-League Virtual Fixture — Automatically Blocked.",
+                evidence="Unverified Cross-League Virtual Fixture — Automatically Declined.",
                 rotation_warning=None,
                 search_url="",
                 match_status="FT",
@@ -392,9 +484,8 @@ class DailyLedgerManager:
                 published_result_to_channel=True
             ),
         ]
-
         seeded: Dict[str, LedgerBetItem] = {}
-        for item in approved_wins + avoided_traps:
+        for item in items_list:
             full_key = f"{item.date_str}:{item.bet_key}"
             seeded[full_key] = item
         return seeded
@@ -414,31 +505,22 @@ class DailyLedgerManager:
                 full_key = f"{item.date_str}:{item.bet_key}"
                 if cls.is_locked_in_channel(f"pick:{full_key}"):
                     item.published_to_channel = True
-                if cls.is_locked_in_channel(f"win:{full_key}"):
+                if cls.is_locked_in_channel(f"result:{full_key}") or cls.is_locked_in_channel(f"win:{full_key}"):
                     item.published_result_to_channel = True
                 items[full_key] = item
             except Exception as e:
                 logger.warning("Skipping malformed ledger entry %s: %s", k, e)
 
-        # Ensure yesterday's (2026-11-08) 4 winning bets are always present in the historical ledger
-        baseline = cls.get_baseline_2026_11_08_items()
+        baseline = cls.get_baseline_historical_items()
         needs_save = False
         for b_key, b_item in baseline.items():
             if b_key not in items:
                 items[b_key] = b_item
                 cls.mark_locked_in_channel(f"pick:{b_key}")
+                cls.mark_locked_in_channel(f"result:{b_key}")
                 cls.mark_locked_in_channel(f"win:{b_key}")
+                cls.mark_locked_in_channel("recap:2026-11-08:4")
                 needs_save = True
-            else:
-                # Ensure the 4 baseline wins from 2026-11-08 are marked settled WON ✅
-                existing = items[b_key]
-                if b_item.is_approved and existing.settlement == "PENDING":
-                    existing.settlement = "WON ✅"
-                    existing.match_status = "FT"
-                    existing.score_str = b_item.score_str
-                    existing.published_to_channel = True
-                    existing.published_result_to_channel = True
-                    needs_save = True
 
         if needs_save:
             cls.save_all_items(items)
@@ -452,18 +534,26 @@ class DailyLedgerManager:
         return {k: v for k, v in all_items.items() if v.date_str == today}
 
     @classmethod
+    def load_recent_active_items(cls) -> Tuple[List[LedgerBetItem], List[LedgerBetItem]]:
+        all_items = cls.load_all_history_items()
+        today = cls.get_today_str()
+        yesterday = cls.get_yesterday_str()
+        t_list = [v for v in all_items.values() if v.date_str == today]
+        y_list = [v for v in all_items.values() if v.date_str == yesterday]
+        return t_list, y_list
+
+    @classmethod
     def save_all_items(cls, items: Dict[str, LedgerBetItem]):
         raw = {k: asdict(v) for k, v in items.items()}
         save_json_dict(DAILY_LEDGER_FILE, raw)
 
     @classmethod
     def upsert_bet(cls, item: LedgerBetItem) -> Tuple[bool, LedgerBetItem]:
-        """Returns (is_brand_new, stored_item)."""
         all_items = cls.load_all_history_items()
         full_key = f"{item.date_str}:{item.bet_key}"
         if cls.is_locked_in_channel(f"pick:{full_key}"):
             item.published_to_channel = True
-        if cls.is_locked_in_channel(f"win:{full_key}"):
+        if cls.is_locked_in_channel(f"result:{full_key}") or cls.is_locked_in_channel(f"win:{full_key}"):
             item.published_result_to_channel = True
 
         if full_key in all_items:
@@ -483,6 +573,133 @@ class DailyLedgerManager:
 
 class LiveFootballAPI:
     BASE_URL = "https://v3.football.api-sports.io"
+    ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/all/scoreboard"
+    ESPN_SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/all/summary"
+
+    @classmethod
+    def fetch_espn_event_stats(cls, event_id: str) -> Tuple[Optional[int], Optional[int]]:
+        """
+        Fetches exact total corners and total bookings (yellow + red cards) for a specific ESPN event_id.
+        Zero API quota limit.
+        """
+        if not event_id:
+            return None, None
+        url = f"{cls.ESPN_SUMMARY_URL}?event={event_id}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        corners_total = None
+        cards_total = None
+        try:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                box = data.get("boxscore", {})
+                teams = box.get("teams", [])
+                c_sum, y_sum = 0, 0
+                found_c, found_y = False, False
+                for t in teams:
+                    for st in t.get("statistics", []):
+                        s_name = st.get("name", "").lower()
+                        val_str = st.get("displayValue", "0")
+                        if "corner" in s_name:
+                            try:
+                                c_sum += int(float(val_str))
+                                found_c = True
+                            except Exception:
+                                pass
+                        elif "yellowcard" in s_name or "redcard" in s_name:
+                            try:
+                                y_sum += int(float(val_str))
+                                found_y = True
+                            except Exception:
+                                pass
+                if found_c:
+                    corners_total = c_sum
+                if found_y:
+                    cards_total = y_sum
+        except Exception:
+            pass
+        return corners_total, cards_total
+
+    @classmethod
+    def fetch_espn_fixtures_by_date(cls, date_str: str) -> List[Dict[str, Any]]:
+        espn_date = date_str.replace("-", "")
+        url = f"{cls.ESPN_SCOREBOARD_URL}?dates={espn_date}&limit=300"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        results = []
+        try:
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                events = data.get("events", [])
+                for ev in events:
+                    ev_id = str(ev.get("id", ""))
+                    comps = ev.get("competitions", [])
+                    if not comps:
+                        continue
+                    comp = comps[0]
+                    competitors = comp.get("competitors", [])
+                    if len(competitors) < 2:
+                        continue
+
+                    home_c = next((c for c in competitors if c.get("homeAway") == "home"), competitors[0])
+                    away_c = next((c for c in competitors if c.get("homeAway") == "away"), competitors[1])
+
+                    h_name = home_c.get("team", {}).get("displayName") or home_c.get("team", {}).get("name", "")
+                    a_name = away_c.get("team", {}).get("displayName") or away_c.get("team", {}).get("name", "")
+                    h_score = int(home_c.get("score") or 0)
+                    a_score = int(away_c.get("score") or 0)
+                    h_form = home_c.get("form") or ""
+                    a_form = away_c.get("form") or ""
+
+                    status_obj = comp.get("status", {}) or ev.get("status", {})
+                    st_type = status_obj.get("type", {})
+                    state = st_type.get("state", "pre")
+                    short_detail = st_type.get("shortDetail") or status_obj.get("displayClock") or "NS"
+                    completed = bool(st_type.get("completed", False))
+
+                    if completed or state == "post":
+                        status_code = "FT"
+                    elif state == "in":
+                        status_code = f"LIVE {short_detail}"
+                    else:
+                        status_code = "NS"
+
+                    corners_total = None
+                    cards_total = None
+                    for c_obj in (home_c, away_c):
+                        for st in c_obj.get("statistics", []):
+                            nm = st.get("name", "").lower()
+                            if "corner" in nm:
+                                try:
+                                    corners_total = (corners_total or 0) + int(float(st.get("displayValue", 0)))
+                                except Exception:
+                                    pass
+                            elif "yellow" in nm or "card" in nm:
+                                try:
+                                    cards_total = (cards_total or 0) + int(float(st.get("displayValue", 0)))
+                                except Exception:
+                                    pass
+
+                    results.append({
+                        "source": "ESPN_LIVE",
+                        "event_id": ev_id,
+                        "home": h_name,
+                        "away": a_name,
+                        "gh": h_score,
+                        "ga": a_score,
+                        "state": state,
+                        "is_finished": completed or state == "post",
+                        "is_live": state == "in",
+                        "status_label": status_code,
+                        "clock": short_detail,
+                        "home_form": h_form,
+                        "away_form": a_form,
+                        "corners_total": corners_total,
+                        "cards_total": cards_total,
+                        "venue": comp.get("venue", {}).get("fullName", "Stadium"),
+                        "league": ev.get("season", {}).get("slug", "Football")
+                    })
+        except Exception as e:
+            logger.warning("ESPN live scoreboard fetch warning (%s): %s", date_str, e)
+        return results
 
     @classmethod
     def make_request(cls, endpoint: str, params: Dict[str, str], ttl_seconds: int = 43200) -> Optional[Dict[str, Any]]:
@@ -491,19 +708,19 @@ class LiveFootballAPI:
         cache_key = f"{endpoint}:{urllib.parse.urlencode(sorted(params.items()))}"
         cache = load_json_dict(API_CACHE_FILE)
         now = time.time()
-        if cache_key in cache and (now - cache[cache_key].get("ts", 0) < ttl_seconds):
+        if ttl_seconds > 0 and cache_key in cache and (now - cache[cache_key].get("ts", 0) < ttl_seconds):
             return cache[cache_key].get("data")
 
         query = urllib.parse.urlencode(params)
         url = f"{cls.BASE_URL}/{endpoint}?{query}"
         req = urllib.request.Request(url, headers={
             "x-apisports-key": API_FOOTBALL_KEY.strip(),
-            "User-Agent": "BetBot-Pro/12.6"
+            "User-Agent": "BetBot-Pro/14.0"
         })
         try:
             with urllib.request.urlopen(req, timeout=8) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-                if data and data.get("response") is not None:
+                if data and data.get("response") is not None and len(data.get("response", [])) > 0:
                     cache[cache_key] = {"ts": now, "data": data}
                     save_json_dict(API_CACHE_FILE, cache)
                 return data
@@ -514,7 +731,7 @@ class LiveFootballAPI:
     @classmethod
     def check_account_status(cls) -> str:
         if not API_FOOTBALL_KEY:
-            return "Not Configured (Using Internal Model)"
+            return "ESPN Real-Time Scoreboard Active (API-Football Key Not Set)"
         url = f"{cls.BASE_URL}/status"
         req = urllib.request.Request(url, headers={"x-apisports-key": API_FOOTBALL_KEY.strip()})
         try:
@@ -523,70 +740,125 @@ class LiveFootballAPI:
                 res = data.get("response", {})
                 reqs = res.get("requests", {})
                 sub = res.get("subscription", {})
-                return f"Active ({sub.get('plan', 'Free')} Plan) — {reqs.get('current', 0)}/{reqs.get('limit_day', 100)} calls today"
+                return f"ESPN Live (Unlimited) + API-Football ({sub.get('plan', 'Free')}: {reqs.get('current', 0)}/{reqs.get('limit_day', 100)} calls)"
         except Exception as e:
-            return f"Error checking status: {e}"
+            return f"ESPN Live Active | API-Football status error: {e}"
 
     @classmethod
-    def get_team_id(cls, team_name: str) -> Optional[int]:
-        clean_name = re.sub(r'^\d+[\.\)]\s*', '', team_name)
-        clean_name = re.sub(r'\b(FC|CF|SK|AC|TSG|SV|1907|1913|1909|FK|TC|IL|SC|CA|AFC|RB)\b', '', clean_name, flags=re.IGNORECASE).strip()
-        if len(clean_name) < 3:
-            clean_name = team_name.strip()
-        data = cls.make_request("teams", {"search": clean_name}, ttl_seconds=86400)
-        if data and data.get("response"):
-            return data["response"][0]["team"]["id"]
-        return None
-
-    @classmethod
-    def fetch_fixtures_by_date(cls, date_str: str) -> List[Dict[str, Any]]:
-        data = cls.make_request("fixtures", {"date": date_str}, ttl_seconds=600)
+    def fetch_apifootball_fixtures_by_date(cls, date_str: str, force_fresh: bool = False) -> List[Dict[str, Any]]:
+        ttl = 0 if force_fresh else 120
+        data = cls.make_request("fixtures", {"date": date_str}, ttl_seconds=ttl)
         if data and data.get("response"):
             return data["response"]
         return []
 
     @classmethod
-    def find_today_fixture(cls, team_a: str, team_b: str) -> Optional[Dict[str, Any]]:
-        today = DailyLedgerManager.get_today_str()
-        fixtures = cls.fetch_fixtures_by_date(today)
-        h_clean = re.sub(r'\b(fc|cf|ac|sc|afc|1907|1913)\b', '', team_a.lower()).strip()
-        a_clean = re.sub(r'\b(fc|cf|ac|sc|afc|1907|1913)\b', '', team_b.lower()).strip()
+    def find_match_in_live_feeds(
+        cls,
+        team_a: str,
+        team_b: str,
+        espn_list: List[Dict[str, Any]],
+        apif_list: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        # 1. Check ESPN Real-Time Feed first
+        for em in espn_list:
+            if (teams_match(team_a, em["home"]) and teams_match(team_b, em["away"])) or (
+                teams_match(team_a, em["away"]) and teams_match(team_b, em["home"])
+            ):
+                swapped = teams_match(team_a, em["away"]) and not teams_match(team_a, em["home"])
+                return {
+                    "event_id": em.get("event_id", ""),
+                    "gh": em["ga"] if swapped else em["gh"],
+                    "ga": em["gh"] if swapped else em["ga"],
+                    "is_finished": em["is_finished"],
+                    "is_live": em["is_live"],
+                    "status_label": em["status_label"],
+                    "clock": em["clock"],
+                    "corners_total": em.get("corners_total"),
+                    "cards_total": em.get("cards_total"),
+                    "home_form": em["away_form"] if swapped else em["home_form"],
+                    "away_form": em["home_form"] if swapped else em["away_form"],
+                }
 
-        for f in fixtures:
-            fh = f.get("teams", {}).get("home", {}).get("name", "").lower()
-            fa = f.get("teams", {}).get("away", {}).get("name", "").lower()
-            if (h_clean in fh or fh in h_clean) and (a_clean in fa or fa in a_clean):
-                return f
+        # 2. Check API-Football Feed
+        for f in apif_list:
+            fh = f.get("teams", {}).get("home", {}).get("name", "")
+            fa = f.get("teams", {}).get("away", {}).get("name", "")
+            if (teams_match(team_a, fh) and teams_match(team_b, fa)) or (
+                teams_match(team_a, fa) and teams_match(team_b, fh)
+            ):
+                swapped = teams_match(team_a, fa) and not teams_match(team_a, fh)
+                st = f.get("fixture", {}).get("status", {})
+                short = st.get("short", "NS")
+                elapsed = st.get("elapsed")
+                gh = f.get("goals", {}).get("home") or 0
+                ga = f.get("goals", {}).get("away") or 0
+                is_fin = short in ["FT", "AET", "PEN"]
+                is_lv = short in ["1H", "HT", "2H", "ET", "LIVE"]
+                clock_str = f"{elapsed}'" if (is_lv and elapsed) else short
+                return {
+                    "event_id": "",
+                    "gh": ga if swapped else gh,
+                    "ga": gh if swapped else ga,
+                    "is_finished": is_fin,
+                    "is_live": is_lv,
+                    "status_label": "FT" if is_fin else (f"LIVE {clock_str}" if is_lv else short),
+                    "clock": clock_str,
+                    "corners_total": None,
+                    "cards_total": None,
+                    "home_form": "",
+                    "away_form": "",
+                }
         return None
 
     @classmethod
-    def build_pre_match_dossier(cls, team_a: str, team_b: str) -> PreMatchDossier:
+    def build_pre_match_dossier(cls, team_a: str, team_b: str, date_str: str) -> PreMatchDossier:
         dossier = PreMatchDossier()
-        fix = cls.find_today_fixture(team_a, team_b)
-        if not fix:
+        espn_list = cls.fetch_espn_fixtures_by_date(date_str)
+        for em in espn_list:
+            if (teams_match(team_a, em["home"]) and teams_match(team_b, em["away"])) or (
+                teams_match(team_a, em["away"]) and teams_match(team_b, em["home"])
+            ):
+                dossier.fixture_found = True
+                dossier.venue = em.get("venue") or "Official Stadium"
+                hf = em.get("home_form") or ""
+                af = em.get("away_form") or ""
+                if hf or af:
+                    dossier.form_summary = f"Home Form: {hf or 'N/A'} | Away Form: {af or 'N/A'}"
+                    if hf.count("L") >= 3:
+                        dossier.home_xg_adj -= 0.30
+                        dossier.home_goals_against_avg = 1.85
+                    if af.count("W") >= 3:
+                        dossier.away_xg_adj += 0.25
+                        dossier.away_goals_for_avg = 1.75
+                break
+
+        apif_list = cls.fetch_apifootball_fixtures_by_date(date_str, force_fresh=False)
+        matched_fix = None
+        for f in apif_list:
+            fh = f.get("teams", {}).get("home", {}).get("name", "")
+            fa = f.get("teams", {}).get("away", {}).get("name", "")
+            if teams_match(team_a, fh) and teams_match(team_b, fa):
+                matched_fix = f
+                break
+
+        if not matched_fix:
             return dossier
 
-        fixture_id = fix.get("fixture", {}).get("id")
-        venue_name = fix.get("fixture", {}).get("venue", {}).get("name") or "Home Pitch"
-        venue_city = fix.get("fixture", {}).get("venue", {}).get("city") or ""
-        league_info = fix.get("league", {})
+        dossier.fixture_found = True
+        fixture_id = matched_fix.get("fixture", {}).get("id")
+        venue_name = matched_fix.get("fixture", {}).get("venue", {}).get("name") or dossier.venue
+        league_info = matched_fix.get("league", {})
         league_id = league_info.get("id")
         season = league_info.get("season")
         league_name = league_info.get("name", "League")
         round_name = league_info.get("round", "")
 
-        home_id = fix.get("teams", {}).get("home", {}).get("id")
-        away_id = fix.get("teams", {}).get("away", {}).get("id")
+        home_id = matched_fix.get("teams", {}).get("home", {}).get("id")
+        away_id = matched_fix.get("teams", {}).get("away", {}).get("id")
 
         dossier.competition = f"{league_name} ({round_name})" if round_name else league_name
-        dossier.venue = f"{venue_name} ({venue_city})" if venue_city else venue_name
-
-        if any(k in round_name.lower() for k in ["final", "semi", "quarter", "knockout", "play-off"]):
-            dossier.match_stakes = f"🔥 High-Stakes Knockout Tie ({round_name})"
-            dossier.home_xg_adj -= 0.15
-            dossier.away_xg_adj -= 0.15
-        elif "champions league" in league_name.lower() or "europa" in league_name.lower():
-            dossier.match_stakes = f"🏆 European Continental Clash ({league_name})"
+        dossier.venue = venue_name
 
         if league_id and season:
             st_data = cls.make_request("standings", {"league": str(league_id), "season": str(season)}, ttl_seconds=43200)
@@ -594,53 +866,36 @@ class LiveFootballAPI:
                 try:
                     table = st_data["response"][0]["league"]["standings"][0]
                     h_rank, a_rank, h_form, a_form, h_pts, a_pts = None, None, "", "", 0, 0
-                    total_teams = len(table)
                     for row in table:
                         tid = row.get("team", {}).get("id")
+                        played = max(1, row.get("all", {}).get("played") or 1)
+                        gf = row.get("all", {}).get("goals", {}).get("for") or 0
+                        ga = row.get("all", {}).get("goals", {}).get("against") or 0
                         if tid == home_id:
                             h_rank = row.get("rank")
                             h_form = row.get("form") or ""
                             h_pts = row.get("points") or 0
+                            dossier.home_goals_for_avg = gf / played
+                            dossier.home_goals_against_avg = ga / played
                         elif tid == away_id:
                             a_rank = row.get("rank")
                             a_form = row.get("form") or ""
                             a_pts = row.get("points") or 0
+                            dossier.away_goals_for_avg = gf / played
+                            dossier.away_goals_against_avg = ga / played
 
                     if h_rank and a_rank:
-                        dossier.standings_summary = f"Home #{h_rank} ({h_pts}pts, Form: {h_form[-5:]}) vs Away #{a_rank} ({a_pts}pts, Form: {a_form[-5:]})"
+                        dossier.standings_summary = (
+                            f"Home #{h_rank} ({h_pts}pts, {h_form[-5:]}) vs Away #{a_rank} ({a_pts}pts, {a_form[-5:]})"
+                        )
                         if h_rank <= 4 and a_rank <= 4:
                             dossier.match_stakes = "🔥 Top-4 Title / UCL 6-Pointer"
-                        elif h_rank >= total_teams - 3 or a_rank >= total_teams - 3:
-                            dossier.match_stakes = "⚠️ Relegation Survival Battle"
-                        if h_form.endswith("WWW") and a_rank > 10:
-                            dossier.home_xg_adj += 0.20
-                            dossier.corners_adj += 1.0
+                        if dossier.home_goals_against_avg >= 1.65:
+                            dossier.veto_reason = (
+                                f"High Defensive Vulnerability: {team_a} concedes {dossier.home_goals_against_avg:.2f} goals/gm"
+                            )
                 except Exception:
                     pass
-
-        if fixture_id:
-            inj_data = cls.make_request("injuries", {"fixture": str(fixture_id)}, ttl_seconds=14400)
-            if inj_data and inj_data.get("response"):
-                h_out, a_out = [], []
-                for entry in inj_data["response"]:
-                    tid = entry.get("team", {}).get("id")
-                    p_name = entry.get("player", {}).get("name", "")
-                    if tid == home_id and p_name:
-                        h_out.append(p_name)
-                    elif tid == away_id and p_name:
-                        a_out.append(p_name)
-
-                dossier.home_missing_count = len(h_out)
-                dossier.away_missing_count = len(a_out)
-                if h_out or a_out:
-                    h_str = f"Home missing {len(h_out)} ({', '.join(h_out[:2])})" if h_out else "Home full squad"
-                    a_str = f"Away missing {len(a_out)} ({', '.join(a_out[:2])})" if a_out else "Away full squad"
-                    dossier.injuries_summary = f"🏥 Absences: {h_str} | {a_str}"
-                    if len(h_out) >= 3:
-                        dossier.home_xg_adj -= 0.20
-                        dossier.corners_adj -= 0.8
-                    if len(a_out) >= 3:
-                        dossier.away_xg_adj -= 0.20
 
         if fixture_id:
             lu_data = cls.make_request("fixtures/lineups", {"fixture": str(fixture_id)}, ttl_seconds=1800)
@@ -655,118 +910,196 @@ class LiveFootballAPI:
                     dossier.lineup_summary = (
                         f"✅ Confirmed XI: Home ({form_h}: {', '.join(xi_h)}...) vs Away ({form_a}: {', '.join(xi_a)}...)"
                     )
-                    if form_a.startswith("5-") or form_h.startswith("5-"):
-                        dossier.home_xg_adj -= 0.12
                 except Exception:
                     pass
 
         return dossier
 
     @classmethod
-    def get_h2h_and_form(cls, team_a: str, team_b: str, line: Optional[float], market_type: str) -> Tuple[Optional[str], Optional[float]]:
-        id_a = cls.get_team_id(team_a)
-        id_b = cls.get_team_id(team_b)
-        if not id_a or not id_b:
-            return None, None
+    def build_live_bet_progress_and_autopsy(
+        cls,
+        item: LedgerBetItem,
+        gh: int,
+        ga: int,
+        is_finished: bool,
+        is_live: bool,
+        clock: str
+    ) -> Tuple[str, str]:
+        total_g = gh + ga
+        live_detail = ""
+        autopsy = ""
 
-        data = cls.make_request("fixtures/headtohead", {"h2h": f"{id_a}-{id_b}", "last": "6"}, ttl_seconds=43200)
-        if not data or not data.get("response"):
-            return None, None
+        if is_live:
+            if item.market_type == "goals_over_under" and item.line is not None:
+                if "over" in item.selection.lower():
+                    needed = max(0, int(math.floor(item.line) + 1) - total_g)
+                    live_detail = f"🟢 CASHED LIVE ({total_g} goals)" if needed == 0 else f"⏳ Live {clock}: {total_g} goals (Needs {needed} more)"
+                else:
+                    max_allowed = int(math.floor(item.line))
+                    margin = max_allowed - total_g
+                    live_detail = f"🟢 On Track ({total_g}/{max_allowed} max goals)" if margin >= 0 else f"🔴 Line Broken ({total_g} goals scored)"
+            else:
+                diff = gh - ga
+                if diff > 0:
+                    live_detail = f"🟢 Leading {gh}-{ga} ({clock})"
+                elif diff == 0:
+                    live_detail = f"⚖️ Level {gh}-{ga} ({clock})"
+                else:
+                    live_detail = f"🔴 Trailing {gh}-{ga} ({clock})"
 
-        matches = data["response"]
-        total_matches = len(matches)
-        if total_matches == 0:
-            return None, None
+        if is_finished and item.settlement == "LOST ❌":
+            if item.market_type == "goals_over_under" and item.line is not None:
+                if "under" in item.selection.lower():
+                    autopsy = f"🔍 Loss Analysis: High-scoring {gh}-{ga} shootout ({total_g} total goals broke {item.selection} line)."
+                else:
+                    autopsy = f"🔍 Loss Analysis: Low-scoring {gh}-{ga} finish ({total_g} total goals fell short of {item.selection})."
+            elif "or draw" in item.selection.lower() or item.market_type in ["1x2", "unknown", "unverified"]:
+                autopsy = (
+                    f"🔍 Loss Analysis: Defensive breakdown — conceded {max(gh, ga)} goals in a {gh}-{ga} defeat despite pre-match projection."
+                )
+            else:
+                autopsy = f"🔍 Loss Analysis: Final result {gh}-{ga} (FT) did not cover {item.selection}."
 
-        total_goals_list = []
-        target_line = line if line is not None else 2.5
-        under_hits = 0
-        over_hits = 0
-
-        for m in matches:
-            gh = m.get("goals", {}).get("home") or 0
-            ga = m.get("goals", {}).get("away") or 0
-            g_sum = gh + ga
-            total_goals_list.append(g_sum)
-            if g_sum < target_line:
-                under_hits += 1
-            elif g_sum > target_line:
-                over_hits += 1
-
-        avg_h2h_goals = sum(total_goals_list) / total_matches
-        evidence = f"H2H ({total_matches} games): Avg {avg_h2h_goals:.1f} goals (Under {target_line}: {under_hits}/{total_matches} | Over: {over_hits}/{total_matches})"
-        return evidence, avg_h2h_goals
+        return live_detail, autopsy
 
     @classmethod
-    def grade_ledger_items(cls) -> Tuple[List[LedgerBetItem], List[LedgerBetItem]]:
+    def grade_ledger_items(cls, force_fresh: bool = False) -> Tuple[List[LedgerBetItem], List[LedgerBetItem]]:
         all_items = DailyLedgerManager.load_all_history_items()
         if not all_items:
             return [], []
 
-        dates_to_check = set(
+        base_dates = set(
             item.date_str for item in all_items.values()
             if item.settlement == "PENDING" or item.match_status != "FT"
         )
-        dates_to_check.add(DailyLedgerManager.get_today_str())
+        base_dates.add(DailyLedgerManager.get_today_str())
+        base_dates.add(DailyLedgerManager.get_yesterday_str())
 
-        fixtures_by_date: Dict[str, List[Dict[str, Any]]] = {}
-        for d_str in dates_to_check:
-            fixtures_by_date[d_str] = cls.fetch_fixtures_by_date(d_str)
+        # Expand with +-1 day window so UTC midnight crossovers never miss a match
+        dates_to_check: Set[str] = set()
+        for d_str in base_dates:
+            dates_to_check.add(d_str)
+            dates_to_check.add(shift_date_str(d_str, -1))
+            dates_to_check.add(shift_date_str(d_str, 1))
+
+        espn_by_date: Dict[str, List[Dict[str, Any]]] = {}
+        apif_by_date: Dict[str, List[Dict[str, Any]]] = {}
+        for d_str in sorted(dates_to_check):
+            espn_by_date[d_str] = cls.fetch_espn_fixtures_by_date(d_str)
+            apif_by_date[d_str] = cls.fetch_apifootball_fixtures_by_date(d_str, force_fresh=force_fresh)
 
         newly_settled = []
 
         for full_key, item in all_items.items():
-            fixtures = fixtures_by_date.get(item.date_str, [])
-            if not fixtures:
+            # Search item.date_str first, then +-1 day
+            search_dates = [item.date_str, shift_date_str(item.date_str, -1), shift_date_str(item.date_str, 1)]
+            candidate_espn: List[Dict[str, Any]] = []
+            candidate_apif: List[Dict[str, Any]] = []
+            for sd in search_dates:
+                candidate_espn.extend(espn_by_date.get(sd, []))
+                candidate_apif.extend(apif_by_date.get(sd, []))
+
+            matched = cls.find_match_in_live_feeds(item.team_home, item.team_away, candidate_espn, candidate_apif)
+            if not matched:
                 continue
 
-            h_clean = re.sub(r'\b(fc|cf|ac|sc|afc|1907|1913)\b', '', item.team_home.lower()).strip()
-            a_clean = re.sub(r'\b(fc|cf|ac|sc|afc|1907|1913)\b', '', item.team_away.lower()).strip()
-
-            matched_fix = None
-            for f in fixtures:
-                fh = f.get("teams", {}).get("home", {}).get("name", "").lower()
-                fa = f.get("teams", {}).get("away", {}).get("name", "").lower()
-                if (h_clean in fh or fh in h_clean) and (a_clean in fa or fa in a_clean):
-                    matched_fix = f
-                    break
-
-            if not matched_fix:
-                continue
-
-            status_short = matched_fix.get("fixture", {}).get("status", {}).get("short", "NS")
-            gh = matched_fix.get("goals", {}).get("home") or 0
-            ga = matched_fix.get("goals", {}).get("away") or 0
+            gh = matched["gh"]
+            ga = matched["ga"]
             total_goals = gh + ga
+            is_finished = matched["is_finished"]
+            is_live = matched["is_live"]
+            status_label = matched["status_label"]
+            clock = matched["clock"]
 
-            item.score_str = f"{gh}-{ga} ({status_short})"
-            is_finished = status_short in ["FT", "AET", "PEN"]
-            is_live = status_short in ["1H", "HT", "2H", "ET", "LIVE"]
+            item.score_str = f"{gh}-{ga} ({status_label})"
+            item.match_status = "FT" if is_finished else ("LIVE" if is_live else status_label)
 
-            if is_finished:
-                item.match_status = "FT"
-            elif is_live:
-                item.match_status = f"LIVE ({status_short})"
-            else:
-                item.match_status = status_short
+            # Fetch detailed ESPN boxscore stats if needed for Corners or Cards
+            if item.market_type in ["corners_over_under", "bookings_over_under"] and matched.get("event_id"):
+                if matched.get("corners_total") is None or matched.get("cards_total") is None:
+                    c_tot, y_tot = cls.fetch_espn_event_stats(matched["event_id"])
+                    if c_tot is not None:
+                        matched["corners_total"] = c_tot
+                    if y_tot is not None:
+                        matched["cards_total"] = y_tot
 
             if item.market_type == "goals_over_under" and item.line is not None:
                 is_over = "over" in item.selection.lower()
                 if is_over and total_goals > item.line:
                     item.settlement = "WON ✅"
+                elif not is_over and total_goals > item.line:
+                    item.settlement = "LOST ❌"
                 elif is_finished:
                     if is_over:
                         item.settlement = "WON ✅" if total_goals > item.line else ("PUSH ➖" if total_goals == item.line else "LOST ❌")
                     else:
                         item.settlement = "WON ✅" if total_goals < item.line else ("PUSH ➖" if total_goals == item.line else "LOST ❌")
 
-            elif ("or draw" in item.selection.lower() or item.market_type == "1x2") and is_finished:
-                if "or draw" in item.selection.lower():
-                    item.settlement = "WON ✅" if gh >= ga else "LOST ❌"
-                elif h_clean in item.selection.lower():
-                    item.settlement = "WON ✅" if gh > ga else "LOST ❌"
-                elif a_clean in item.selection.lower():
+            elif item.market_type == "corners_over_under" and item.line is not None:
+                c_tot = matched.get("corners_total")
+                if c_tot is not None:
+                    item.score_str = f"{gh}-{ga} ({c_tot} Corners | {status_label})"
+                    is_over = "over" in item.selection.lower()
+                    if is_over and c_tot > item.line:
+                        item.settlement = "WON ✅"
+                    elif not is_over and c_tot > item.line:
+                        item.settlement = "LOST ❌"
+                    elif is_finished:
+                        item.settlement = "WON ✅" if (c_tot > item.line if is_over else c_tot < item.line) else "LOST ❌"
+
+            elif item.market_type == "bookings_over_under" and item.line is not None:
+                y_tot = matched.get("cards_total")
+                if y_tot is not None:
+                    item.score_str = f"{gh}-{ga} ({y_tot} Cards | {status_label})"
+                    is_over = "over" in item.selection.lower()
+                    if is_over and y_tot > item.line:
+                        item.settlement = "WON ✅"
+                    elif not is_over and y_tot > item.line:
+                        item.settlement = "LOST ❌"
+                    elif is_finished:
+                        item.settlement = "WON ✅" if (y_tot > item.line if is_over else y_tot < item.line) else "LOST ❌"
+
+            elif item.market_type == "btts":
+                btts_yes = "no" not in item.selection.lower()
+                if btts_yes and gh >= 1 and ga >= 1:
+                    item.settlement = "WON ✅"
+                elif not btts_yes and gh >= 1 and ga >= 1:
+                    item.settlement = "LOST ❌"
+                elif is_finished:
+                    both_scored = (gh >= 1 and ga >= 1)
+                    item.settlement = "WON ✅" if (both_scored if btts_yes else not both_scored) else "LOST ❌"
+
+            elif item.market_type == "handicap" and item.line is not None and is_finished:
+                sel_low = item.selection.lower()
+                for_away = teams_match(item.team_away, sel_low) and not teams_match(item.team_home, sel_low)
+                adj_diff = ((ga + item.line) - gh) if for_away else ((gh + item.line) - ga)
+                if adj_diff > 0:
+                    item.settlement = "WON ✅"
+                elif adj_diff == 0:
+                    item.settlement = "PUSH ➖"
+                else:
+                    item.settlement = "LOST ❌"
+
+            elif is_finished and (
+                "or draw" in item.selection.lower()
+                or item.market_type in ["1x2", "unknown", "unverified"]
+            ):
+                sel_low = item.selection.lower()
+                for_away = teams_match(item.team_away, sel_low) and not teams_match(item.team_home, sel_low)
+                if "or draw" in sel_low or "1x" in sel_low or "x2" in sel_low:
+                    if for_away or "x2" in sel_low:
+                        item.settlement = "WON ✅" if ga >= gh else "LOST ❌"
+                    else:
+                        item.settlement = "WON ✅" if gh >= ga else "LOST ❌"
+                elif for_away:
                     item.settlement = "WON ✅" if ga > gh else "LOST ❌"
+                else:
+                    item.settlement = "WON ✅" if gh > ga else "LOST ❌"
+
+            live_dt, autopsy_txt = cls.build_live_bet_progress_and_autopsy(item, gh, ga, is_finished, is_live, clock)
+            item.live_detail = live_dt
+            if autopsy_txt:
+                item.loss_autopsy = autopsy_txt
 
             if item.settlement in ["WON ✅", "LOST ❌", "PUSH ➖"] and not item.notified_settled:
                 item.notified_settled = True
@@ -784,8 +1117,10 @@ class BetParser:
     GOALS_PATTERN = re.compile(r"(Over|Under|O\/U|Total\s+OVER|Total\s+UNDER)\s*([0-9]\.?[0-9]?)\s*(?:Total\s*)?(?:Goals?)?", re.IGNORECASE)
     CORNERS_PATTERN = re.compile(r"(?:Corners?\s+total\s+)?(Over|Under)\s*([0-9]{1,2}\.?[0-9]?)\s*(?:Total\s*)?Corners?|Corners?\s+total\s+(OVER|UNDER)\s*([0-9]{1,2}\.?[0-9]?)", re.IGNORECASE)
     BOOKINGS_PATTERN = re.compile(r"(?:Yellow\s+cards?\s+total\s+)?(Over|Under)\s*([0-9]\.?[0-9]?)\s*(?:Total\s*)?(?:Bookings?|Cards?)|(?:Yellow\s+cards?|Bookings?)\s+total\s+(OVER|UNDER)\s*([0-9]\.?[0-9]?)", re.IGNORECASE)
+    BTTS_PATTERN = re.compile(r"(?:Both\s+Teams\s+To\s+Score|BTTS)\s*[:\-]?\s*(Yes|No|GG|NG)?", re.IGNORECASE)
     HANDICAP_PATTERN = re.compile(r"([A-Za-z\s&]+?)\s*\(([+-][0-9]\.?[0-9]?)\)\s*(?:Handicap)?", re.IGNORECASE)
-    WIN_PATTERN = re.compile(r"([A-Za-z\s&]+?)\s*(?:1x2|to win|win|ml|moneyline)", re.IGNORECASE)
+    DOUBLE_CHANCE_PATTERN = re.compile(r"([A-Za-z\s&]+?)\s*(?:or\s+Draw|1X|X2|Double\s+Chance)", re.IGNORECASE)
+    WIN_PATTERN = re.compile(r"([A-Za-z\s&]+?)\s*(?:1x2|to win|win|ml|moneyline|home\s+win|away\s+win)", re.IGNORECASE)
 
     SRL_CROSS_MATCHES = [
         ("crystal palace", "hoffenheim"), ("sparta prague", "bournemouth"),
@@ -857,7 +1192,7 @@ class BetParser:
         return None
 
     @classmethod
-    def parse_single_block(cls, block: str, source_channel: str = "") -> Optional[BetSignal]:
+    def parse_single_block(cls, block: str, source_channel: str = "", post_date_str: str = "") -> Optional[BetSignal]:
         lines = [line.strip() for line in block.strip().split("\n") if line.strip()]
         if not lines:
             return None
@@ -883,14 +1218,16 @@ class BetParser:
             except ValueError:
                 odds = 1.70
 
-        market_type = "unknown"
+        market_type = "unverified"
         selection = ""
         line_val = None
 
         cm = cls.CORNERS_PATTERN.search(block)
         bm = cls.BOOKINGS_PATTERN.search(block)
         gm = cls.GOALS_PATTERN.search(block)
+        bttsm = cls.BTTS_PATTERN.search(block)
         hm = cls.HANDICAP_PATTERN.search(block)
+        dcm = cls.DOUBLE_CHANCE_PATTERN.search(block)
         wm = cls.WIN_PATTERN.search(block)
 
         if cm:
@@ -924,22 +1261,29 @@ class BetParser:
                 line_val = f_v
                 market_type = "goals_over_under"
                 selection = f"{dir_str} {line_val} Goals"
+        elif bttsm:
+            yn = (bttsm.group(1) or "Yes").capitalize()
+            if yn.upper() == "NG":
+                yn = "No"
+            elif yn.upper() == "GG":
+                yn = "Yes"
+            market_type = "btts"
+            selection = f"Both Teams To Score: {yn}"
         elif hm:
             team = hm.group(1).strip()
             line_val = float(hm.group(2))
             market_type = "handicap"
             selection = f"{team} ({line_val:+.1f}) Handicap"
+        elif dcm:
+            market_type = "1x2"
+            selection = f"{team_home} or Draw (1X / Safe Line)"
         elif wm:
             team = wm.group(1).strip()
             market_type = "1x2"
             selection = f"{team} to Win (1X2)"
         else:
-            if odds <= 1.52:
-                market_type = "1x2"
-                selection = f"{team_home} or Draw (1X / Safe Line)"
-            else:
-                market_type = "1x2"
-                selection = f"{team_home} / {team_away} Value Line"
+            market_type = "unverified"
+            selection = f"Unverified Market Line (@ {odds:.2f})"
 
         is_srl = cls.detect_srl(team_home, team_away, block)
         return BetSignal(
@@ -951,11 +1295,12 @@ class BetParser:
             line=line_val,
             odds=odds,
             source_channel=source_channel,
-            is_virtual_srl=is_srl
+            is_virtual_srl=is_srl,
+            post_date_str=post_date_str
         )
 
     @classmethod
-    def parse_multiple(cls, text: str, source_channel: str = "") -> List[BetSignal]:
+    def parse_multiple(cls, text: str, source_channel: str = "", post_date_str: str = "") -> List[BetSignal]:
         raw_lines = [line.strip() for line in text.split("\n") if line.strip()]
         match_indices = []
         for idx, line in enumerate(raw_lines):
@@ -974,7 +1319,7 @@ class BetParser:
         for i, start_idx in enumerate(match_indices):
             end_idx = match_indices[i + 1] if i + 1 < len(match_indices) else min(start_idx + 6, len(raw_lines))
             chunk = "\n".join(raw_lines[start_idx:end_idx])
-            sig = cls.parse_single_block(chunk, source_channel=source_channel)
+            sig = cls.parse_single_block(chunk, source_channel=source_channel, post_date_str=post_date_str)
             if sig:
                 signals.append(sig)
         return signals
@@ -991,22 +1336,20 @@ class FootballIntelligenceEngine:
 
     @classmethod
     def build_bet_key(cls, s: BetSignal) -> str:
-        h = re.sub(r'\b(fc|cf|ac|sc|afc|1907|1913)\b', '', s.team_home.lower()).strip()
-        a = re.sub(r'\b(fc|cf|ac|sc|afc|1907|1913)\b', '', s.team_away.lower()).strip()
-        h = re.sub(r'\s+', ' ', h)
-        a = re.sub(r'\s+', ' ', a)
+        h = normalize_team_str(s.team_home)
+        a = normalize_team_str(s.team_away)
         return f"{h}_vs_{a}_{s.market_type}_{s.selection.lower()}"
 
     @classmethod
     def evaluate_to_ledger_item(cls, s: BetSignal, date_override: Optional[str] = None) -> LedgerBetItem:
-        today_str = date_override or DailyLedgerManager.get_today_str()
+        target_date = date_override or s.post_date_str or DailyLedgerManager.get_today_str()
         bet_key = cls.build_bet_key(s)
         sources = [s.source_channel] if s.source_channel else []
 
         if s.is_virtual_srl:
             return LedgerBetItem(
                 bet_key=bet_key,
-                date_str=today_str,
+                date_str=target_date,
                 team_home=s.team_home,
                 team_away=s.team_away,
                 market_type=s.market_type,
@@ -1015,26 +1358,50 @@ class FootballIntelligenceEngine:
                 odds=s.odds,
                 floor_odds=2.00,
                 is_approved=False,
-                confidence_stars="❌ AVOID (VIRTUAL SRL)",
+                confidence_stars="❌ DECLINED (VIRTUAL SRL)",
                 model_prob=0.0,
                 edge_ev=-100.0,
                 recommended_units=0.0,
                 consensus_sources=sources,
                 rationale="Simulated Reality League (SRL) virtual AI match detected. No real players or lineups exist.",
-                evidence="Unverified Cross-League Virtual Fixture — Automatically Blocked.",
+                evidence="Unverified Cross-League Virtual Fixture — Automatically Declined.",
                 rotation_warning=None,
                 search_url=""
             )
 
-        dossier = LiveFootballAPI.build_pre_match_dossier(s.team_home, s.team_away)
-        h2h_evidence, api_avg_goals = LiveFootballAPI.get_h2h_and_form(s.team_home, s.team_away, s.line, s.market_type)
+        if s.market_type == "unverified":
+            return LedgerBetItem(
+                bet_key=bet_key,
+                date_str=target_date,
+                team_home=s.team_home,
+                team_away=s.team_away,
+                market_type=s.market_type,
+                selection=s.selection,
+                line=s.line,
+                odds=s.odds,
+                floor_odds=2.00,
+                is_approved=False,
+                confidence_stars="❌ DECLINED (UNVERIFIED MARKET)",
+                model_prob=0.0,
+                edge_ev=-100.0,
+                recommended_units=0.0,
+                consensus_sources=sources,
+                rationale="Signal did not specify a clear verifiable market (Over/Under, Corners, Handicap, or explicit 1X2). Blocked to prevent blind favorite losses.",
+                evidence="Strict Veto: Never guess a market purely from odds.",
+                rotation_warning=None,
+                search_url=""
+            )
 
-        base_goals = api_avg_goals if api_avg_goals is not None else 2.70
-        expected_goals = max(1.4, min(4.2, base_goals + dossier.home_xg_adj + dossier.away_xg_adj))
+        dossier = LiveFootballAPI.build_pre_match_dossier(s.team_home, s.team_away, target_date)
+
+        proj_home_goals = (dossier.home_goals_for_avg + dossier.away_goals_against_avg) / 2.0 + dossier.home_xg_adj
+        proj_away_goals = (dossier.away_goals_for_avg + dossier.home_goals_against_avg) / 2.0 + dossier.away_xg_adj
+        expected_goals = max(1.5, min(4.3, proj_home_goals + proj_away_goals))
         expected_corners = max(7.5, min(12.5, 9.60 + dossier.corners_adj))
         expected_cards = 4.30
 
         rot_warn = BetParser.detect_rotation_risk(s.team_home, s.team_away, s.market_type)
+        veto_triggered: Optional[str] = None
 
         if s.market_type == "goals_over_under" and s.line is not None:
             max_k = int(math.floor(s.line))
@@ -1043,12 +1410,15 @@ class FootballIntelligenceEngine:
             is_under = "under" in s.selection.lower()
             model_prob = prob_under if is_under else prob_over
 
-            if is_under and s.line >= 3.5:
-                rationale = f"Tactical discipline & pre-match xG ({expected_goals:.2f} goals) give {s.selection} a {model_prob*100:.1f}% safety buffer."
-            elif not is_under and s.line <= 1.5:
-                rationale = f"High-tempo attacking metrics ({expected_goals:.2f} xG) project {model_prob*100:.1f}% hit rate."
-            else:
-                rationale = f"Pre-match xG model ({expected_goals:.2f} goals) rates {s.selection} at {model_prob*100:.1f}% probability."
+            if is_under and (expected_goals >= 3.05 or dossier.home_goals_against_avg >= 1.65 or dossier.away_goals_against_avg >= 1.65):
+                veto_triggered = (
+                    f"Shootout Risk Veto: High-tempo scoring profile ({expected_goals:.2f} proj goals) makes {s.selection} unsafe (3-2 shootout trap)."
+                )
+                model_prob = min(model_prob, 0.48)
+
+            rationale = veto_triggered or (
+                f"Pre-match xG model ({expected_goals:.2f} goals) rates {s.selection} at {model_prob*100:.1f}% probability."
+            )
 
         elif s.market_type == "corners_over_under" and s.line is not None:
             max_k = int(math.floor(s.line))
@@ -1058,9 +1428,8 @@ class FootballIntelligenceEngine:
             model_prob = prob_over if is_over else prob_under
             if rot_warn and is_over and s.line >= 8.5:
                 model_prob *= 0.80
-                rationale = "Rotation & squad absences lower projected wing play and corner volume."
-            else:
-                rationale = f"Wing width & corner projection ({expected_corners:.1f} avg) gives {model_prob*100:.1f}% hit rate."
+                veto_triggered = "Rotation Risk Veto: Starting wingers projected to be rested; low corner volume expected."
+            rationale = veto_triggered or f"Wing width & corner projection ({expected_corners:.1f} avg) gives {model_prob*100:.1f}% hit rate."
 
         elif s.market_type == "bookings_over_under" and s.line is not None:
             max_k = int(math.floor(s.line))
@@ -1074,28 +1443,47 @@ class FootballIntelligenceEngine:
             else:
                 rationale = f"Referee & fixture intensity model projects {model_prob*100:.1f}% probability."
 
+        elif s.market_type == "btts":
+            p_home_0 = cls.poisson_pmf(0, max(0.5, proj_home_goals))
+            p_away_0 = cls.poisson_pmf(0, max(0.5, proj_away_goals))
+            p_btts_yes = (1.0 - p_home_0) * (1.0 - p_away_0)
+            is_yes = "no" not in s.selection.lower()
+            model_prob = p_btts_yes if is_yes else (1.0 - p_btts_yes)
+            rationale = f"Attacking/defensive xG split projects {model_prob*100:.1f}% probability for {s.selection}."
+
         elif s.market_type == "handicap" and s.line is not None:
             if s.line > 0:
-                model_prob = 0.72 if s.line >= 1.5 else 0.64
-                rationale = f"Plus-handicap cushion ({s.line:+.1f}) covers both win and close draw/1-goal margin."
+                if dossier.home_goals_against_avg >= 1.70:
+                    veto_triggered = f"Defensive Collapse Veto: Concedes {dossier.home_goals_against_avg:.2f} goals/gm; unsafe for handicap."
+                    model_prob = 0.49
+                else:
+                    model_prob = 0.70 if s.line >= 1.5 else 0.63
+                rationale = veto_triggered or f"Plus-handicap cushion ({s.line:+.1f}) covers both win and close 1-goal margin."
             else:
-                model_prob = 0.52
-                rationale = "Minus handicap requires multi-goal margin; elevated draw risk."
+                model_prob = 0.51
+                rationale = "Minus handicap requires multi-goal margin; elevated draw/backdoor cover risk."
 
         else:
-            if s.odds <= 1.52:
-                model_prob = 0.78 + (0.03 if dossier.home_xg_adj > 0 else 0.0)
-                rationale = f"Form, table position & Poisson distribution project {model_prob*100:.1f}% hit probability."
+            if dossier.veto_reason:
+                veto_triggered = f"Defensive Veto: {dossier.veto_reason} (High 3-2 upset risk)."
+                model_prob = 0.50
+            elif not dossier.fixture_found:
+                veto_triggered = "Fixture Verification Veto: Could not verify live starting form/standings for 1X2 favorite."
+                model_prob = 0.52
+            elif "or draw" in s.selection.lower() and s.odds <= 1.52:
+                model_prob = 0.76 + (0.03 if dossier.home_xg_adj > 0 else 0.0)
             else:
                 model_prob = 0.54
-                rationale = f"Implied odds of {s.odds:.2f} exceed fair pre-match valuation ({((0.54 * s.odds) - 1.0)*100:+.1f}% EV)."
+            rationale = veto_triggered or (
+                f"Verified form ({dossier.form_summary}) & Poisson distribution project {model_prob*100:.1f}% probability."
+            )
 
         ev_pct = ((model_prob * s.odds) - 1.0) * 100.0
         floor_odds = round(1.0 / max(model_prob, 0.01), 2)
-        is_approved = (ev_pct >= 2.0 and model_prob >= 0.58)
+        is_approved = (veto_triggered is None) and (ev_pct >= 2.5) and (model_prob >= 0.60)
 
-        if not is_approved and "Implied odds" not in rationale and "Rotation" not in rationale:
-            rationale = f"Negative value ({ev_pct:+.1f}% EV). Model probability ({model_prob*100:.1f}%) requires odds >= {floor_odds:.2f}."
+        if not is_approved and not veto_triggered:
+            rationale = f"Declined ({ev_pct:+.1f}% EV): Model win prob ({model_prob*100:.1f}%) requires minimum odds of {floor_odds:.2f} (offered {s.odds:.2f})."
 
         if is_approved:
             if ev_pct >= 10.0 and model_prob >= 0.70:
@@ -1108,14 +1496,11 @@ class FootballIntelligenceEngine:
                 stars = "⭐️⭐️⭐️"
                 units = 1.0
         else:
-            stars = "❌ AVOID"
+            stars = "❌ DECLINED"
             units = 0.0
 
-        if not h2h_evidence:
-            hits_5 = max(3, min(5, int(round(model_prob * 5))))
-            h2h_evidence = f"Consistent with recent form: {hits_5}/5 competitive matches aligned ({int(model_prob*100)}% trend)."
-
-        match_context_str = f"{dossier.competition} | {dossier.match_stakes} | {dossier.standings_summary}"
+        evidence = f"{dossier.standings_summary} | {dossier.form_summary}"
+        match_context_str = f"{dossier.competition} | {dossier.match_stakes}"
         lineup_inj_str = f"{dossier.lineup_summary} | {dossier.injuries_summary}"
 
         q = urllib.parse.quote(f"{s.team_home} vs {s.team_away} {s.selection} odds")
@@ -1123,7 +1508,7 @@ class FootballIntelligenceEngine:
 
         return LedgerBetItem(
             bet_key=bet_key,
-            date_str=today_str,
+            date_str=target_date,
             team_home=s.team_home,
             team_away=s.team_away,
             market_type=s.market_type,
@@ -1138,7 +1523,7 @@ class FootballIntelligenceEngine:
             recommended_units=units,
             consensus_sources=sources,
             rationale=rationale,
-            evidence=h2h_evidence,
+            evidence=evidence,
             rotation_warning=rot_warn,
             search_url=search_url,
             match_context=match_context_str,
@@ -1148,11 +1533,27 @@ class FootballIntelligenceEngine:
 
 class BetSlipCardFormatter:
     @classmethod
+    def get_running_channel_tally_line(cls) -> str:
+        """Returns a 1-line summary of the cumulative @Footybett record to embed in every result post."""
+        all_items = list(DailyLedgerManager.load_all_history_items().values())
+        settled_app = [
+            i for i in all_items
+            if i.is_approved and i.settlement in ["WON ✅", "LOST ❌", "PUSH ➖"]
+        ]
+        won_cnt = sum(1 for i in settled_app if "WON" in i.settlement)
+        lost_cnt = sum(1 for i in settled_app if "LOST" in i.settlement)
+        wr = (won_cnt / (won_cnt + lost_cnt) * 100.0) if (won_cnt + lost_cnt) > 0 else 0.0
+        net_u = 0.0
+        for i in settled_app:
+            if "WON" in i.settlement:
+                net_u += i.recommended_units * (i.odds - 1.0)
+            elif "LOST" in i.settlement:
+                net_u -= i.recommended_units
+        return f"📈 Total Record: {won_cnt}W - {lost_cnt}L ({wr:.1f}% Win Rate | {net_u:+.2f}u Profit)"
+
+    @classmethod
     def format_player_channel_post(cls, s: LedgerBetItem) -> str:
-        """
-        Formats a single clean VIP Bet Card for https://t.me/Footybett (@Footybett).
-        Sent ONCE as soon as a new valid pick is confirmed.
-        """
+        """Sent ONCE to @Footybett when a new approved pick is confirmed."""
         lines = [
             "🔥 NEW VIP PICK TO TAKE — @Footybett 🔥",
             "════════════════════════════",
@@ -1168,103 +1569,223 @@ class BetSlipCardFormatter:
         if s.lineup_injuries_info:
             lines.append(f"👥 Team News  : {s.lineup_injuries_info}")
         lines.append(f"💡 Analysis   : {s.rationale}")
-        lines.append(f"📊 Trend      : {s.evidence}")
+        lines.append(f"📊 Form/Table : {s.evidence}")
         if s.rotation_warning:
             lines.append(f"{s.rotation_warning}")
         lines.append("════════════════════════════")
-        lines.append("📲 Place Single Bet • Manage Bankroll Strictly")
+        lines.append(cls.get_running_channel_tally_line())
         return "\n".join(lines)
 
     @classmethod
-    def format_player_channel_win_update(cls, s: LedgerBetItem) -> str:
-        """Formats a single Winner Celebration card for @Footybett ONCE when an approved pick cashes."""
-        profit_u = s.recommended_units * (s.odds - 1.0)
-        return (
-            "🎉✅ FOOTYBETT WINNER CASHED! ✅🎉\n"
-            "════════════════════════════\n"
-            f"🏟 Match  : {s.team_home} vs {s.team_away}\n"
-            f"🎯 Pick   : {s.selection} @ {s.odds:.2f}\n"
-            f"🏁 Score  : {s.score_str}\n"
-            f"💰 Profit : +{profit_u:.2f} Units Won!\n"
-            "════════════════════════════"
-        )
+    def format_player_channel_result_update(cls, s: LedgerBetItem) -> str:
+        """
+        Formats the settled result card for @Footybett ONCE — both for WON ✅ and LOST ❌
+        and embeds the running cumulative @Footybett record!
+        """
+        tally_line = cls.get_running_channel_tally_line()
+        if "WON" in s.settlement:
+            profit_u = s.recommended_units * (s.odds - 1.0)
+            return (
+                "🎉✅ FOOTYBETT WINNER CASHED! ✅🎉\n"
+                "════════════════════════════\n"
+                f"🏟 Match  : {s.team_home} vs {s.team_away}\n"
+                f"🎯 Pick   : {s.selection} @ {s.odds:.2f}\n"
+                f"🏁 Result : {s.score_str} — WON ✅\n"
+                f"💰 Profit : +{profit_u:.2f} Units Won!\n"
+                "────────────────────────────\n"
+                f"{tally_line}\n"
+                "════════════════════════════"
+            )
+        elif "LOST" in s.settlement:
+            autopsy_line = f"\n{s.loss_autopsy}" if s.loss_autopsy else ""
+            return (
+                "📊❌ FOOTYBETT PICK RESULT (SETTLED) ❌📊\n"
+                "════════════════════════════\n"
+                f"🏟 Match  : {s.team_home} vs {s.team_away}\n"
+                f"🎯 Pick   : {s.selection} @ {s.odds:.2f}\n"
+                f"🏁 Result : {s.score_str} — LOST ❌\n"
+                f"📉 Impact : -{s.recommended_units:.1f} Unit(s){autopsy_line}\n"
+                "────────────────────────────\n"
+                f"{tally_line}\n"
+                "════════════════════════════"
+            )
+        else:
+            return (
+                "➖📊 FOOTYBETT PICK RESULT (PUSH / VOID) 📊➖\n"
+                "════════════════════════════\n"
+                f"🏟 Match  : {s.team_home} vs {s.team_away}\n"
+                f"🎯 Pick   : {s.selection} @ {s.odds:.2f}\n"
+                f"🏁 Result : {s.score_str} — PUSH ➖ (Stake Returned)\n"
+                "────────────────────────────\n"
+                f"{tally_line}\n"
+                "════════════════════════════"
+            )
 
     @classmethod
-    def format_daily_ledger(cls, items: List[LedgerBetItem], header_title: str = "TODAY'S BET SLATE") -> str:
+    def format_channel_total_analysis_recap(cls, focus_date: Optional[str] = None) -> str:
+        """
+        Formats a clean, high-trust Official Total Analysis (Won vs Lost + All-Time P&L)
+        specifically designed to be posted to @Footybett once a day's slate settles or on `/poststats`.
+        """
+        all_items = list(DailyLedgerManager.load_all_history_items().values())
+        approved = [i for i in all_items if i.is_approved]
+        settled_app = [i for i in approved if i.settlement in ["WON ✅", "LOST ❌", "PUSH ➖"]]
+        won_app = [i for i in settled_app if "WON" in i.settlement]
+        lost_app = [i for i in settled_app if "LOST" in i.settlement]
+
+        win_rate = (len(won_app) / (len(won_app) + len(lost_app)) * 100.0) if (len(won_app) + len(lost_app)) > 0 else 0.0
+        units_staked = sum(i.recommended_units for i in settled_app)
+        net_units = 0.0
+        for i in settled_app:
+            if "WON" in i.settlement:
+                net_units += i.recommended_units * (i.odds - 1.0)
+            elif "LOST" in i.settlement:
+                net_units -= i.recommended_units
+        roi_pct = (net_units / units_staked * 100.0) if units_staked > 0 else 0.0
+
+        target_d = focus_date or DailyLedgerManager.get_yesterday_str()
+        day_picks = [i for i in approved if i.date_str == target_d]
+        if not day_picks:
+            target_d = DailyLedgerManager.get_today_str()
+            day_picks = [i for i in approved if i.date_str == target_d]
+
+        lines = [
+            "📊🏆 @Footybett OFFICIAL WON/LOST & P&L RECAP 🏆📊",
+            "════════════════════════════════",
+        ]
+
+        if day_picks:
+            d_won = sum(1 for i in day_picks if "WON" in i.settlement)
+            d_lost = sum(1 for i in day_picks if "LOST" in i.settlement)
+            lines.append(f"📅 SLATE REVIEW ({target_d}: {d_won} Won ✅ | {d_lost} Lost ❌):")
+            for idx, s in enumerate(day_picks, 1):
+                if "WON" in s.settlement:
+                    p_u = s.recommended_units * (s.odds - 1.0)
+                    lines.append(f"  {idx}. ✅ {s.team_home} vs {s.team_away} — {s.selection} @ {s.odds:.2f} ➔ {s.score_str} (+{p_u:.2f}u)")
+                elif "LOST" in s.settlement:
+                    lines.append(f"  {idx}. ❌ {s.team_home} vs {s.team_away} — {s.selection} @ {s.odds:.2f} ➔ {s.score_str} (-{s.recommended_units:.1f}u)")
+                    if s.loss_autopsy:
+                        lines.append(f"      ↳ {s.loss_autopsy}")
+                else:
+                    lines.append(f"  {idx}. ⏳ {s.team_home} vs {s.team_away} — {s.selection} @ {s.odds:.2f} ➔ {s.score_str}")
+            lines.append("────────────────────────────────")
+
+        lines.extend([
+            f"📈 ALL-TIME @Footybett TRACK RECORD (Since {TRACKING_START_DATE}):",
+            f"• Total VIP Picks Settled : {len(settled_app)}",
+            f"• Total Picks Won ✅      : {len(won_app)}",
+            f"• Total Picks Lost ❌     : {len(lost_app)}",
+            f"• Official Win Rate       : {win_rate:.1f}%",
+            f"• Total Units Risked      : {units_staked:.1f} u",
+            f"• Net Profit Made         : {net_units:+.2f} u ( @ $50/u = ${net_units * 50:+.2f} )",
+            f"• Return on Inv (ROI)     : {roi_pct:+.1f}%",
+            "════════════════════════════════",
+            "🛡️ 100% Verified Pre-Match Model • Every Win & Loss Tracked"
+        ])
+        return "\n".join(lines)
+
+    @classmethod
+    def _format_single_day_section(cls, date_label: str, items: List[LedgerBetItem]) -> List[str]:
         approved = [i for i in items if i.is_approved]
         rejected = [i for i in items if not i.is_approved]
         approved.sort(key=lambda x: x.edge_ev, reverse=True)
 
-        lines = []
-        today = DailyLedgerManager.get_today_str()
-        lines.append(f"🎯 {header_title} ({today})")
-        lines.append(f"Summary: {len(approved)} Valid Bets ✅ | {len(rejected)} Avoided ❌")
-        lines.append("═" * 32 + "\n")
+        lines = [
+            f"📅 {date_label} — ({len(approved)} Chosen ✅ | {len(rejected)} Declined ❌)",
+            "═" * 32
+        ]
 
         if approved:
-            lines.append("🟢 VALID BETS TO PLACE TODAY:")
+            lines.append("🟢 CHOSEN / APPROVED BETS:")
             for idx, s in enumerate(approved, 1):
                 chs = ", ".join(f"@{ch}" for ch in s.consensus_sources if ch) or "@Manual"
-                status_tag = f" • [{s.settlement} {s.score_str}]" if s.score_str != "-" else ""
-                pub_tag = " 📢[Sent to @Footybett]" if s.published_to_channel else ""
-                lines.append(f"{idx}. {s.team_home} vs {s.team_away}{status_tag}{pub_tag}")
-                if len(s.consensus_sources) >= 2:
-                    lines.append(f"   🔥 CONSENSUS ({len(s.consensus_sources)} Channels: {chs})")
-                else:
-                    lines.append(f"   📡 Channel : {chs}")
-                lines.append(f"   📋 Pick    : {s.selection}")
-                lines.append(f"   💰 Odds    : {s.odds:.2f} (Min Floor: {s.floor_odds:.2f}) | Stake: {s.recommended_units}u")
-                lines.append(f"   📊 Edge    : {s.confidence_stars} ({s.model_prob}% Win Prob | {s.edge_ev:+.1f}% EV)")
-                if s.match_context:
-                    lines.append(f"   🏆 Context : {s.match_context}")
-                if s.lineup_injuries_info:
-                    lines.append(f"   👥 Squads  : {s.lineup_injuries_info}")
+                live_str = f" • [{s.settlement} | {s.score_str}]" if s.score_str != "-" else f" • [{s.settlement}]"
+                pub_tag = " 📢[@Footybett]" if s.published_to_channel else ""
+                lines.append(f"{idx}. {s.team_home} vs {s.team_away}{live_str}{pub_tag}")
+                lines.append(f"   📡 Source  : {chs}")
+                lines.append(f"   📋 Pick    : {s.selection} @ {s.odds:.2f} (Stake: {s.recommended_units}u)")
+                lines.append(f"   📊 Edge    : {s.confidence_stars} ({s.model_prob}% Prob | {s.edge_ev:+.1f}% EV)")
+                if s.live_detail:
+                    lines.append(f"   ⏱️ Live Now: {s.live_detail}")
+                if s.loss_autopsy:
+                    lines.append(f"   {s.loss_autopsy}")
                 lines.append(f"   💡 Why     : {s.rationale}")
-                lines.append(f"   📜 Proof   : {s.evidence}")
                 lines.append("-" * 32)
-            lines.append("")
         else:
-            lines.append("⚠️ No valid +EV bets found yet today.\n")
+            lines.append("⚠️ No approved +EV bets for this date.")
 
         if rejected:
-            lines.append("🔴 AVOIDED / INVALID BETS (Do Not Bet):")
+            lines.append("\n🔴 DECLINED / AVOIDED BETS (Why We Passed):")
             for r in rejected:
                 chs = ", ".join(f"@{ch}" for ch in r.consensus_sources if ch) or "@Manual"
-                status_tag = f" [{r.settlement} {r.score_str}]" if r.score_str != "-" else ""
-                lines.append(f"✖ [{chs}] {r.team_home} vs {r.team_away} ({r.selection} @ {r.odds:.2f}){status_tag} — {r.rationale}")
+                score_info = f" [{r.settlement} {r.score_str}]" if r.score_str != "-" else ""
+                badge = " 🛡️(TRAP DODGED!)" if "LOST" in r.settlement else ""
+                lines.append(f"✖ [{chs}] {r.team_home} vs {r.team_away} ({r.selection} @ {r.odds:.2f}){score_info}{badge}")
+                lines.append(f"   ↳ Reason: {r.rationale}")
 
+        lines.append("")
+        return lines
+
+    @classmethod
+    def format_full_bot_curation_slate(cls, today_items: List[LedgerBetItem], yesterday_items: List[LedgerBetItem]) -> str:
+        today = DailyLedgerManager.get_today_str()
+        yesterday = DailyLedgerManager.get_yesterday_str()
+        lines = [
+            "🎯 BOT CURATION LOG (CHOSEN ✅ vs DECLINED ❌)",
+            "🔄 Live Score Engine: ESPN Real-Time + API-Football",
+            ""
+        ]
+        lines.extend(cls._format_single_day_section(f"TODAY ({today})", today_items))
+        if yesterday_items:
+            lines.extend(cls._format_single_day_section(f"YESTERDAY ({yesterday})", yesterday_items))
         return "\n".join(lines)
 
     @classmethod
-    def format_results_audit(cls, items: List[LedgerBetItem]) -> str:
-        if not items:
-            return "ℹ️ No bets recorded for today yet. Tap `/scan` first, or tap `/stats` to view all-time results since yesterday (2026-11-08)."
-
-        approved = [i for i in items if i.is_approved]
-        rejected = [i for i in items if not i.is_approved]
-
-        lines = []
+    def format_results_audit(cls, today_items: List[LedgerBetItem], yesterday_items: List[LedgerBetItem]) -> str:
         today = DailyLedgerManager.get_today_str()
-        lines.append(f"🏁 TODAY'S LIVE SCORES & RESULTS ({today})")
-        lines.append("═" * 32 + "\n")
+        yesterday = DailyLedgerManager.get_yesterday_str()
+        combined = today_items + yesterday_items
+        if not combined:
+            return "ℹ️ No bets recorded for today or yesterday yet. Tap `/scan` first."
 
-        app_won = sum(1 for i in approved if "WON" in i.settlement)
-        app_lost = sum(1 for i in approved if "LOST" in i.settlement)
-        lines.append(f"🟢 OUR PICKS ({app_won} Won | {app_lost} Lost | {len(approved) - app_won - app_lost} Live/Pending):")
-        for idx, s in enumerate(approved, 1):
-            chs = ", ".join(f"@{ch}" for ch in s.consensus_sources if ch) or "@Manual"
-            lines.append(f"  {idx}. [{chs}] {s.team_home} vs {s.team_away} — {s.selection} @ {s.odds:.2f} ➔ {s.score_str} [{s.settlement}]")
-        if not approved:
-            lines.append("  • None today.")
-        lines.append("")
+        lines = [
+            f"🏁 LIVE ON-SPOT SCORES & SETTLEMENT AUDIT",
+            f"(Updated Live: {datetime.datetime.now(datetime.timezone.utc).strftime('%H:%M:%S UTC')})",
+            "═" * 32 + "\n"
+        ]
 
-        rej_won = sum(1 for i in rejected if "WON" in i.settlement)
-        rej_lost = sum(1 for i in rejected if "LOST" in i.settlement)
-        lines.append(f"🔴 REJECTED AUDIT ({rej_lost} Traps Dodged 🛡️ | {rej_won} Won 💡):")
-        for r in rejected:
-            chs = ", ".join(f"@{ch}" for ch in r.consensus_sources if ch) or "@Manual"
-            badge = "🛡️ SAVED!" if "LOST" in r.settlement else ("💡 Won" if "WON" in r.settlement else "")
-            lines.append(f"  • [{chs}] {r.team_home} vs {r.team_away} ({r.selection} @ {r.odds:.2f}) ➔ {r.score_str} [{r.settlement}] {badge}")
+        for label, group in [(f"TODAY ({today})", today_items), (f"YESTERDAY ({yesterday})", yesterday_items)]:
+            if not group:
+                continue
+            approved = [i for i in group if i.is_approved]
+            rejected = [i for i in group if not i.is_approved]
+            w_cnt = sum(1 for i in approved if "WON" in i.settlement)
+            l_cnt = sum(1 for i in approved if "LOST" in i.settlement)
+            p_cnt = len(approved) - w_cnt - l_cnt
+
+            lines.append(f"📅 {label} — CHOSEN PICKS ({w_cnt} Won ✅ | {l_cnt} Lost ❌ | {p_cnt} Live/Pending):")
+            for idx, s in enumerate(approved, 1):
+                chs = ", ".join(f"@{ch}" for ch in s.consensus_sources if ch) or "@Manual"
+                lines.append(
+                    f"  {idx}. [{chs}] {s.team_home} vs {s.team_away} — {s.selection} @ {s.odds:.2f} ➔ {s.score_str} [{s.settlement}]"
+                )
+                if s.live_detail:
+                    lines.append(f"      ⏱️ {s.live_detail}")
+                if s.loss_autopsy:
+                    lines.append(f"      {s.loss_autopsy}")
+            if not approved:
+                lines.append("  • No approved picks for this date.")
+
+            rej_won = sum(1 for i in rejected if "WON" in i.settlement)
+            rej_lost = sum(1 for i in rejected if "LOST" in i.settlement)
+            lines.append(f"\n🔴 {label} — DECLINED AUDIT ({rej_lost} Traps Dodged 🛡️ | {rej_won} Won 💡):")
+            for r in rejected:
+                chs = ", ".join(f"@{ch}" for ch in r.consensus_sources if ch) or "@Manual"
+                badge = "🛡️ TRAP DODGED!" if "LOST" in r.settlement else ("💡 Won" if "WON" in r.settlement else "")
+                lines.append(
+                    f"  • [{chs}] {r.team_home} vs {r.team_away} ({r.selection} @ {r.odds:.2f}) ➔ {r.score_str} [{r.settlement}] {badge}"
+                )
+            lines.append("\n" + "─" * 32 + "\n")
 
         return "\n".join(lines)
 
@@ -1298,7 +1819,6 @@ class BetSlipCardFormatter:
         traps_dodged = sum(1 for r in rejected if "LOST" in r.settlement)
         units_saved = traps_dodged * 1.0
 
-        # Group day-by-day summary starting from TRACKING_START_DATE (2026-11-08)
         dates = sorted({i.date_str for i in approved if i.date_str >= TRACKING_START_DATE})
         daily_lines = []
         for d_str in dates:
@@ -1319,7 +1839,7 @@ class BetSlipCardFormatter:
 
         return (
             f"📈 ALL-TIME P&L & PERFORMANCE STATS\n"
-            f"(Tracking Since Yesterday: {TRACKING_START_DATE})\n"
+            f"(Tracking Since: {TRACKING_START_DATE})\n"
             f"════════════════════════════════\n"
             f"🎯 BETS TAKEN SUMMARY:\n"
             f"• Total Approved Bets : {total_taken} ({len(settled_app)} Settled | {pending_app} Open)\n"
@@ -1336,7 +1856,7 @@ class BetSlipCardFormatter:
             f"{daily_breakdown_str}\n\n"
             f"🛡️ FILTER EFFICIENCY (TRAPS DODGED):\n"
             f"• Total Signals Scanned: {len(all_items)}\n"
-            f"• Bad Bets Filtered Out: {len(rejected)}\n"
+            f"• Bad Bets Declined    : {len(rejected)}\n"
             f"• Confirmed Losing Traps Dodged: {traps_dodged} (Saved -{units_saved:.1f} u)"
         )
 
@@ -1370,12 +1890,12 @@ class ChannelWebWatcher:
             return ""
 
     @classmethod
-    def extract_posts_today_only(cls, html: str, only_unseen: bool = True) -> List[Tuple[str, str, List[str]]]:
+    def extract_recent_posts(cls, html: str, only_unseen: bool = True) -> List[Tuple[str, str, str, List[str]]]:
         if not html:
             return []
         seen = load_json_set(SEEN_POSTS_FILE)
         posts = []
-        today_iso = DailyLedgerManager.get_today_str()
+        valid_dates = {DailyLedgerManager.get_today_str(), DailyLedgerManager.get_yesterday_str()}
 
         parts = re.split(r'(?=<div[^>]+data-post=")', html)
         for block in parts:
@@ -1388,11 +1908,10 @@ class ChannelWebWatcher:
                 continue
 
             time_m = re.search(r'<time[^>]+datetime="([^"]+)"', block)
-            if time_m:
-                post_datetime_str = time_m.group(1)
-                if not post_datetime_str.startswith(today_iso):
-                    continue
-            else:
+            if not time_m:
+                continue
+            post_date = time_m.group(1)[:10]
+            if post_date not in valid_dates:
                 continue
 
             text_m = re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', block, re.DOTALL)
@@ -1402,7 +1921,7 @@ class ChannelWebWatcher:
                 raw_text = re.sub(r'<[^>]+>', '', raw_text).strip()
 
             img_urls = re.findall(r'background-image:url\(\'(https://[^\']+)\'\)', block)
-            posts.append((post_id, raw_text, img_urls))
+            posts.append((post_id, post_date, raw_text, img_urls))
 
         return posts
 
@@ -1417,7 +1936,6 @@ class TelegramBotClient:
         self.pending_timers: Dict[int, threading.Timer] = {}
         self.lock = threading.Lock()
         self.channel_publish_lock = threading.Lock()
-        # Ensure 2026-11-08 baseline is seeded immediately on startup
         DailyLedgerManager.load_all_history_items()
 
     def send_message(self, chat_id: Any, text: str, remove_kb: bool = True) -> bool:
@@ -1455,23 +1973,28 @@ class TelegramBotClient:
                 ok = False
         return ok
 
-    def sync_and_publish_to_footybett(self) -> int:
+    def sync_and_publish_to_footybett(self, force_fresh_scores: bool = False) -> int:
         """
-        Thread-safe publisher for @Footybett:
-        1. Grades live/finished scores first so already-finished games aren't posted as 'new bets to take'.
-        2. Sends each newly confirmed, open APPROVED pick ONCE as an individual card to @Footybett.
-        3. Sends a Winner Celebration card ONCE when a previously published pick on @Footybett settles as WON ✅.
+        Thread-safe publisher & retroactive corrector for @Footybett:
+        1. Grades live/finished scores across 3-day window (using ESPN Real-Time + ESPN Stats + API-Football).
+        2. Sends each newly confirmed, open APPROVED pick ONCE to @Footybett (`pick:<date>:<bet_key>`).
+        3. Retroactively & live sends the settled outcome (BOTH WON ✅ and LOST ❌) ONCE to @Footybett
+           (`result:<date>:<bet_key>`) for any approved pick from 2026-11-09 onward whose result hasn't been posted yet.
+        4. Once all of a date's approved picks have settled, posts the Official Total Won/Lost & P&L Analysis Recap
+           card ONCE for that settled slate (`recap:<date>:<settled_count>`).
         """
         with self.channel_publish_lock:
-            LiveFootballAPI.grade_ledger_items()
+            LiveFootballAPI.grade_ledger_items(force_fresh=force_fresh_scores)
             all_items = DailyLedgerManager.load_all_history_items()
             today = DailyLedgerManager.get_today_str()
             published_count = 0
             updated = False
+            dates_with_new_settlements: Set[str] = set()
 
             for full_key, item in all_items.items():
                 pick_lock_key = f"pick:{full_key}"
-                win_lock_key = f"win:{full_key}"
+                result_lock_key = f"result:{full_key}"
+                legacy_win_lock = f"win:{full_key}"
 
                 # 1. New Approved Bet -> Send ONCE to @Footybett (only if match is today & still open/pending)
                 if item.date_str == today and item.is_approved:
@@ -1485,25 +2008,56 @@ class TelegramBotClient:
                                 updated = True
                                 time.sleep(1.0)
 
-                # 2. Settled Winner -> Celebrate ONCE in @Footybett
-                if item.is_approved and "WON" in item.settlement:
-                    if (item.published_to_channel or DailyLedgerManager.is_locked_in_channel(pick_lock_key)):
-                        if not item.published_result_to_channel and not DailyLedgerManager.is_locked_in_channel(win_lock_key):
-                            win_text = BetSlipCardFormatter.format_player_channel_win_update(item)
-                            if self.send_message(PUBLISH_CHANNEL_ID, win_text, remove_kb=False):
-                                item.published_result_to_channel = True
-                                DailyLedgerManager.mark_locked_in_channel(win_lock_key)
-                                updated = True
-                                time.sleep(1.0)
+                # 2. Settled Outcome (WON ✅, LOST ❌, or PUSH ➖) -> Post Result ONCE in @Footybett
+                # Also catches yesterday's (2026-11-09+) approved picks where the losing result was never posted!
+                if item.is_approved and item.date_str >= "2026-11-09" and item.settlement in ["WON ✅", "LOST ❌", "PUSH ➖"]:
+                    already_settled_post = (
+                        item.published_result_to_channel
+                        or DailyLedgerManager.is_locked_in_channel(result_lock_key)
+                        or DailyLedgerManager.is_locked_in_channel(legacy_win_lock)
+                    )
+                    if not already_settled_post:
+                        res_text = BetSlipCardFormatter.format_player_channel_result_update(item)
+                        if self.send_message(PUBLISH_CHANNEL_ID, res_text, remove_kb=False):
+                            item.published_to_channel = True
+                            item.published_result_to_channel = True
+                            DailyLedgerManager.mark_locked_in_channel(pick_lock_key)
+                            DailyLedgerManager.mark_locked_in_channel(result_lock_key)
+                            dates_with_new_settlements.add(item.date_str)
+                            updated = True
+                            time.sleep(1.0)
 
             if updated:
                 DailyLedgerManager.save_all_items(all_items)
+
+            # 3. Post Official Daily + All-Time Won/Lost Analysis Recap to @Footybett ONCE when a date's picks finish settling
+            check_dates = dates_with_new_settlements | {DailyLedgerManager.get_yesterday_str()}
+            for d_str in sorted(check_dates):
+                if d_str < "2026-11-09":
+                    continue
+                day_app = [i for i in all_items.values() if i.date_str == d_str and i.is_approved]
+                if not day_app:
+                    continue
+                settled_day = [i for i in day_app if i.settlement in ["WON ✅", "LOST ❌", "PUSH ➖"]]
+                # Post recap when all approved picks for that date have settled
+                if len(settled_day) == len(day_app) and len(settled_day) > 0:
+                    recap_lock = f"recap:{d_str}:{len(settled_day)}"
+                    if not DailyLedgerManager.is_locked_in_channel(recap_lock):
+                        recap_text = BetSlipCardFormatter.format_channel_total_analysis_recap(focus_date=d_str)
+                        if self.send_message(PUBLISH_CHANNEL_ID, recap_text, remove_kb=False):
+                            DailyLedgerManager.mark_locked_in_channel(recap_lock)
+                            time.sleep(1.0)
+
             return published_count
 
-    def broadcast(self, text: str):
+    def broadcast_admin(self, text: str):
         subs = load_json_set(SUBSCRIBERS_FILE)
         for cid in subs:
-            self.send_message(int(cid), text)
+            try:
+                if int(cid) > 0:
+                    self.send_message(int(cid), text)
+            except Exception:
+                pass
 
     def get_updates(self, offset: Optional[int] = None) -> List[Dict[str, Any]]:
         url = f"{self.base_url}/getUpdates?timeout=10"
@@ -1563,14 +2117,14 @@ class TelegramBotClient:
             logger.error("OCR extraction failed: %s", e)
             return ""
 
-    def ingest_text_into_ledger(self, text: str, source_channel: str = "") -> List[LedgerBetItem]:
-        signals = BetParser.parse_multiple(text, source_channel=source_channel)
-        added_or_updated = []
+    def ingest_text_into_ledger(self, text: str, source_channel: str = "", post_date_str: str = "") -> List[Tuple[bool, LedgerBetItem]]:
+        signals = BetParser.parse_multiple(text, source_channel=source_channel, post_date_str=post_date_str)
+        results = []
         for s in signals:
-            item = FootballIntelligenceEngine.evaluate_to_ledger_item(s)
-            _, stored = DailyLedgerManager.upsert_bet(item)
-            added_or_updated.append(stored)
-        return added_or_updated
+            item = FootballIntelligenceEngine.evaluate_to_ledger_item(s, date_override=post_date_str or None)
+            is_new, stored = DailyLedgerManager.upsert_bet(item)
+            results.append((is_new, stored))
+        return results
 
     def flush_album_burst(self, chat_id: int):
         with self.lock:
@@ -1580,18 +2134,15 @@ class TelegramBotClient:
         if not photos:
             return
 
-        self.send_message(chat_id, f"🔍 Scanning {len(photos)} bet slips & sending new approved picks to {PUBLISH_CHANNEL_ID}...")
+        self.send_message(chat_id, f"🔍 Scanning {len(photos)} bet slips & syncing live status...")
         for p_bytes in photos:
             extracted = self.extract_text_from_photo(p_bytes)
             self.ingest_text_into_ledger(extracted, source_channel="Forwarded_Slip")
 
-        self.sync_and_publish_to_footybett()
-        all_today = list(DailyLedgerManager.load_today_items().values())
-        if all_today:
-            card = BetSlipCardFormatter.format_daily_ledger(all_today)
-            self.send_message(chat_id, card)
-        else:
-            self.send_message(chat_id, "⚠️ Scanned screenshots, but could not detect structured match & odds lines.")
+        self.sync_and_publish_to_footybett(force_fresh_scores=True)
+        t_items, y_items = DailyLedgerManager.load_recent_active_items()
+        card = BetSlipCardFormatter.format_full_bot_curation_slate(t_items, y_items)
+        self.send_message(chat_id, card)
 
     def queue_photo(self, chat_id: int, photo_bytes: bytes):
         with self.lock:
@@ -1606,61 +2157,62 @@ class TelegramBotClient:
             self.pending_timers[chat_id] = timer
             timer.start()
 
-    def execute_scan_and_show_today_slate(self, chat_id: int):
+    def execute_scan_and_show_slate(self, chat_id: int):
         try:
             channels = list(ChannelWebWatcher.get_watched_channels())
-            today_str = DailyLedgerManager.get_today_str()
-            self.send_message(chat_id, f"⚡ Scanning {len(channels)} channels & syncing new valid picks to {PUBLISH_CHANNEL_ID} ({today_str})...")
+            self.send_message(
+                chat_id,
+                f"⚡ Scanning {len(channels)} channels + pulling LIVE on-spot match scores & syncing {PUBLISH_CHANNEL_ID}..."
+            )
 
             seen = load_json_set(SEEN_POSTS_FILE)
             for ch in channels:
                 html = ChannelWebWatcher.fetch_recent_channel_html(ch)
                 if not html:
                     continue
-                posts = ChannelWebWatcher.extract_posts_today_only(html, only_unseen=True)
-                for post_id, text, img_urls in posts:
+                posts = ChannelWebWatcher.extract_recent_posts(html, only_unseen=True)
+                for post_id, post_date, text, img_urls in posts:
                     seen.add(post_id)
                     if text.strip():
-                        self.ingest_text_into_ledger(text, source_channel=ch)
+                        self.ingest_text_into_ledger(text, source_channel=ch, post_date_str=post_date)
                     for i_url in img_urls:
                         i_bytes = self.download_url_bytes(i_url)
                         if i_bytes:
                             img_text = self.extract_text_from_photo(i_bytes)
-                            self.ingest_text_into_ledger(img_text, source_channel=ch)
+                            self.ingest_text_into_ledger(img_text, source_channel=ch, post_date_str=post_date)
 
             save_json_set(SEEN_POSTS_FILE, seen)
 
-            # Grade and publish any newly confirmed picks / winners to @Footybett ONCE
-            self.sync_and_publish_to_footybett()
-            all_today = list(DailyLedgerManager.load_today_items().values())
+            self.sync_and_publish_to_footybett(force_fresh_scores=True)
+            t_items, y_items = DailyLedgerManager.load_recent_active_items()
 
-            if not all_today:
-                self.send_message(
-                    chat_id,
-                    f"📅 No new structured bet slips have been posted yet for today ({today_str}).\n\n"
-                    f"✅ Yesterday's (2026-11-08) 4 Wins (+2.89u) are recorded in your ledger — tap /stats to view your total P&L!"
-                )
-                return
-
-            card = BetSlipCardFormatter.format_daily_ledger(all_today, header_title="TODAY'S COMPLETE BET SLATE")
+            card = BetSlipCardFormatter.format_full_bot_curation_slate(t_items, y_items)
             self.send_message(chat_id, card)
         except Exception as e:
             logger.error("Scan error: %s", e)
             self.send_message(chat_id, f"❌ Scan error: {e}")
 
     def background_worker_loop(self):
-        logger.info("Background Channel & @Footybett One-Time Publisher Worker started...")
-        time.sleep(30)
+        logger.info("Background Channel, Live Score & @Footybett Publisher Worker started...")
+        # Run an immediate catch-up pass 5 seconds after startup so yesterday's missing loss result & recap post right away!
+        time.sleep(5)
+        try:
+            self.sync_and_publish_to_footybett(force_fresh_scores=True)
+        except Exception as e:
+            logger.error("Initial startup sync error: %s", e)
+
         cycle = 0
         while True:
             try:
+                time.sleep(50)
                 cycle += 1
                 seen = load_json_set(SEEN_POSTS_FILE)
+                newly_scanned_items: List[LedgerBetItem] = []
 
                 for ch in ChannelWebWatcher.get_watched_channels():
                     html = ChannelWebWatcher.fetch_recent_channel_html(ch)
-                    posts = ChannelWebWatcher.extract_posts_today_only(html, only_unseen=True)
-                    for post_id, text, img_urls in posts:
+                    posts = ChannelWebWatcher.extract_recent_posts(html, only_unseen=True)
+                    for post_id, post_date, text, img_urls in posts:
                         seen.add(post_id)
                         all_blocks = [text] if text.strip() else []
                         for i_url in img_urls:
@@ -1668,29 +2220,43 @@ class TelegramBotClient:
                             if i_bytes:
                                 all_blocks.append(self.extract_text_from_photo(i_bytes))
                         for blk in all_blocks:
-                            for s in BetParser.parse_multiple(blk, source_channel=ch):
-                                item = FootballIntelligenceEngine.evaluate_to_ledger_item(s)
-                                DailyLedgerManager.upsert_bet(item)
+                            res_list = self.ingest_text_into_ledger(blk, source_channel=ch, post_date_str=post_date)
+                            for is_new, stored in res_list:
+                                if is_new:
+                                    newly_scanned_items.append(stored)
 
                 save_json_set(SEEN_POSTS_FILE, seen)
 
-                # Sync to @Footybett: sends ONLY new unposted individual picks and newly won celebrations
-                self.sync_and_publish_to_footybett()
+                self.sync_and_publish_to_footybett(force_fresh_scores=(cycle % 3 == 0))
 
-                if cycle % 10 == 0:
-                    self.sync_and_publish_to_footybett()
+                if newly_scanned_items:
+                    app_new = [i for i in newly_scanned_items if i.is_approved]
+                    rej_new = [i for i in newly_scanned_items if not i.is_approved]
+                    lines = [
+                        f"🔔 NEW CHANNEL SIGNALS EVALUATED ({len(app_new)} Chosen ✅ | {len(rej_new)} Declined ❌)",
+                        "═" * 32
+                    ]
+                    for s in app_new:
+                        chs = ", ".join(f"@{c}" for c in s.consensus_sources if c)
+                        lines.append(f"✅ CHOSEN [{chs}]: {s.team_home} vs {s.team_away} — {s.selection} @ {s.odds:.2f}")
+                        lines.append(f"   ↳ Why: {s.rationale}")
+                    for r in rej_new:
+                        chs = ", ".join(f"@{c}" for c in r.consensus_sources if c)
+                        lines.append(f"❌ DECLINED [{chs}]: {r.team_home} vs {r.team_away} ({r.selection} @ {r.odds:.2f})")
+                        lines.append(f"   ↳ Reason: {r.rationale}")
+                    self.broadcast_admin("\n".join(lines))
 
             except Exception as e:
                 logger.error("Background worker error: %s", e)
-            time.sleep(50)
 
     def set_official_menu_commands(self):
         commands = [
-            {"command": "scan", "description": "⚡ Today's Valid & Invalid Bets"},
-            {"command": "results", "description": "🏁 Today's Live Scores & Match Audit"},
+            {"command": "scan", "description": "⚡ Chosen & Declined Bets + Live Sync"},
+            {"command": "results", "description": "🏁 Live On-Spot Scores & Won/Lost Audit"},
             {"command": "stats", "description": "📈 Total PnL, Win Rate & R:R (Since 2026-11-08)"},
+            {"command": "poststats", "description": "📢 Post Total Won/Lost Analysis to @Footybett"},
             {"command": "channels", "description": "👁️ Monitored Telegram Channels (8)"},
-            {"command": "status", "description": "⚙️ System & API Quota Status"}
+            {"command": "status", "description": "⚙️ System & Live Feed Status"}
         ]
         url = f"{self.base_url}/setMyCommands"
         req = urllib.request.Request(
@@ -1709,7 +2275,7 @@ class TelegramBotClient:
         watcher_thread = threading.Thread(target=self.background_worker_loop, daemon=True)
         watcher_thread.start()
 
-        logger.info("Bot listener running with @Footybett One-Time Publisher & 2026-11-08 Baseline...")
+        logger.info("Bot listener running (v14.0) with Retroactive @Footybett Settlement & Total Analysis...")
         offset = None
 
         while True:
@@ -1731,23 +2297,34 @@ class TelegramBotClient:
                 if text == "/start":
                     self.send_message(
                         chat_id,
-                        "👋 Welcome to Pro Football Syndicate & @Footybett Publisher!\n\n"
+                        "👋 Welcome to Pro Football Syndicate & @Footybett Publisher (v14.0)!\n\n"
                         "Use the blue [ Menu ] button on the left anytime:\n"
-                        "• /scan — ⚡ Today's Valid & Invalid Bets\n"
-                        "• /results — 🏁 Today's Live Scores & Match Audit\n"
+                        "• /scan — ⚡ Chosen ✅ & Declined ❌ Bets (Today & Yesterday)\n"
+                        "• /results — 🏁 Live On-Spot Scores, Match Clock & Won/Lost Audit\n"
                         "• /stats — 📈 Total PnL, Win Rate & R:R (Since 2026-11-08)\n"
+                        "• /poststats — 📢 Post Official Total Won/Lost Analysis to @Footybett\n"
                         "• /channels — 👁️ Monitored Telegram Channels\n"
-                        "• /status — ⚙️ System & API Quota Status\n\n"
-                        "📢 Auto-Publishing: Every new approved bet is sent ONCE to @Footybett, and celebrated ONCE when it wins."
+                        "• /status — ⚙️ System & Live Feed Status"
                     )
                     continue
 
                 if text in ["/stats", "📈 Total PnL & Stats"]:
                     def run_stats(cid):
-                        self.sync_and_publish_to_footybett()
+                        self.sync_and_publish_to_footybett(force_fresh_scores=True)
                         report = BetSlipCardFormatter.format_lifetime_pnl_stats()
                         self.send_message(cid, report)
                     threading.Thread(target=run_stats, args=[chat_id], daemon=True).start()
+                    continue
+
+                if text == "/poststats":
+                    def run_post_stats(cid):
+                        self.sync_and_publish_to_footybett(force_fresh_scores=True)
+                        recap_card = BetSlipCardFormatter.format_channel_total_analysis_recap()
+                        if self.send_message(PUBLISH_CHANNEL_ID, recap_card, remove_kb=False):
+                            self.send_message(cid, f"✅ Posted Official Total Won/Lost & P&L Analysis to {PUBLISH_CHANNEL_ID}!\n\n{recap_card}")
+                        else:
+                            self.send_message(cid, f"❌ Could not post to {PUBLISH_CHANNEL_ID}. Verify the bot is an Admin in the channel.")
+                    threading.Thread(target=run_post_stats, args=[chat_id], daemon=True).start()
                     continue
 
                 if text in ["/status", "⚙️ System & Quota Status"]:
@@ -1755,17 +2332,17 @@ class TelegramBotClient:
                     ocr_stat = "Active (Shuffle Dark-Mode Binarization)" if OCR_AVAILABLE else "Not Installed"
                     channels = ChannelWebWatcher.get_watched_channels()
                     all_hist = DailyLedgerManager.load_all_history_items()
-                    today_items = DailyLedgerManager.load_today_items()
+                    t_items, y_items = DailyLedgerManager.load_recent_active_items()
                     locks_count = len(load_json_set(PUBLISHED_LOCKS_FILE))
                     self.send_message(
                         chat_id,
-                        f"⚙️ SYSTEM STATUS\n"
+                        f"⚙️ SYSTEM & LIVE SCORE STATUS\n"
                         f"════════════════════════════════\n"
-                        f"📡 API-Football : {api_stat}\n"
+                        f"📡 Live Feeds   : {api_stat}\n"
                         f"📸 Image OCR    : {ocr_stat}\n"
                         f"📢 VIP Channel  : {PUBLISH_CHANNEL_ID} ({locks_count} posts locked)\n"
                         f"👁️ Active Feeds : {len(channels)} Channels Monitored\n"
-                        f"📅 Today's Slate: {len(today_items)} unique bets\n"
+                        f"📅 Active Slate : {len(t_items)} Today | {len(y_items)} Yesterday\n"
                         f"📚 All-Time DB  : {len(all_hist)} bets tracked (from {TRACKING_START_DATE})"
                     )
                     continue
@@ -1777,21 +2354,21 @@ class TelegramBotClient:
                         f"📋 MONITORED CHANNELS ({len(ChannelWebWatcher.get_watched_channels())} Feeds):\n"
                         f"════════════════════════════════\n"
                         f"{ch_list}\n\n"
-                        f"📢 Publishing Approved Bets to: {PUBLISH_CHANNEL_ID}\n"
+                        f"📢 Publishing Approved Bets & Final Results to: {PUBLISH_CHANNEL_ID}\n"
                         f"💡 To add another source channel, send: `/watch username`"
                     )
                     continue
 
                 if text in ["/scan", "⚡ Scan Today's Bets"]:
-                    threading.Thread(target=self.execute_scan_and_show_today_slate, args=[chat_id], daemon=True).start()
+                    threading.Thread(target=self.execute_scan_and_show_slate, args=[chat_id], daemon=True).start()
                     continue
 
                 if text in ["/results", "🏁 Live Scores & Results"]:
                     def run_results_check(cid):
-                        self.send_message(cid, "🏁 Updating live & final match scores...")
-                        self.sync_and_publish_to_footybett()
-                        all_today = list(DailyLedgerManager.load_today_items().values())
-                        report = BetSlipCardFormatter.format_results_audit(all_today)
+                        self.send_message(cid, "🏁 Pulling live on-spot scores & match clock (ESPN Live + API-Football)...")
+                        self.sync_and_publish_to_footybett(force_fresh_scores=True)
+                        t_items, y_items = DailyLedgerManager.load_recent_active_items()
+                        report = BetSlipCardFormatter.format_results_audit(t_items, y_items)
                         self.send_message(cid, report)
                     threading.Thread(target=run_results_check, args=[chat_id], daemon=True).start()
                     continue
@@ -1820,9 +2397,9 @@ class TelegramBotClient:
                 if text:
                     added = self.ingest_text_into_ledger(text, source_channel="Manual")
                     if added:
-                        self.sync_and_publish_to_footybett()
-                        all_today = list(DailyLedgerManager.load_today_items().values())
-                        card = BetSlipCardFormatter.format_daily_ledger(all_today)
+                        self.sync_and_publish_to_footybett(force_fresh_scores=True)
+                        t_items, y_items = DailyLedgerManager.load_recent_active_items()
+                        card = BetSlipCardFormatter.format_full_bot_curation_slate(t_items, y_items)
                         self.send_message(chat_id, card)
                     else:
                         self.send_message(chat_id, "❓ Could not recognize clear match fixtures. Use the [ Menu ] button on the left to navigate.")
