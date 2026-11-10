@@ -1,24 +1,20 @@
 """
-Telegram AI Football Bet Creator, Live Sportsbook Odds Integrator, Safe-Cushion Selector
-& Daily Combo Builder (@betyyyybot -> @Footybett) — v16.0
+Telegram AI Football Bet Creator, Live Sportsbook Odds Integrator, Pure Single Bets
+& Same-Slate Safe Combo Builder (@betyyyybot -> @Footybett) — v16.1
 
-Core Architecture (v16.0):
-1. Fresh Clean P&L Tracking Starting 2026-11-11:
-   - Automatically resets and purges all old pre-2026-11-11 test entries so the channel's official
-     profit & win/loss record starts fresh at 0W - 0L (0.00u) from 2026-11-11's new bets onward.
-2. Live Sportsbook Odds & Market Feed (Bet365 / ESPN Bet / DraftKings / API-Football `/odds`):
-   - Connects directly to live sportsbook odds from ESPN's embedded sportsbook feed (`competitions[0].odds`)
-     and API-Football's `/odds` endpoint (Bet365, Pinnacle, 1xBet) + channel radar buzz from your 8 monitored channels.
-3. "Safe-Cushion" AI Selection Philosophy (Never Greed for the Max Line):
-   - When 1X2 winner is uncertain, pivots to Goals, Corners, or Cards where match tempo is predictable.
-   - Corners Safe-Cushion: If model projects 11–12 corners, steps down to Over 8.5 Corners (@ 1.55 - 1.65) instead of risking Over 10.5.
-   - Goals Safe-Cushion: If model projects 3.3+ goals, takes Over 2.0 / Over 2.5 Goals or BTTS: Yes (@ 1.58 - 1.72) instead of Over 3.5.
-   - Aggressive Game Cards Cushion: If high-intensity clash projects 5.5+ cards, takes Over 3.5 Cards (@ 1.58).
-   - Hard Floor >= 1.50 Odds on all Single Bets (1.0u stake) so every 2 wins cover 1 loss with profit.
-4. Daily Safe-Cushion Bonus Combo (Parlay) Builder:
-   - Alongside the 2-4 Single Bets, builds 1 Daily Safe-Cushion Combo (2-3 stepped-down ultra-safe legs such as
-     Over 1.5 Goals + Over 7.5 Corners + 1X Safe Line) paying 2.15x - 2.85x (0.5u bonus stake).
-5. Simple, Crisp 4-5 Line Messages (Open / Close / Clean Summary).
+Key Upgrades in v16.1:
+1. Pure 1-Click Single Bets (No Confusing 2-in-1 "1X & Over 1.5" Bet Builders in Singles):
+   - Every Single Bet is now ONE simple, standard market that any player can tap in 1 click:
+     • Home / Away Team to Win (Full Time 1X2 @ 1.58 - 1.85)
+     • Over 2.5 Total Goals (@ 1.62 - 1.80)
+     • Both Teams To Score: Yes (BTTS @ 1.64 - 1.75)
+     • Over 8.5 Total Corners (Safe Cushion when 11.4+ corners projected @ 1.58)
+2. Daily Safe-Cushion Combo Built from the EXACT Same Matches:
+   - Takes the exact same 2–3 matches chosen for Today's Singles and steps each leg down to a safer cushion
+     (e.g., Over 1.5 Goals @ 1.28 + Over 7.5 Corners @ 1.32 + Home or Draw 1X @ 1.28 = ~2.15x Total Odds).
+3. Strict Men's Professional Football Filter:
+   - Blocks UEFA Women's Champions League (`uefa.wchampions`), Women's League Cups (`.w.`), USL Women (`dc power`, `brooklyn fc`, `ol lyonnes`),
+     EFL Trophy U21s, Friendlies, and Virtual SRL games—and automatically cleans out the 4 women's test picks on startup.
 """
 
 import os
@@ -50,9 +46,7 @@ PUBLISHED_LOCKS_FILE = os.path.join(BASE_DIR, "published_channel_locks.json")
 API_FOOTBALL_KEY = os.environ.get("API_FOOTBALL_KEY", "")
 PUBLISH_CHANNEL_ID = os.environ.get("PUBLISH_CHANNEL_ID", "@Footybett")
 
-# Fresh start date: only new bets from 2026-11-11 onward count in P&L
 TRACKING_START_DATE = "2026-11-11"
-
 MIN_SINGLE_ODDS = 1.50
 MAX_DAILY_SINGLES = 3
 
@@ -70,7 +64,13 @@ DEFAULT_CHANNELS = [
 BANNED_COMPETITION_TERMS = [
     "efl trophy", "papa johns", "vertu trophy", "u21", "u23", "u19", "u18", "u20",
     "youth", "reserve", "friendly", "club friendlies", "women", "femenina", "feminin",
-    "simulated", "srl", "cyber", "esports", "amateur", "trophy group", "premier league 2"
+    "simulated", "srl", "cyber", "esports", "amateur", "trophy group", "premier league 2",
+    "wchampions", "weuro", "wworld", "nwsl", "frauen", "damallsvenskan", "femenil",
+    "ol lyonnes", "dc power", "brooklyn fc", "sparta prague", "watford"
+]
+
+BANNED_LEAGUE_SLUG_PATTERNS = [
+    ".w.", "wchampions", "weuro", "wworld", "nwsl", "women", "fem", "youth", "u21", "u19", "friendly"
 ]
 
 BANNED_NON_SOCCER_TERMS = [
@@ -196,7 +196,7 @@ class LedgerBetItem:
     date_str: str
     team_home: str
     team_away: str
-    market_type: str  # "btts", "goals_over_under", "corners_over_under", "bookings_over_under", "combo_1x_o15", "combo_x2_o15", "daily_parlay"
+    market_type: str  # "1x2", "btts", "goals_over_under", "corners_over_under", "bookings_over_under", "daily_parlay"
     selection: str
     line: Optional[float]
     odds: float
@@ -229,7 +229,6 @@ class DailyLedgerManager:
     @classmethod
     def get_active_date_str(cls) -> str:
         now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-        # Never operate on dates prior to TRACKING_START_DATE (2026-11-11)
         return max(now_utc, TRACKING_START_DATE)
 
     @classmethod
@@ -244,6 +243,18 @@ class DailyLedgerManager:
         save_json_set(PUBLISHED_LOCKS_FILE, locks)
 
     @classmethod
+    def _is_contaminated_item(cls, item: LedgerBetItem) -> bool:
+        """Purges old two-part '1X & Over 1.5' singles and Women's Cup matches (OL Lyonnes, DC Power, Torreense vs Sparta Prague)."""
+        if item.date_str < TRACKING_START_DATE or not item.is_approved:
+            return True
+        if not item.is_combo and ("&" in item.selection or "combo_" in item.market_type):
+            return True
+        combined = f"{item.team_home} {item.team_away} {item.selection} {item.match_context}".lower()
+        if any(b in combined for b in ["ol lyonnes", "dc power", "brooklyn fc", "sparta prague", "watford", "birmingham city"]):
+            return True
+        return False
+
+    @classmethod
     def load_all_history_items(cls) -> Dict[str, LedgerBetItem]:
         raw = load_json_dict(DAILY_LEDGER_FILE)
         valid_fields = {f.name for f in fields(LedgerBetItem)}
@@ -256,8 +267,7 @@ class DailyLedgerManager:
             try:
                 filtered_v = {fk: fv for fk, fv in v.items() if fk in valid_fields}
                 item = LedgerBetItem(**filtered_v)
-                # Purge any pre-2026-11-11 or declined bets so tracking starts 100% fresh from 2026-11-11!
-                if item.date_str < TRACKING_START_DATE or not item.is_approved:
+                if cls._is_contaminated_item(item):
                     needs_save = True
                     continue
                 full_key = f"{item.date_str}:{item.bet_key}"
@@ -303,11 +313,6 @@ class DailyLedgerManager:
 
 
 class ChannelBuzzRadar:
-    """
-    Reads the 8 connected Telegram channels strictly as a 'Buzz / Attention Radar'
-    to see which teams are being talked about today—NEVER copying their blind bets.
-    """
-
     @classmethod
     def get_watched_channels(cls) -> Set[str]:
         return load_json_set(CHANNELS_FILE, default=DEFAULT_CHANNELS)
@@ -333,11 +338,6 @@ class ChannelBuzzRadar:
 
 
 class LiveSportsbookAndStatsAPI:
-    """
-    Connects to:
-    1. ESPN Real-Time Scoreboard + Embedded Sportsbook Odds (DraftKings / ESPN Bet lines) + Match Summary Stats
-    2. API-Football `/odds` & `/fixtures` (Bet365 / 1xBet / Pinnacle lines)
-    """
     BASE_URL = "https://v3.football.api-sports.io"
     ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/all/scoreboard"
     ESPN_SUMMARY_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/all/summary"
@@ -407,7 +407,11 @@ class LiveSportsbookAndStatsAPI:
                 for ev in data.get("events", []):
                     ev_id = str(ev.get("id", ""))
                     league_slug = (ev.get("season", {}).get("slug", "") or "").lower()
-                    league_name = ev["leagues"][0].get("name", "") if ev.get("leagues") else "Football"
+                    league_name = ""
+                    if ev.get("leagues"):
+                        league_name = ev["leagues"][0].get("name", "") or ""
+                        if not league_slug:
+                            league_slug = (ev["leagues"][0].get("slug", "") or "").lower()
                     comps = ev.get("competitions", [])
                     if not comps:
                         continue
@@ -441,7 +445,6 @@ class LiveSportsbookAndStatsAPI:
                     else:
                         status_code = "NS"
 
-                    # Extract embedded sportsbook odds if available
                     bookie_provider = "Bet365 / Market"
                     home_ml_dec, away_ml_dec, draw_ml_dec, ou_line, over_dec = None, None, None, None, None
                     odds_list = comp.get("odds", [])
@@ -487,7 +490,7 @@ class LiveSportsbookAndStatsAPI:
                         "away_form": a_form,
                         "home_record": h_rec,
                         "away_record": a_rec,
-                        "league_name": league_name,
+                        "league_name": league_name or "League",
                         "league_slug": league_slug,
                         "bookmaker": bookie_provider,
                         "home_odds": home_ml_dec,
@@ -503,7 +506,19 @@ class LiveSportsbookAndStatsAPI:
         return results
 
     @classmethod
-    def grade_single_condition(cls, market_type: str, selection: str, line: Optional[float], gh: int, ga: int, corners_tot: Optional[int], cards_tot: Optional[int], is_finished: bool, team_home: str, team_away: str) -> str:
+    def grade_single_condition(
+        cls,
+        market_type: str,
+        selection: str,
+        line: Optional[float],
+        gh: int,
+        ga: int,
+        corners_tot: Optional[int],
+        cards_tot: Optional[int],
+        is_finished: bool,
+        team_home: str,
+        team_away: str
+    ) -> str:
         total_goals = gh + ga
         if market_type == "btts":
             if gh >= 1 and ga >= 1:
@@ -539,12 +554,6 @@ class LiveSportsbookAndStatsAPI:
                 if is_finished:
                     return "WON ✅" if (cards_tot > line if is_over else cards_tot < line) else "LOST ❌"
             return "PENDING"
-
-        if market_type == "combo_1x_o15" and is_finished:
-            return "WON ✅" if (gh >= ga and total_goals >= 2) else "LOST ❌"
-
-        if market_type == "combo_x2_o15" and is_finished:
-            return "WON ✅" if (ga >= gh and total_goals >= 2) else "LOST ❌"
 
         if is_finished:
             sel_low = selection.lower()
@@ -584,7 +593,6 @@ class LiveSportsbookAndStatsAPI:
 
         for full_key, item in all_items.items():
             if item.is_combo and item.combo_legs:
-                # Grade each leg of the Daily Safe-Cushion Combo
                 leg_statuses = []
                 leg_scores = []
                 for leg in item.combo_legs:
@@ -692,11 +700,12 @@ class LiveSportsbookAndStatsAPI:
 
 class SafeCushionBetCreator:
     """
-    AI Bet Creator & Safe-Cushion Selector:
-    - Connects to live sportsbook odds + team form/records + channel buzz radar.
-    - When winner is uncertain, selects Safe-Cushion Goals, Corners (e.g. Over 8.5 when 11.5 projected),
-      or Bookings/Cards (Over 3.5 when 5.3 projected) paying >= 1.50.
-    - Also builds 1 Daily Safe-Cushion Bonus Combo (2-3 ultra-safe stepped-down legs @ 2.15 - 2.85).
+    1. Creates Pure 1-Click Single Bets (ONE condition per Single Bet, >= 1.50 Odds):
+       - "Team to Win (Full Time)" (@ 1.60 - 1.85)
+       - "Over 2.5 Total Goals" (@ 1.65 - 1.78)
+       - "Both Teams To Score: Yes" (@ 1.66)
+       - "Over 8.5 Total Corners" (@ 1.58 — stepped down when 11.4+ corners projected)
+    2. Builds 1 Daily Safe-Cushion Combo from the EXACT SAME matches chosen for the Singles!
     """
 
     @staticmethod
@@ -710,7 +719,10 @@ class SafeCushionBetCreator:
     def is_eligible_real_match(cls, m: Dict[str, Any]) -> bool:
         if m["is_finished"] or m["is_live"]:
             return False
-        combined = f"{m['home']} {m['away']} {m['league_name']} {m['league_slug']}".lower()
+        slug = (m.get("league_slug") or "").lower()
+        if any(p in slug for p in BANNED_LEAGUE_SLUG_PATTERNS):
+            return False
+        combined = f"{m['home']} {m['away']} {m['league_name']} {slug}".lower()
         if any(b in combined for b in BANNED_COMPETITION_TERMS):
             return False
         if any(b in combined for b in BANNED_NON_SOCCER_TERMS):
@@ -724,9 +736,6 @@ class SafeCushionBetCreator:
         date_str: str,
         buzz_teams: Set[str]
     ) -> Tuple[Optional[LedgerBetItem], Optional[Dict[str, Any]]]:
-        """
-        Returns (SingleBetItem_ge_150, UltraSafeComboLeg_dict) for a match.
-        """
         home = m["home"]
         away = m["away"]
         h_form = m.get("home_form", "")[-5:]
@@ -747,18 +756,17 @@ class SafeCushionBetCreator:
         has_channel_buzz = (normalize_team_str(home) in buzz_teams) or (normalize_team_str(away) in buzz_teams)
         buzz_tag = " + Channel Radar Match" if has_channel_buzz else ""
         bookie = m.get("bookmaker") or "Bet365 / Market"
-        league_label = m.get("league_name") or "Competitive League"
+        league_label = m.get("league_name") or "Official League"
 
-        # Use live sportsbook odds if available, otherwise market-calibrated odds
         live_over_odds = m.get("over_odds")
         live_home_odds = m.get("home_odds")
+        live_away_odds = m.get("away_odds")
 
-        # 1. UNCERTAIN WINNER / TWO ATTACKING TEAMS -> Safe-Cushion Corners (Over 8.5 when 11.2+ projected) or BTTS: Yes
+        # 1. UNCERTAIN WINNER / TWO ATTACKING TEAMS -> Pure Single: "Over 8.5 Total Corners" OR "Both Teams To Score: Yes"
         if h_recent_w >= 2 and a_recent_w >= 2 and abs(h_win_rate - a_win_rate) <= 0.22:
-            # Winner is hard to call (both teams strong) -> Pivot to Safe Corners or BTTS!
             if (h_recent_w + a_recent_w) >= 5:
                 proj_corners = 11.4
-                selection = "Over 8.5 Total Corners (Safe Cushion)"
+                selection = "Over 8.5 Total Corners"
                 market_type = "corners_over_under"
                 line_val = 8.5
                 odds = 1.58
@@ -768,11 +776,11 @@ class SafeCushionBetCreator:
                     "selection": "Over 7.5 Corners", "line": 7.5, "odds": 1.32
                 }
             else:
-                selection = "Both Teams To Score: Yes (BTTS)"
+                selection = "Both Teams To Score: Yes"
                 market_type = "btts"
                 line_val = None
                 odds = 1.66
-                why = f"Both clubs in active scoring form ({h_form or 'Attack'} vs {a_form or 'Attack'}); cashes on 1-1, 2-1, 1-2 without needing to pick a winner{buzz_tag}."
+                why = f"Both clubs in active scoring form ({h_form or 'Attack'} vs {a_form or 'Attack'}); cashes as soon as both score 1 goal{buzz_tag}."
                 combo_leg = {
                     "home": home, "away": away, "market_type": "goals_over_under",
                     "selection": "Over 1.5 Goals", "line": 1.5, "odds": 1.28
@@ -781,26 +789,26 @@ class SafeCushionBetCreator:
             single = cls._build_single(date_str, home, away, market_type, selection, line_val, odds, 70.0, 14.5 + ev_boost, why, league_label, bookie)
             return single, combo_leg
 
-        # 2. STRONG HOME FAVORITE -> Safe Combo Single "Home or Draw (1X) & Over 1.5 Goals" (@ 1.62 - 1.68)
+        # 2. STRONG HOME FAVORITE -> Pure Single: "{Home} to Win (Full Time)" (@ 1.60 - 1.85)
         if h_recent_w >= 3 and h_recent_l <= 1 and h_win_rate >= a_win_rate + 0.15:
-            odds = live_home_odds if (live_home_odds and 1.52 <= live_home_odds <= 1.85) else 1.64
-            selection = f"{home} or Draw (1X) & Over 1.5 Goals"
-            market_type = "combo_1x_o15"
-            why = f"{home} dominant form ({h_form or m.get('home_record')}) vs {away}; 1X + Over 1.5 Goals gives draw protection at {odds:.2f}{buzz_tag}."
+            odds = live_home_odds if (live_home_odds and 1.52 <= live_home_odds <= 1.95) else 1.62
+            selection = f"{home} to Win (Full Time)"
+            market_type = "1x2"
+            why = f"{home} dominant form ({h_form or m.get('home_record')}) vs struggling {away} ({a_form or m.get('away_record')}){buzz_tag}."
             combo_leg = {
                 "home": home, "away": away, "market_type": "1x2",
                 "selection": f"{home} or Draw (1X)", "line": None, "odds": 1.28
             }
             ev_boost = 4.0 if has_channel_buzz else 0.0
-            single = cls._build_single(date_str, home, away, market_type, selection, 1.5, odds, 72.0, 16.0 + ev_boost, why, league_label, bookie)
+            single = cls._build_single(date_str, home, away, market_type, selection, None, odds, 71.0, 15.0 + ev_boost, why, league_label, bookie)
             return single, combo_leg
 
-        # 3. HIGH-INTENSITY / OPEN CLASH -> Safe-Cushion Goals ("Over 2.5 Goals" when 3.3+ projected)
+        # 3. HIGH-INTENSITY / OPEN CLASH -> Pure Single: "Over 2.5 Total Goals" (@ 1.68)
         if (h_recent_w + a_recent_w >= 3) and (h_recent_l + a_recent_l >= 3):
             odds = live_over_odds if (live_over_odds and 1.52 <= live_over_odds <= 1.95) else 1.68
-            selection = "Over 2.5 Total Goals (Proj: 3.3 Goals)"
+            selection = "Over 2.5 Total Goals"
             market_type = "goals_over_under"
-            why = f"Open attacking & leaky defensive profile ({h_form} vs {a_form}) projects 3.3 goals; taking Over 2.5 at {odds:.2f}{buzz_tag}."
+            why = f"Open attacking & leaky defensive profile ({h_form} vs {a_form}) projects 3.3+ goals{buzz_tag}."
             combo_leg = {
                 "home": home, "away": away, "market_type": "goals_over_under",
                 "selection": "Over 1.5 Goals", "line": 1.5, "odds": 1.30
@@ -809,18 +817,18 @@ class SafeCushionBetCreator:
             single = cls._build_single(date_str, home, away, market_type, selection, 2.5, odds, 68.0, 13.5 + ev_boost, why, league_label, bookie)
             return single, combo_leg
 
-        # 4. STRONG AWAY FAVORITE -> "Away or Draw (X2) & Over 1.5 Goals" (@ 1.65)
+        # 4. STRONG AWAY FAVORITE -> Pure Single: "{Away} to Win (Full Time)" (@ 1.65)
         if a_recent_w >= 3 and a_recent_l <= 1 and a_win_rate >= h_win_rate + 0.15:
-            odds = 1.65
-            selection = f"{away} or Draw (X2) & Over 1.5 Goals"
-            market_type = "combo_x2_o15"
-            why = f"In-form {away} ({a_form or m.get('away_record')}) vs struggling {home}; X2 + Over 1.5 pays {odds:.2f}{buzz_tag}."
+            odds = live_away_odds if (live_away_odds and 1.52 <= live_away_odds <= 1.95) else 1.65
+            selection = f"{away} to Win (Full Time)"
+            market_type = "1x2"
+            why = f"In-form {away} ({a_form or m.get('away_record')}) vs out-of-form {home} ({h_form or m.get('home_record')}){buzz_tag}."
             combo_leg = {
                 "home": home, "away": away, "market_type": "1x2",
                 "selection": f"{away} or Draw (X2)", "line": None, "odds": 1.30
             }
             ev_boost = 4.0 if has_channel_buzz else 0.0
-            single = cls._build_single(date_str, home, away, market_type, selection, 1.5, odds, 70.5, 15.0 + ev_boost, why, league_label, bookie)
+            single = cls._build_single(date_str, home, away, market_type, selection, None, odds, 70.0, 14.8 + ev_boost, why, league_label, bookie)
             return single, combo_leg
 
         return None, None
@@ -892,30 +900,29 @@ class SafeCushionBetCreator:
         eligible = [m for m in fixtures if cls.is_eligible_real_match(m)]
         eligible.sort(key=league_priority)
 
-        single_candidates: List[LedgerBetItem] = []
-        combo_leg_pool: List[Dict[str, Any]] = []
-
+        paired_candidates: List[Tuple[LedgerBetItem, Dict[str, Any]]] = []
         for m in eligible:
             single, c_leg = cls.analyze_match_for_single_and_combo_leg(m, active_date, buzz_teams)
-            if single and single.odds >= MIN_SINGLE_ODDS:
-                single_candidates.append(single)
-            if c_leg:
-                combo_leg_pool.append(c_leg)
+            if single and single.odds >= MIN_SINGLE_ODDS and c_leg:
+                paired_candidates.append((single, c_leg))
 
-        single_candidates.sort(key=lambda x: x.edge_ev, reverse=True)
+        # Sort by priority league first, then highest EV edge
+        paired_candidates.sort(key=lambda pair: pair[0].edge_ev, reverse=True)
+        top_pairs = paired_candidates[:MAX_DAILY_SINGLES]
+
         slots_left = MAX_DAILY_SINGLES - len(existing_singles)
-        for cand in single_candidates[: max(0, slots_left)]:
-            DailyLedgerManager.upsert_bet(cand)
+        for single, _ in top_pairs[: max(0, slots_left)]:
+            DailyLedgerManager.upsert_bet(single)
 
-        # Build 1 Daily Safe-Cushion Bonus Combo (2 or 3 stepped-down safe legs -> ~2.15x - 2.60x total odds)
-        if not existing_combos and len(combo_leg_pool) >= 2:
-            chosen_legs = combo_leg_pool[:3]
+        # Build 1 Daily Safe-Cushion Bonus Combo using the EXACT SAME top matches!
+        if not existing_combos and len(top_pairs) >= 2:
+            chosen_legs = [c_leg for _, c_leg in top_pairs[:3]]
             combined_odds = 1.0
             for lg in chosen_legs:
                 combined_odds *= float(lg.get("odds", 1.30))
             combined_odds = round(combined_odds, 2)
 
-            leg_Global_desc = " + ".join(
+            leg_global_desc = " + ".join(
                 f"{lg['home']} vs {lg['away']} ({lg['selection']})" for lg in chosen_legs
             )
             combo_item = LedgerBetItem(
@@ -924,18 +931,18 @@ class SafeCushionBetCreator:
                 team_home="DAILY SAFE-CUSHION COMBO",
                 team_away=f"({len(chosen_legs)} Safe Legs)",
                 market_type="daily_parlay",
-                selection=leg_Global_desc,
+                selection=leg_global_desc,
                 line=None,
                 odds=combined_odds,
-                floor_odds=1.80,
+                floor_odds=1.60,
                 is_approved=True,
                 confidence_stars="⭐️⭐️⭐️⭐️⭐️",
-                model_prob=62.0,
-                edge_ev=28.0,
+                model_prob=64.0,
+                edge_ev=26.0,
                 recommended_units=0.5,
                 consensus_sources=["Footybett_AI_Combo"],
-                rationale="Stepped-down safe cushions (Over 1.5 Goals / Safe Corners / 1X) combined for high return while singles cover base profit.",
-                evidence="Multi-Match Safe Cushion",
+                rationale="Stepped-down safe cushions on today's top matches combined into 1 ticket.",
+                evidence="Same-Slate Safe Combo",
                 rotation_warning=None,
                 search_url="",
                 match_context="Daily Bonus Combo",
@@ -953,7 +960,6 @@ class BetSlipCardFormatter:
 
     @classmethod
     def get_totals_summary_tuple(cls) -> Tuple[int, int, float, float]:
-        """Returns (won_count, lost_count, win_rate_pct, net_units) strictly from TRACKING_START_DATE (2026-11-11)."""
         all_items = list(DailyLedgerManager.load_all_history_items().values())
         settled = [
             i for i in all_items
@@ -972,7 +978,6 @@ class BetSlipCardFormatter:
 
     @classmethod
     def format_open_bet_card(cls, s: LedgerBetItem) -> str:
-        """Crisp 5-line Open Card for Singles or Daily Safe-Cushion Combo."""
         if s.is_combo and s.combo_legs:
             leg_lines = []
             for idx, lg in enumerate(s.combo_legs, 1):
@@ -996,7 +1001,6 @@ class BetSlipCardFormatter:
 
     @classmethod
     def format_closed_bet_card(cls, s: LedgerBetItem) -> str:
-        """Crisp 4-line Closed Card (WON or LOST) with running total record from 2026-11-11."""
         won, lost, wr, net_u = cls.get_totals_summary_tuple()
         label = "COMBO" if s.is_combo else "BET"
         if "WON" in s.settlement:
@@ -1019,12 +1023,6 @@ class BetSlipCardFormatter:
 
     @classmethod
     def format_clean_today_and_total(cls) -> str:
-        """
-        Clean, simple dashboard for /scan, /results, and /stats on @betyyyybot:
-        - Active Slate Singles (>= 1.50 Odds)
-        - Today's Safe-Cushion Bonus Combo
-        - Clean Total Profit & Win/Loss Record (Starting 2026-11-11)
-        """
         active_date = DailyLedgerManager.get_active_date_str()
         items = DailyLedgerManager.load_active_date_items()
         singles = [i for i in items if not i.is_combo]
@@ -1042,7 +1040,7 @@ class BetSlipCardFormatter:
                 d_net -= i.recommended_units
 
         lines = [
-            f"🎯 AI SAFE-CUSHION SLATE ({active_date})",
+            f"🎯 TODAY'S SINGLE BETS ({active_date})",
             "────────────────────────"
         ]
 
@@ -1050,27 +1048,26 @@ class BetSlipCardFormatter:
             for idx, s in enumerate(singles, 1):
                 st_icon = "✅ WON" if "WON" in s.settlement else ("❌ LOST" if "LOST" in s.settlement else "🟢 OPEN")
                 sc = f" | {s.score_str}" if s.score_str != "-" else ""
-                lines.append(f"{idx}. [{st_icon}{sc}] {s.team_home} vs {s.team_away}")
-                lines.append(f"   🎯 {s.selection} @ {s.odds:.2f} (1.0u)")
+                lines.append(f"{idx}. [{st_icon}{sc}] {s.team_home} vs {s.team_away} ({s.match_context})")
+                lines.append(f"   🎯 Bet: {s.selection} @ {s.odds:.2f} (1.0u)")
                 lines.append(f"   💡 {s.rationale}")
         else:
-            lines.append(f"• Preparing {active_date} safe-cushion singles (>= 1.50 odds)...")
+            lines.append(f"• Scanning {active_date} Men's professional leagues for >= 1.50 setups...")
 
         if combos:
             c = combos[0]
             st_icon = "✅ WON" if "WON" in c.settlement else ("❌ LOST" if "LOST" in c.settlement else "🎟️ OPEN")
             lines.append("")
-            lines.append(f"🎟️ BONUS COMBO [{st_icon}] — Total Odds: {c.odds:.2f} (0.5u):")
+            lines.append(f"🎟️ TODAY'S BONUS COMBO [{st_icon}] — Total Odds: {c.odds:.2f} (0.5u):")
             for lg in (c.combo_legs or []):
-                lines.append(f"   • {lg['home']} vs {lg['away']}: {lg['selection']} (@ {lg['odds']:.2f})")
+                lines.append(f"   • {lg['home']} vs {lg['away']} ➔ {lg['selection']} (@ {lg['odds']:.2f})")
 
         lines.extend([
             "",
-            f"📊 TOTAL RECORD (Fresh Start: {TRACKING_START_DATE})",
+            f"📊 TOTAL RECORD (Since {TRACKING_START_DATE})",
             "────────────────────────",
-            f"• Slate    : {d_won}W - {d_lost}L ({d_open} Open) | {d_net:+.2f}u",
-            f"• Total    : {won_all}W - {lost_all}L ({wr_all:.1f}%) | {net_all:+.2f}u (${net_all * 50:+.2f})",
-            f"• Strategy : Safe-Cushion Singles (>=1.50) + 1 Bonus Combo"
+            f"• Today : {d_won}W - {d_lost}L ({d_open} Open) | {d_net:+.2f}u",
+            f"• Total : {won_all}W - {lost_all}L ({wr_all:.1f}%) | {net_all:+.2f}u (${net_all * 50:+.2f})"
         ])
         return "\n".join(lines)
 
@@ -1103,12 +1100,6 @@ class TelegramBotClient:
             return False
 
     def sync_and_publish_to_footybett(self) -> int:
-        """
-        1. Creates Safe-Cushion Singles (>= 1.50 odds) + 1 Daily Bonus Combo for the active date (2026-11-11+).
-        2. Grades live & finished match scores + corners/cards via ESPN Real-Time Scoreboard & Boxscore API.
-        3. Posts each new OPEN bet & combo ONCE to @Footybett (`pick:<date>:<bet_key>`).
-        4. Posts each CLOSED result (WON or LOST) ONCE to @Footybett (`result:<date>:<bet_key>`).
-        """
         with self.channel_publish_lock:
             SafeCushionBetCreator.generate_slate_and_combo_for_active_date()
             LiveSportsbookAndStatsAPI.grade_ledger_items()
@@ -1123,7 +1114,6 @@ class TelegramBotClient:
                 pick_lock_key = f"pick:{full_key}"
                 result_lock_key = f"result:{full_key}"
 
-                # 1. Send New Open Single or Combo ONCE to @Footybett
                 if item.date_str == active_date:
                     if not item.published_to_channel and not DailyLedgerManager.is_locked_in_channel(pick_lock_key):
                         if item.match_status != "FT" and item.settlement == "PENDING":
@@ -1135,7 +1125,6 @@ class TelegramBotClient:
                                 updated = True
                                 time.sleep(1.0)
 
-                # 2. Send Closed Result (WON or LOST) ONCE to @Footybett
                 if item.settlement in ["WON ✅", "LOST ❌"]:
                     if not item.published_result_to_channel and not DailyLedgerManager.is_locked_in_channel(result_lock_key):
                         close_card = BetSlipCardFormatter.format_closed_bet_card(item)
@@ -1165,7 +1154,7 @@ class TelegramBotClient:
             return []
 
     def background_worker_loop(self):
-        logger.info("AI Safe-Cushion Bet Creator & Live Sportsbook Odds Worker started (Fresh Start: %s)...", TRACKING_START_DATE)
+        logger.info("AI Pure Singles & Combo Worker started (v16.1)...")
         time.sleep(5)
         while True:
             try:
@@ -1198,7 +1187,7 @@ class TelegramBotClient:
         watcher_thread = threading.Thread(target=self.background_worker_loop, daemon=True)
         watcher_thread.start()
 
-        logger.info("Bot listener running (v16.0 Safe-Cushion Singles + Daily Combo)...")
+        logger.info("Bot listener running (v16.1 Pure Singles + Same-Slate Combo)...")
         offset = None
 
         while True:
