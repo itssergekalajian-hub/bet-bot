@@ -1,22 +1,24 @@
 """
-Telegram AI Men's Football Bet Creator, Live Sportsbook Odds Integrator,
-Safe-Cushion Single Bets & 3-Leg Combo Builder (@betyyyybot -> @Footybett) — v16.2
+Telegram AI Men's Football Bet Creator, Optimal Pre-Kickoff Timing Engine (0.5h–5.5h),
+Live Sportsbook Odds Integrator, Pure Single Bets & 3-Leg Safe-Cushion Combo Builder
+(@betyyyybot -> @Footybett) — v17.0 Final Production Release
 
-Key Upgrades in v16.2:
-1. Strict Men's Official League Feeds Only (Zero Women's / Youth / Trap Cups):
-   - Queries dedicated Men's professional league scoreboards on ESPN (`eng.1`, `esp.1`, `ita.1`, `ger.1`, `fra.1`,
-     `uefa.champions`, `uefa.europa`, `uefa.europa.conf`, `uefa.nations`, `fifa.worldq.uefa`, `fifa.worldq.conmebol`,
-     `ned.1`, `por.1`, `bra.1`, `arg.1`, `tur.1`, `bel.1`, `sco.1`, `eng.2`, `esp.2`, `ita.2`, `ger.2`, `usa.1`, `mex.1`)
-     plus API-Football Men's fixtures.
-   - Displays the exact competition name (e.g., "Brazilian Serie A", "English Championship", "CONMEBOL World Cup Qualifiers")
-     instead of generic "(League)" or "(Football)", and completely eliminates Women's Cup games like Liverpool Women or America Femenil.
-2. Guaranteed 3 Pure Single Bets + 1 Safe-Cushion 3-Leg Combo Every Slate:
-   - Evaluates 6 Safe-Cushion strategies across all Men's fixtures so every slate produces 3 Pure Single Bets (>= 1.54 odds)
-     PLUS 1 Daily Safe-Cushion Bonus Combo (3 stepped-down safe legs from those exact same matches).
-   - Uses a leg-fingerprint key for the Combo so a new Combo is never blocked by an old deleted test lock.
-3. One-Time Automatic Cleanup (`v16_2_mens_clean_reset`):
-   - Automatically clears the old test picks (`Liverpool vs Aston Villa`, `América vs Toluca`, etc.) once on startup
-     so your 2026-11-11 record starts 100% clean with real Men's fixtures + the new Combo.
+Production Highlights (v17.0):
+1. Fresh Launch Reset (`v17_0_final_launch_reset_2026_11_11`):
+   - Automatically resets `daily_ledger.json` and `published_channel_locks.json` ONCE on startup
+     so @Footybett starts at 0W - 0L (+0.00u) from today (2026-11-11) onward.
+2. Optimal Pre-Kickoff Timing Window (0.5h to 5.5h Before Kickoff):
+   - Never posts bets 12–24 hours early.
+   - Publishes Single Bets when matches are 30 minutes to 5.5 hours before kickoff (squads, press conferences,
+     and market odds stabilized) and delivers the 3-Leg Safe-Cushion Bonus Combo alongside them.
+3. Strict Men's Professional Football Only ( ESPN Curated Feeds + API-Football Fallback ):
+   - 32 dedicated Men's top-flight & international scoreboards on ESPN + verified API-Football Men's fixtures.
+   - Zero Women's, Youth/U21, EFL Trophy, Friendly, or Virtual SRL games.
+4. Pure 1-Click Single Bets (>= 1.52 Odds, 1.0u Stake) + 1 Daily 3-Leg Safe Combo (0.5u Stake):
+   - Singles: Team to Win (Full Time), Over 2.5 Goals, Both Teams To Score: Yes, Over 8.5 Corners (Safe Cushion).
+   - Combo: 2–3 stepped-down ultra-safe legs (Over 1.5 Goals, Over 7.5 Corners, 1X/X2 Safe Line) paying ~1.85x–2.35x.
+5. Full Live & Final Grading (ESPN Scoreboard + ESPN Boxscore Summary + API-Football Statistics):
+   - Automatically posts each Open card ONCE and each Closed (WON ✅ / LOST ❌) card ONCE with the running record.
 """
 
 import os
@@ -52,7 +54,14 @@ PUBLISH_CHANNEL_ID = os.environ.get("PUBLISH_CHANNEL_ID", "@Footybett")
 TRACKING_START_DATE = "2026-11-11"
 MIN_SINGLE_ODDS = 1.52
 MAX_DAILY_SINGLES = 3
-RESET_MARKER_LOCK = "system:v16_2_mens_clean_reset_done"
+
+# Optimal Pre-Kickoff Timing Window for Single Bets (30 mins to 5.5 hours before kickoff)
+MIN_HOURS_BEFORE_KICKOFF = 0.5
+MAX_HOURS_BEFORE_KICKOFF = 5.5
+# Extended lookahead (up to 8 hours) allowed for pairing a 2nd/3rd Combo leg so Singles + Combo arrive together
+MAX_COMBO_LEG_HOURS_AHEAD = 8.0
+
+RESET_MARKER_LOCK = "system:v17_0_final_launch_reset_2026_11_11"
 
 DEFAULT_CHANNELS = [
     "bomb_footballsignals",
@@ -65,7 +74,6 @@ DEFAULT_CHANNELS = [
     "sportybet_codes"
 ]
 
-# Dedicated Men's Professional Football Leagues & International Tournaments on ESPN
 MENS_LEAGUE_FEEDS: List[Tuple[str, str]] = [
     ("uefa.champions", "UEFA Champions League"),
     ("uefa.europa", "UEFA Europa League"),
@@ -103,9 +111,9 @@ MENS_LEAGUE_FEEDS: List[Tuple[str, str]] = [
 
 BANNED_TERMS = [
     "women", "femenil", "femenina", "feminin", "frauen", "ladies", "wchampions",
-    "efl trophy", "papa johns", "vertu trophy", "u21", "u23", "u19", "u18", "u20",
-    "youth", "reserve", "friendly", "simulated", "srl", "cyber", "esports",
-    "ol lyonnes", "dc power", "brooklyn fc"
+    "efl trophy", "papa johns", "vertu trophy", "u21", "u23", "u19", "u18", "u20", "u17",
+    "youth", "reserve", "friendly", "friendlies", "simulated", "srl", "cyber", "esports",
+    "amateur", "regional", "oberliga", "tercera", "non-league", "ol lyonnes", "dc power", "brooklyn fc"
 ]
 
 TEAM_ALIASES: Dict[str, str] = {
@@ -167,6 +175,33 @@ def teams_match(name_a: str, name_b: str) -> bool:
     if tokens_a and tokens_b and (tokens_a & tokens_b):
         return True
     return difflib.SequenceMatcher(None, na, nb).ratio() >= 0.74
+
+
+def parse_kickoff_utc(raw_date_str: str) -> Optional[datetime.datetime]:
+    if not raw_date_str:
+        return None
+    try:
+        clean = raw_date_str.replace("Z", "+00:00")
+        dt = datetime.datetime.fromisoformat(clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone(datetime.timezone.utc)
+    except Exception:
+        return None
+
+
+def format_kickoff_human(dt: Optional[datetime.datetime]) -> str:
+    if not dt:
+        return ""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    diff_min = int((dt - now).total_seconds() / 60.0)
+    time_str = dt.strftime("%H:%M UTC")
+    if diff_min <= 0:
+        return f"{time_str} (Starting Soon)"
+    h = diff_min // 60
+    m = diff_min % 60
+    rel_str = f"In {h}h {m}m" if h > 0 else f"In {m}m"
+    return f"{time_str} ({rel_str})"
 
 
 def shift_date_str(date_str: str, delta_days: int) -> str:
@@ -237,6 +272,7 @@ class LedgerBetItem:
     search_url: str
     match_context: str = ""
     bookmaker_name: str = "Bet365 / Market"
+    kickoff_str: str = ""
     is_combo: bool = False
     combo_legs: Optional[List[Dict[str, Any]]] = None
     match_status: str = "PENDING"
@@ -267,17 +303,17 @@ class DailyLedgerManager:
         save_json_set(PUBLISHED_LOCKS_FILE, locks)
 
     @classmethod
-    def ensure_v16_2_clean_reset(cls):
-        """One-time automatic reset to wipe the Women's test picks (Liverpool vs Aston Villa, America vs Toluca, etc.)."""
+    def ensure_v17_0_clean_launch_reset(cls):
+        """One-time automatic reset so the channel starts 100% fresh right now (0W - 0L | +0.00u)."""
         locks = load_json_set(PUBLISHED_LOCKS_FILE)
         if RESET_MARKER_LOCK not in locks:
             save_json_dict(DAILY_LEDGER_FILE, {})
             save_json_set(PUBLISHED_LOCKS_FILE, {RESET_MARKER_LOCK})
-            logger.info("Executed one-time v16.2 clean reset of ledger and locks.")
+            logger.info("Executed v17.0 final clean launch reset of ledger and locks.")
 
     @classmethod
     def load_all_history_items(cls) -> Dict[str, LedgerBetItem]:
-        cls.ensure_v16_2_clean_reset()
+        cls.ensure_v17_0_clean_launch_reset()
         raw = load_json_dict(DAILY_LEDGER_FILE)
         valid_fields = {f.name for f in fields(LedgerBetItem)}
         items: Dict[str, LedgerBetItem] = {}
@@ -421,15 +457,43 @@ class LiveSportsbookAndStatsAPI:
         return corners_total, cards_total
 
     @classmethod
+    def fetch_apifootball_fixture_stats(cls, fixture_id: str) -> Tuple[Optional[int], Optional[int]]:
+        if not fixture_id or not API_FOOTBALL_KEY:
+            return None, None
+        url = f"{cls.BASE_URL}/fixtures/statistics?fixture={fixture_id}"
+        req = urllib.request.Request(url, headers={"x-apisports-key": API_FOOTBALL_KEY.strip()})
+        corners_total, cards_total = None, None
+        try:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                c_sum, y_sum = 0, 0
+                found_c, found_y = False, False
+                for team_entry in data.get("response", []):
+                    for st in team_entry.get("statistics", []):
+                        t_type = (st.get("type") or "").lower()
+                        val = st.get("value") or 0
+                        if "corner" in t_type:
+                            c_sum += int(val)
+                            found_c = True
+                        elif "yellow card" in t_type or "red card" in t_type:
+                            y_sum += int(val)
+                            found_y = True
+                if found_c:
+                    corners_total = c_sum
+                if found_y:
+                    cards_total = y_sum
+        except Exception:
+            pass
+        return corners_total, cards_total
+
+    @classmethod
     def fetch_mens_fixtures_with_odds(cls, date_str: str) -> List[Dict[str, Any]]:
-        """
-        Queries strictly our curated Men's Professional Football League feeds on ESPN + API-Football
-        so Women's games (FA Women's League Cup, Liga MX Femenil, UWCL) and U21s can NEVER enter.
-        """
         espn_date = date_str.replace("-", "")
         results: List[Dict[str, Any]] = []
         seen_match_keys: Set[str] = set()
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
 
+        # 1. Primary: Curated Men's Professional League Feeds on ESPN
         for rank_idx, (slug, league_title) in enumerate(MENS_LEAGUE_FEEDS):
             url = f"{cls.ESPN_LEAGUE_SCOREBOARD_TEMPLATE.format(slug=slug)}?dates={espn_date}&limit=100"
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -459,6 +523,12 @@ class LiveSportsbookAndStatsAPI:
                         if m_key in seen_match_keys:
                             continue
                         seen_match_keys.add(m_key)
+
+                        raw_date = comp.get("date") or ev.get("date") or ""
+                        kickoff_dt = parse_kickoff_utc(raw_date)
+                        hours_left = None
+                        if kickoff_dt:
+                            hours_left = (kickoff_dt - now_utc).total_seconds() / 3600.0
 
                         h_score = int(home_c.get("score") or 0)
                         a_score = int(away_c.get("score") or 0)
@@ -512,9 +582,13 @@ class LiveSportsbookAndStatsAPI:
 
                         results.append({
                             "event_id": ev_id,
+                            "apif_fixture_id": "",
                             "priority_rank": rank_idx,
                             "home": h_name,
                             "away": a_name,
+                            "kickoff_dt": kickoff_dt,
+                            "kickoff_str": format_kickoff_human(kickoff_dt),
+                            "hours_until_kickoff": hours_left,
                             "gh": h_score,
                             "ga": a_score,
                             "state": state,
@@ -540,8 +614,13 @@ class LiveSportsbookAndStatsAPI:
             except Exception:
                 pass
 
-        # Fallback / supplement with API-Football Men's fixtures if key is present and ESPN had < 4 matches
-        if len(results) < 4 and API_FOOTBALL_KEY:
+        # 2. Secondary Supplement: API-Football Men's Professional Fixtures (when ESPN has < 4 in-window matches)
+        in_window_espn = [
+            r for r in results
+            if r.get("hours_until_kickoff") is not None
+            and MIN_HOURS_BEFORE_KICKOFF <= r["hours_until_kickoff"] <= MAX_HOURS_BEFORE_KICKOFF
+        ]
+        if len(in_window_espn) < 3 and API_FOOTBALL_KEY:
             try:
                 url = f"{cls.BASE_URL}/fixtures?date={date_str}"
                 req = urllib.request.Request(url, headers={"x-apisports-key": API_FOOTBALL_KEY.strip()})
@@ -552,34 +631,49 @@ class LiveSportsbookAndStatsAPI:
                         country = f.get("league", {}).get("country", "")
                         h_name = f.get("teams", {}).get("home", {}).get("name", "")
                         a_name = f.get("teams", {}).get("away", {}).get("name", "")
-                        comb = f"{h_name} {a_name} {lg_name}".lower()
+                        comb = f"{h_name} {a_name} {lg_name} {country}".lower()
                         if any(b in comb for b in BANNED_TERMS):
                             continue
                         m_key = f"{normalize_team_str(h_name)}_vs_{normalize_team_str(a_name)}"
                         if m_key in seen_match_keys:
                             continue
                         seen_match_keys.add(m_key)
-                        st = f.get("fixture", {}).get("status", {})
+
+                        fix_obj = f.get("fixture", {})
+                        raw_date = fix_obj.get("date") or ""
+                        kickoff_dt = parse_kickoff_utc(raw_date)
+                        hours_left = None
+                        if kickoff_dt:
+                            hours_left = (kickoff_dt - now_utc).total_seconds() / 3600.0
+
+                        st = fix_obj.get("status", {})
                         short = st.get("short", "NS")
+                        elapsed = st.get("elapsed")
                         is_fin = short in ["FT", "AET", "PEN"]
                         is_lv = short in ["1H", "HT", "2H", "ET", "LIVE"]
+                        clock_str = f"{elapsed}'" if (is_lv and elapsed) else short
+
                         results.append({
                             "event_id": "",
-                            "priority_rank": 50,
+                            "apif_fixture_id": str(fix_obj.get("id", "")),
+                            "priority_rank": 40,
                             "home": h_name,
                             "away": a_name,
+                            "kickoff_dt": kickoff_dt,
+                            "kickoff_str": format_kickoff_human(kickoff_dt),
+                            "hours_until_kickoff": hours_left,
                             "gh": f.get("goals", {}).get("home") or 0,
                             "ga": f.get("goals", {}).get("away") or 0,
                             "state": "post" if is_fin else ("in" if is_lv else "pre"),
                             "is_finished": is_fin,
                             "is_live": is_lv,
-                            "status_label": "FT" if is_fin else short,
-                            "clock": short,
+                            "status_label": "FT" if is_fin else (f"LIVE {clock_str}" if is_lv else short),
+                            "clock": clock_str,
                             "home_form": "WWDWL",
                             "away_form": "WDLLW",
                             "home_record": "",
                             "away_record": "",
-                            "league_name": f"{country} {lg_name}".strip(),
+                            "league_name": f"{country} - {lg_name}".strip(" -"),
                             "league_slug": "apif",
                             "bookmaker": "Bet365 / Market",
                             "home_odds": None,
@@ -700,9 +794,12 @@ class LiveSportsbookAndStatsAPI:
                     ga = matched_leg["gh"] if swapped else matched_leg["ga"]
                     c_tot = matched_leg.get("corners_total")
                     y_tot = matched_leg.get("cards_total")
-                    if matched_leg.get("event_id") and (c_tot is None or y_tot is None):
+                    if c_tot is None or y_tot is None:
                         if "corner" in leg.get("market_type", "") or "booking" in leg.get("market_type", ""):
-                            c_tot, y_tot = cls.fetch_espn_event_stats(matched_leg["event_id"])
+                            if matched_leg.get("event_id"):
+                                c_tot, y_tot = cls.fetch_espn_event_stats(matched_leg["event_id"])
+                            elif matched_leg.get("apif_fixture_id"):
+                                c_tot, y_tot = cls.fetch_apifootball_fixture_stats(matched_leg["apif_fixture_id"])
                     leg_res = cls.grade_single_condition(
                         leg.get("market_type", "goals_over_under"),
                         leg.get("selection", ""),
@@ -750,9 +847,11 @@ class LiveSportsbookAndStatsAPI:
                 c_tot = matched.get("corners_total")
                 y_tot = matched.get("cards_total")
 
-                if item.market_type in ["corners_over_under", "bookings_over_under"] and matched.get("event_id"):
-                    if c_tot is None or y_tot is None:
+                if item.market_type in ["corners_over_under", "bookings_over_under"] and (c_tot is None or y_tot is None):
+                    if matched.get("event_id"):
                         c_tot, y_tot = cls.fetch_espn_event_stats(matched["event_id"])
+                    elif matched.get("apif_fixture_id"):
+                        c_tot, y_tot = cls.fetch_apifootball_fixture_stats(matched["apif_fixture_id"])
 
                 extra_stat = ""
                 if item.market_type == "corners_over_under" and c_tot is not None:
@@ -786,8 +885,8 @@ class LiveSportsbookAndStatsAPI:
 
 class SafeCushionBetCreator:
     """
-    Evaluates strictly Men's Professional Football Fixtures across 6 Safe-Cushion strategies
-    to produce up to 3 Pure 1-Click Single Bets (>= 1.54 odds) + 1 Daily 3-Leg Safe Combo.
+    Evaluates Men's Professional Football Fixtures inside the 0.5h–5.5h pre-kickoff window
+    to produce up to 3 Pure 1-Click Single Bets (>= 1.52 odds) + 1 Daily 3-Leg Safe Combo.
     """
 
     @staticmethod
@@ -798,17 +897,41 @@ class SafeCushionBetCreator:
         return form_str.count("W"), form_str.count("D"), form_str.count("L")
 
     @classmethod
+    def is_in_single_window(cls, m: Dict[str, Any]) -> bool:
+        if m["is_finished"] or m["is_live"]:
+            return False
+        hours_left = m.get("hours_until_kickoff")
+        if hours_left is None:
+            return False
+        return MIN_HOURS_BEFORE_KICKOFF <= hours_left <= MAX_HOURS_BEFORE_KICKOFF
+
+    @classmethod
+    def is_in_combo_window(cls, m: Dict[str, Any]) -> bool:
+        if m["is_finished"] or m["is_live"]:
+            return False
+        hours_left = m.get("hours_until_kickoff")
+        if hours_left is None:
+            return False
+        return MIN_HOURS_BEFORE_KICKOFF <= hours_left <= MAX_COMBO_LEG_HOURS_AHEAD
+
+    @classmethod
     def analyze_match_for_single_and_combo_leg(
         cls,
         m: Dict[str, Any],
         date_str: str,
-        buzz_teams: Set[str]
+        buzz_teams: Set[str],
+        allow_extended_combo_window: bool = False
     ) -> Tuple[Optional[LedgerBetItem], Optional[Dict[str, Any]]]:
-        if m["is_finished"] or m["is_live"]:
-            return None, None
+        if allow_extended_combo_window:
+            if not cls.is_in_combo_window(m):
+                return None, None
+        else:
+            if not cls.is_in_single_window(m):
+                return None, None
 
         home = m["home"]
         away = m["away"]
+        kickoff_str = m.get("kickoff_str", "")
         h_form = m.get("home_form", "")[-5:]
         a_form = m.get("away_form", "")[-5:]
         hw, hd, hl = cls._parse_w_d_l(m.get("home_record", ""), h_form)
@@ -846,7 +969,7 @@ class SafeCushionBetCreator:
                 "home": home, "away": away, "market_type": "1x2",
                 "selection": f"{home} or Draw (1X)", "line": None, "odds": 1.28
             }
-            single = cls._build_single(date_str, home, away, market_type, selection, None, odds, 71.0, 15.0 + ev_boost, why, league_label, bookie)
+            single = cls._build_single(date_str, home, away, market_type, selection, None, odds, 71.0, 15.0 + ev_boost, why, league_label, bookie, kickoff_str)
             return single, combo_leg
 
         # Strategy 2: Two Attacking / Evenly Matched Teams -> Safe-Cushion Corners ("Over 8.5 Total Corners")
@@ -859,7 +982,7 @@ class SafeCushionBetCreator:
                 "home": home, "away": away, "market_type": "corners_over_under",
                 "selection": "Over 7.5 Corners", "line": 7.5, "odds": 1.32
             }
-            single = cls._build_single(date_str, home, away, market_type, selection, 8.5, odds, 70.0, 14.5 + ev_boost, why, league_label, bookie)
+            single = cls._build_single(date_str, home, away, market_type, selection, 8.5, odds, 70.0, 14.5 + ev_boost, why, league_label, bookie, kickoff_str)
             return single, combo_leg
 
         # Strategy 3: Balanced Scoring Clash -> Pure Single "Both Teams To Score: Yes"
@@ -872,7 +995,7 @@ class SafeCushionBetCreator:
                 "home": home, "away": away, "market_type": "goals_over_under",
                 "selection": "Over 1.5 Goals", "line": 1.5, "odds": 1.28
             }
-            single = cls._build_single(date_str, home, away, market_type, selection, None, odds, 69.0, 14.2 + ev_boost, why, league_label, bookie)
+            single = cls._build_single(date_str, home, away, market_type, selection, None, odds, 69.0, 14.2 + ev_boost, why, league_label, bookie, kickoff_str)
             return single, combo_leg
 
         # Strategy 4: High-Tempo / Leaky Defenses -> Pure Single "Over 2.5 Total Goals"
@@ -885,7 +1008,7 @@ class SafeCushionBetCreator:
                 "home": home, "away": away, "market_type": "goals_over_under",
                 "selection": "Over 1.5 Goals", "line": 1.5, "odds": 1.30
             }
-            single = cls._build_single(date_str, home, away, market_type, selection, 2.5, odds, 68.0, 13.8 + ev_boost, why, league_label, bookie)
+            single = cls._build_single(date_str, home, away, market_type, selection, 2.5, odds, 68.0, 13.8 + ev_boost, why, league_label, bookie, kickoff_str)
             return single, combo_leg
 
         # Strategy 5: Strong Away Favorite -> Pure Single "{Away} to Win (Full Time)"
@@ -900,10 +1023,10 @@ class SafeCushionBetCreator:
                 "home": home, "away": away, "market_type": "1x2",
                 "selection": f"{away} or Draw (X2)", "line": None, "odds": 1.30
             }
-            single = cls._build_single(date_str, home, away, market_type, selection, None, odds, 69.5, 14.0 + ev_boost, why, league_label, bookie)
+            single = cls._build_single(date_str, home, away, market_type, selection, None, odds, 69.5, 14.0 + ev_boost, why, league_label, bookie, kickoff_str)
             return single, combo_leg
 
-        # Strategy 6: Competitive League Fixture -> Safe-Cushion Corners ("Over 8.5 Total Corners")
+        # Strategy 6: Competitive League Clash -> Safe-Cushion Corners
         selection = "Over 8.5 Total Corners"
         market_type = "corners_over_under"
         odds = 1.56
@@ -912,7 +1035,7 @@ class SafeCushionBetCreator:
             "home": home, "away": away, "market_type": "goals_over_under",
             "selection": "Over 1.5 Goals", "line": 1.5, "odds": 1.28
         }
-        single = cls._build_single(date_str, home, away, market_type, selection, 8.5, odds, 67.5, 11.5 + ev_boost, why, league_label, bookie)
+        single = cls._build_single(date_str, home, away, market_type, selection, 8.5, odds, 67.5, 11.5 + ev_boost, why, league_label, bookie, kickoff_str)
         return single, combo_leg
 
     @classmethod
@@ -929,7 +1052,8 @@ class SafeCushionBetCreator:
         ev_pct: float,
         why: str,
         league_label: str,
-        bookie: str
+        bookie: str,
+        kickoff_str: str = ""
     ) -> LedgerBetItem:
         h_norm = normalize_team_str(home)
         a_norm = normalize_team_str(away)
@@ -956,6 +1080,7 @@ class SafeCushionBetCreator:
             search_url="",
             match_context=league_label,
             bookmaker_name=bookie,
+            kickoff_str=kickoff_str,
             is_combo=False
         )
 
@@ -971,18 +1096,16 @@ class SafeCushionBetCreator:
 
         buzz_teams = ChannelBuzzRadar.fetch_channel_buzz_teams()
         fixtures = LiveSportsbookAndStatsAPI.fetch_mens_fixtures_with_odds(active_date)
-        # If today's Men's fixtures are all finished or scarce late at night, also look at tomorrow's Men's fixtures
-        if len([f for f in fixtures if not f["is_finished"] and not f["is_live"]]) < 3:
-            next_day = shift_date_str(active_date, 1)
-            fixtures.extend(LiveSportsbookAndStatsAPI.fetch_mens_fixtures_with_odds(next_day))
+        next_day = shift_date_str(active_date, 1)
+        fixtures.extend(LiveSportsbookAndStatsAPI.fetch_mens_fixtures_with_odds(next_day))
 
+        # 1. Evaluate matches strictly in the 0.5h–5.5h Single Bet window
         paired_candidates: List[Tuple[int, LedgerBetItem, Dict[str, Any]]] = []
         for m in fixtures:
-            single, c_leg = cls.analyze_match_for_single_and_combo_leg(m, active_date, buzz_teams)
+            single, c_leg = cls.analyze_match_for_single_and_combo_leg(m, active_date, buzz_teams, allow_extended_combo_window=False)
             if single and single.odds >= MIN_SINGLE_ODDS and c_leg:
                 paired_candidates.append((m.get("priority_rank", 50), single, c_leg))
 
-        # Sort by top Men's league priority first, then highest EV edge
         paired_candidates.sort(key=lambda item: (item[0], -item[1].edge_ev))
         top_pairs = paired_candidates[:MAX_DAILY_SINGLES]
 
@@ -990,44 +1113,79 @@ class SafeCushionBetCreator:
         for _, single, _ in top_pairs[: max(0, slots_left)]:
             DailyLedgerManager.upsert_bet(single)
 
-        # Build 1 Daily Safe-Cushion Bonus Combo using the EXACT SAME top matches!
-        if not existing_combos and len(top_pairs) >= 2:
-            chosen_legs = [c_leg for _, _, c_leg in top_pairs[:3]]
-            combined_odds = 1.0
-            for lg in chosen_legs:
-                combined_odds *= float(lg.get("odds", 1.30))
-            combined_odds = round(combined_odds, 2)
+        # Refresh existing_singles after upserting new ones
+        updated_existing = DailyLedgerManager.load_active_date_items()
+        current_singles = [i for i in updated_existing if not i.is_combo]
 
-            leg_global_desc = " + ".join(
-                f"{lg['home']} vs {lg['away']} ({lg['selection']})" for lg in chosen_legs
-            )
-            legs_hash = hashlib.md5(leg_global_desc.encode("utf-8")).hexdigest()[:8]
-            combo_item = LedgerBetItem(
-                bet_key=f"combo_{active_date}_{legs_hash}",
-                date_str=active_date,
-                team_home="DAILY SAFE-CUSHION COMBO",
-                team_away=f"({len(chosen_legs)} Safe Legs)",
-                market_type="daily_parlay",
-                selection=leg_global_desc,
-                line=None,
-                odds=combined_odds,
-                floor_odds=1.60,
-                is_approved=True,
-                confidence_stars="⭐️⭐️⭐️⭐️⭐️",
-                model_prob=64.0,
-                edge_ev=26.0,
-                recommended_units=0.5,
-                consensus_sources=["Footybett_AI_Combo"],
-                rationale="Stepped-down safe cushions on today's top matches combined into 1 ticket.",
-                evidence="Same-Slate Safe Combo",
-                rotation_warning=None,
-                search_url="",
-                match_context="Daily Bonus Combo",
-                bookmaker_name="Bet365 / Market",
-                is_combo=True,
-                combo_legs=chosen_legs
-            )
-            DailyLedgerManager.upsert_bet(combo_item)
+        # 2. If we have at least 1 Single today and no Combo yet, build the Daily Safe-Cushion Combo so they arrive together!
+        if not existing_combos and len(current_singles) >= 1:
+            combo_legs_pool: List[Dict[str, Any]] = []
+            for s in current_singles:
+                if s.market_type == "1x2":
+                    combo_legs_pool.append({
+                        "home": s.team_home, "away": s.team_away, "market_type": "1x2",
+                        "selection": f"{s.team_home} or Draw (1X)" if s.team_home in s.selection else f"{s.team_away} or Draw (X2)",
+                        "line": None, "odds": 1.28
+                    })
+                elif s.market_type == "corners_over_under":
+                    combo_legs_pool.append({
+                        "home": s.team_home, "away": s.team_away, "market_type": "corners_over_under",
+                        "selection": "Over 7.5 Corners", "line": 7.5, "odds": 1.32
+                    })
+                else:
+                    combo_legs_pool.append({
+                        "home": s.team_home, "away": s.team_away, "market_type": "goals_over_under",
+                        "selection": "Over 1.5 Goals", "line": 1.5, "odds": 1.30
+                    })
+
+            # If fewer than 3 legs are in the 5.5h window right now, check up to 8.0h ahead to complete the 2-3 leg Combo
+            if len(combo_legs_pool) < 3:
+                for m in fixtures:
+                    _, ext_leg = cls.analyze_match_for_single_and_combo_leg(
+                        m, active_date, buzz_teams, allow_extended_combo_window=True
+                    )
+                    if ext_leg and not any(teams_match(ext_leg["home"], lg["home"]) for lg in combo_legs_pool):
+                        combo_legs_pool.append(ext_leg)
+                    if len(combo_legs_pool) >= 3:
+                        break
+
+            if len(combo_legs_pool) >= 2:
+                chosen_legs = combo_legs_pool[:3]
+                combined_odds = 1.0
+                for lg in chosen_legs:
+                    combined_odds *= float(lg.get("odds", 1.30))
+                combined_odds = round(combined_odds, 2)
+
+                leg_global_desc = " + ".join(
+                    f"{lg['home']} vs {lg['away']} ({lg['selection']})" for lg in chosen_legs
+                )
+                legs_hash = hashlib.md5(leg_global_desc.encode("utf-8")).hexdigest()[:8]
+                combo_item = LedgerBetItem(
+                    bet_key=f"combo_{active_date}_{legs_hash}",
+                    date_str=active_date,
+                    team_home="DAILY SAFE-CUSHION COMBO",
+                    team_away=f"({len(chosen_legs)} Safe Legs)",
+                    market_type="daily_parlay",
+                    selection=leg_global_desc,
+                    line=None,
+                    odds=combined_odds,
+                    floor_odds=1.60,
+                    is_approved=True,
+                    confidence_stars="⭐️⭐️⭐️⭐️⭐️",
+                    model_prob=64.0,
+                    edge_ev=26.0,
+                    recommended_units=0.5,
+                    consensus_sources=["Footybett_AI_Combo"],
+                    rationale="Stepped-down safe cushions on verified lineups combined into 1 ticket.",
+                    evidence="Same-Slate Safe Combo",
+                    rotation_warning=None,
+                    search_url="",
+                    match_context="Daily Bonus Combo",
+                    bookmaker_name="Bet365 / Market",
+                    is_combo=True,
+                    combo_legs=chosen_legs
+                )
+                DailyLedgerManager.upsert_bet(combo_item)
 
         return DailyLedgerManager.load_active_date_items()
 
@@ -1067,13 +1225,14 @@ class BetSlipCardFormatter:
                 f"💰 Total Odds : {s.odds:.2f}  |  Stake: {s.recommended_units:.1f}u (Bonus)\n"
                 f"📊 Why        : {s.rationale}"
             )
+        kickoff_line = f"\n⏰ Kickoff : {s.kickoff_str}" if s.kickoff_str else ""
         return (
             "🟢 OPEN SINGLE BET — @Footybett\n"
             "────────────────────────\n"
-            f"⚽ Match : {s.team_home} vs {s.team_away} ({s.match_context})\n"
-            f"🎯 Bet   : {s.selection}\n"
-            f"💰 Odds  : {s.odds:.2f} ({s.bookmaker_name})  |  Stake: {s.recommended_units:.1f}u\n"
-            f"📊 Why   : {s.rationale}"
+            f"⚽ Match   : {s.team_home} vs {s.team_away} ({s.match_context}){kickoff_line}\n"
+            f"🎯 Bet     : {s.selection}\n"
+            f"💰 Odds    : {s.odds:.2f} ({s.bookmaker_name})  |  Stake: {s.recommended_units:.1f}u\n"
+            f"📊 Why     : {s.rationale}"
         )
 
     @classmethod
@@ -1125,11 +1284,13 @@ class BetSlipCardFormatter:
             for idx, s in enumerate(singles, 1):
                 st_icon = "✅ WON" if "WON" in s.settlement else ("❌ LOST" if "LOST" in s.settlement else "🟢 OPEN")
                 sc = f" | {s.score_str}" if s.score_str != "-" else ""
-                lines.append(f"{idx}. [{st_icon}{sc}] {s.team_home} vs {s.team_away} ({s.match_context})")
+                ko = f" [{s.kickoff_str}]" if s.kickoff_str else ""
+                lines.append(f"{idx}. [{st_icon}{sc}] {s.team_home} vs {s.team_away} ({s.match_context}){ko}")
                 lines.append(f"   🎯 Bet: {s.selection} @ {s.odds:.2f} (1.0u)")
                 lines.append(f"   💡 {s.rationale}")
         else:
-            lines.append(f"• Scanning {active_date} Men's professional leagues for >= 1.52 setups...")
+            lines.append("• Queue active: Monitoring upcoming Men's professional matches.")
+            lines.append("  (Singles & Combos automatically publish within 5.5 hours of kickoff once lineups & odds settle).")
 
         if combos:
             c = combos[0]
@@ -1185,7 +1346,10 @@ class TelegramBotClient:
             published_count = 0
             updated = False
 
-            for full_key, item in all_items.items():
+            # Publish Singles first, then the Daily Safe-Cushion Combo right after
+            ordered_items = sorted(all_items.items(), key=lambda kv: (1 if kv[1].is_combo else 0))
+
+            for full_key, item in ordered_items:
                 if not item.is_approved or item.date_str < TRACKING_START_DATE:
                     continue
                 pick_lock_key = f"pick:{full_key}"
@@ -1231,7 +1395,7 @@ class TelegramBotClient:
             return []
 
     def background_worker_loop(self):
-        logger.info("AI Men's Football Bet Creator & Combo Worker started (v16.2)...")
+        logger.info("Footybett v17.0 Production Worker started (Window: %s-%sh pre-kickoff)...", MIN_HOURS_BEFORE_KICKOFF, MAX_HOURS_BEFORE_KICKOFF)
         time.sleep(5)
         while True:
             try:
@@ -1264,7 +1428,7 @@ class TelegramBotClient:
         watcher_thread = threading.Thread(target=self.background_worker_loop, daemon=True)
         watcher_thread.start()
 
-        logger.info("Bot listener running (v16.2 Men's Leagues Only + 3 Singles + 1 Combo)...")
+        logger.info("Bot listener running (v17.0 Final Production Release)...")
         offset = None
 
         while True:
