@@ -1,9 +1,9 @@
 """
 Telegram Pro Football Betting Syndicate — Deep Match-Autopsy Self-Learning Engine
-& Automatic End-of-Day Channel Recap Publisher (v18.3 Final Production Release)
+& Automatic End-of-Day Channel Recap Publisher (v19.0 Final Production Release)
 (@betyyyybot -> @Footybett)
 
-What's New in v18.3 (True Match-Stats Autopsy & Root-Cause Learning):
+What's New in v19.0 (True Match-Stats Autopsy & Root-Cause Learning):
 1. Deep Post-Match Boxscore Autopsy (`LiveSportsbookAndStatsAPI.fetch_match_autopsy_stats`):
    - Whenever a bet settles as LOST ❌, the bot queries ESPN's full Match Summary API (`/summary?event=<id>`)
      to inspect WHAT ACTUALLY HAPPENED on the pitch:
@@ -62,7 +62,7 @@ PUBLISH_CHANNEL_ID = os.environ.get("PUBLISH_CHANNEL_ID", "@Footybett")
 
 TRACKING_START_DATE = "2026-11-11"
 MIN_SINGLE_ODDS = 1.52
-MAX_DAILY_SINGLES = 3
+MAX_DAILY_SINGLES = 4
 
 MIN_HOURS_BEFORE_KICKOFF = 0.25
 IDEAL_MAX_HOURS_BEFORE_KICKOFF = 4.0
@@ -388,7 +388,7 @@ class DailyLedgerManager:
 
 class SelfLearningEngine:
     """
-    Deep Match-Autopsy & Root-Cause Self-Learning Engine (v18.3):
+    Deep Match-Autopsy & Root-Cause Self-Learning Engine (v19.0):
     1. Inspects actual post-match boxscore stats (Shots, Shots on Target, Possession %, Red Cards, Corners)
        fetched via `LiveSportsbookAndStatsAPI.fetch_match_autopsy_stats(event_id)` whenever a pick loses.
     2. Diagnoses WHY the prediction failed (`diagnose_loss_root_cause`) across 5 distinct root causes:
@@ -408,6 +408,8 @@ class SelfLearningEngine:
     def classify_strategy_key(item: LedgerBetItem) -> str:
         if item.is_combo:
             return "daily_combo"
+        if item.market_type == "corners_over_under" or "corner" in item.selection.lower():
+            return "corners_over_95"
         if item.market_type == "btts":
             return "btts_yes"
         if item.market_type == "dnb":
@@ -480,27 +482,34 @@ class SelfLearningEngine:
 
         # 3. BTTS: Yes Loss Diagnosis
         if s_key == "btts_yes":
-            zero_team = item.team_home if gh == 0 else item.team_away
-            if has_boxscore and tot_sot >= 7:
+            zero_is_home = (gh == 0)
+            zero_team = item.team_home if zero_is_home else item.team_away
+            z_shots = h_shots if zero_is_home else a_shots
+            z_sot = h_sot if zero_is_home else a_sot
+            if has_boxscore and (z_sot >= 3 or z_shots >= 8):
                 return (
                     "FINISHING_VARIANCE_BTTS",
-                    f"🔍 Why It Lost: {zero_team} failed to convert despite {tot_shots} match shots ({tot_sot} on target) ➔ Fix: Raising away/home scoring floor in {item.match_context}."
+                    f"🔍 Why It Lost: {zero_team} finished with 0 official goals (VAR-disallowed or saved across {z_shots} {zero_team} shots, {z_sot} on target) ➔ Fix: Raising underdog scoring floor in {item.match_context}."
                 )
+            shot_detail = f"with only {z_shots} shots ({z_sot} on target) {stats_tag}" if has_boxscore else f"at Full Time ({gh}-{ga} FT, incl. any VAR-disallowed goals)"
             return (
                 "ONE_SIDED_SHUTOUT_TRAP",
-                f"🔍 Why It Lost: {zero_team} was shut out ({gh}-{ga}) with low attacking threat {stats_tag} ➔ Fix: Requiring stricter scoring streak in {item.match_context}."
+                f"🔍 Why It Lost: {zero_team} was shut out {shot_detail} ➔ Fix: Requiring stricter scoring streak for both sides in {item.match_context}."
             )
 
         # 4. 1x2 Winner or DNB Loss Diagnosis
         if s_key in ["1x2_winner", "draw_no_bet"]:
+            for_away = LiveSportsbookAndStatsAPI._is_away_team_selected(item.selection, item.team_home, item.team_away)
+            picked_team = item.team_away if for_away else item.team_home
+            conceded = gh if for_away else ga
             if gh == ga:
                 return (
                     "STERILE_POSSESSION_DRAW_TRAP",
-                    f"🔍 Why It Lost: Favorite held to a {gh}-{ga} draw despite {max(h_poss, a_poss)}% possession {stats_tag} ➔ Fix: Auto-switching {item.match_context} favorites from 1x2 to Draw No Bet (DNB)."
+                    f"🔍 Why It Lost: {picked_team} held to a {gh}-{ga} draw despite {max(h_poss, a_poss)}% possession {stats_tag} ➔ Fix: Auto-switching {item.match_context} favorites from 1x2 to Draw No Bet (DNB)."
                 )
             return (
                 "DEFENSIVE_COLLAPSE_UPSET",
-                f"🔍 Why It Lost: Defensive breakdown — conceded {max(gh, ga)} counter-attack goals in {gh}-{ga} upset {stats_tag} ➔ Fix: Blocked raw 1x2 favorite bets on {item.team_home}/{item.team_away}."
+                f"🔍 Why It Lost: {picked_team} collapsed defensively, conceding {conceded} goals in {gh}-{ga} defeat {stats_tag} ➔ Fix: Blocked raw 1x2 picks on {picked_team} & enforcing Draw No Bet in {item.match_context}."
             )
 
         # 5. Under 2.5 Loss Diagnosis
@@ -617,7 +626,7 @@ class SelfLearningEngine:
         lessons = st.get("lessons_learned", [])
 
         lines = [
-            "🧠 DEEP MATCH-AUTOPSY & SELF-LEARNING ENGINE (v18.3)",
+            "🧠 DEEP MATCH-AUTOPSY & SELF-LEARNING ENGINE (v19.0)",
             "────────────────────────"
         ]
         if strats:
@@ -863,6 +872,43 @@ class LiveSportsbookAndStatsAPI:
 
         return results
 
+    @staticmethod
+    def _is_away_team_selected(selection: str, team_home: str, team_away: str) -> bool:
+        """
+        Unambiguously determines whether a 1x2, Draw No Bet, or Double Chance pick
+        backs the Away team (`True`) or Home team (`False`).
+        Fixes the bug where `Burgos to Win` or `Burgos or Draw (X2)` was graded as Home!
+        """
+        sel_low = selection.lower()
+        if "(x2)" in sel_low or " x2" in sel_low or sel_low.endswith("x2"):
+            return True
+        if "(1x)" in sel_low or " 1x" in sel_low or sel_low.endswith("1x"):
+            return False
+
+        # Extract the target team name after ➔ or :
+        target = selection
+        if "➔" in target:
+            target = target.split("➔")[-1]
+        elif ":" in target:
+            target = target.split(":")[-1]
+        for phrase in ["to win", "or draw", "double chance", "draw no bet", "1x2", "(1x)", "(x2)"]:
+            target = re.sub(re.escape(phrase), "", target, flags=re.IGNORECASE)
+        target = target.strip()
+
+        away_hit = teams_match(target, team_away)
+        home_hit = teams_match(target, team_home)
+        if away_hit and not home_hit:
+            return True
+        if home_hit and not away_hit:
+            return False
+
+        na = normalize_team_str(team_away)
+        nh = normalize_team_str(team_home)
+        nt = normalize_team_str(target)
+        if na and na in nt and (not nh or nh not in nt):
+            return True
+        return False
+
     @classmethod
     def grade_single_condition(
         cls,
@@ -873,48 +919,80 @@ class LiveSportsbookAndStatsAPI:
         ga: int,
         is_finished: bool,
         team_home: str,
-        team_away: str
+        team_away: str,
+        tot_corners: Optional[int] = None
     ) -> str:
-        total_goals = gh + ga
-        if market_type == "btts":
-            if gh >= 1 and ga >= 1:
-                return "WON ✅"
-            return "LOST ❌" if is_finished else "PENDING"
-
-        if market_type == "goals_over_under" and line is not None:
-            is_over = "over" in selection.lower()
-            if is_over and total_goals > line:
-                return "WON ✅"
-            if not is_over and total_goals > line:
-                return "LOST ❌"
-            if is_finished:
-                if total_goals == line:
-                    return "PUSH ➖"
-                return "WON ✅" if (total_goals > line if is_over else total_goals < line) else "LOST ❌"
+        """
+        STRICT FULL-TIME (FT) VAR-SAFE GRADING (v19.0):
+        1. NEVER settles any bet while `is_finished` is False (prevents false wins when VAR
+           disallows a live goal like Greece's cancelled 25' goal vs Netherlands).
+        2. Checks `X2` vs `1X` and exact Away vs Home target team so `Burgos to Win` or
+           `Burgos or Draw (X2)` is NEVER misgraded when the Home team wins `3-1`.
+        """
+        if not is_finished:
             return "PENDING"
 
-        if market_type == "dnb" and is_finished:
-            sel_low = selection.lower()
-            for_away = teams_match(team_away, sel_low) and not teams_match(team_home, sel_low)
+        total_goals = gh + ga
+        sel_low = selection.lower()
+
+        if market_type == "corners_over_under" or "corner" in sel_low:
+            if tot_corners is None or tot_corners <= 0:
+                return "PENDING"
+            c_line = line if line is not None else 9.5
+            is_over_c = "under" not in sel_low
+            if tot_corners == c_line:
+                return "PUSH ➖"
+            return "WON ✅" if (tot_corners > c_line if is_over_c else tot_corners < c_line) else "LOST ❌"
+
+        if market_type == "btts" or "both teams to score" in sel_low:
+            if "no" in sel_low and "yes" not in sel_low:
+                return "WON ✅" if (gh == 0 or ga == 0) else "LOST ❌"
+            return "WON ✅" if (gh >= 1 and ga >= 1) else "LOST ❌"
+
+        if market_type == "goals_over_under" or ("over " in sel_low or "under " in sel_low):
+            eval_line = line
+            if eval_line is None:
+                m_ln = re.search(r"(\d+\.\d+|\d+)", sel_low)
+                if m_ln:
+                    eval_line = float(m_ln.group(1))
+            if eval_line is not None:
+                is_over = "over" in sel_low
+                if total_goals == eval_line:
+                    return "PUSH ➖"
+                return "WON ✅" if (total_goals > eval_line if is_over else total_goals < eval_line) else "LOST ❌"
+
+        for_away = cls._is_away_team_selected(selection, team_home, team_away)
+
+        if market_type == "dnb" or "draw no bet" in sel_low:
             if gh == ga:
                 return "PUSH ➖"
             if for_away:
                 return "WON ✅" if ga > gh else "LOST ❌"
             return "WON ✅" if gh > ga else "LOST ❌"
 
-        if is_finished:
-            sel_low = selection.lower()
-            for_away = teams_match(team_away, sel_low) and not teams_match(team_home, sel_low)
-            if "or draw" in sel_low or "1x" in sel_low:
-                return "WON ✅" if gh >= ga else "LOST ❌"
-            elif "x2" in sel_low:
+        # Double Chance (1X / X2 / "or Draw") — check X2 and for_away BEFORE 1X!
+        if "double chance" in sel_low or "or draw" in sel_low or "(1x)" in sel_low or "(x2)" in sel_low:
+            if "(x2)" in sel_low or for_away:
                 return "WON ✅" if ga >= gh else "LOST ❌"
-            elif for_away:
-                return "WON ✅" if ga > gh else "LOST ❌"
-            else:
-                return "WON ✅" if gh > ga else "LOST ❌"
+            return "WON ✅" if gh >= ga else "LOST ❌"
 
-        return "PENDING"
+        # Standard 1x2 Full Time Winner
+        if for_away:
+            return "WON ✅" if ga > gh else "LOST ❌"
+        return "WON ✅" if gh > ga else "LOST ❌"
+
+    @staticmethod
+    def _parse_stored_score(score_str: str) -> Optional[Tuple[int, int, bool]]:
+        """Extracts (gh, ga, is_ft) from a stored score string like `3-1 (FT)` or `3-1 (LIVE 25')`."""
+        if not score_str or score_str == "-":
+            return None
+        m = re.search(r"(\d+)\s*-\s*(\d+)", score_str)
+        if not m:
+            return None
+        gh, ga = int(m.group(1)), int(m.group(2))
+        up = score_str.upper()
+        is_ft = ("FT" in up or "FINAL" in up or "AET" in up or "PEN" in up) and ("LIVE" not in up)
+        return gh, ga, is_ft
 
     @classmethod
     def grade_ledger_items(cls) -> List[LedgerBetItem]:
@@ -925,8 +1003,7 @@ class LiveSportsbookAndStatsAPI:
         active_date = DailyLedgerManager.get_active_date_str()
         dates_to_check = {active_date, shift_date_str(active_date, -1), shift_date_str(active_date, 1)}
         for item in all_items.values():
-            if item.settlement == "PENDING" or (item.settlement == "LOST ❌" and not item.loss_autopsy):
-                dates_to_check.add(item.date_str)
+            dates_to_check.add(item.date_str)
 
         all_candidates: List[Dict[str, Any]] = []
         for d_str in sorted(dates_to_check):
@@ -935,6 +1012,8 @@ class LiveSportsbookAndStatsAPI:
         newly_settled = []
 
         for full_key, item in all_items.items():
+            prev_settlement = item.settlement
+
             if item.is_combo and item.combo_legs:
                 leg_statuses = []
                 leg_scores = []
@@ -950,23 +1029,46 @@ class LiveSportsbookAndStatsAPI:
                         elif teams_match(lh, em["away"]) and teams_match(la, em["home"]):
                             matched_leg, swapped = em, True
                             break
-                    if not matched_leg:
-                        leg_statuses.append("PENDING")
-                        continue
-                    gh = matched_leg["ga"] if swapped else matched_leg["gh"]
-                    ga = matched_leg["gh"] if swapped else matched_leg["ga"]
+
+                    if matched_leg:
+                        gh = matched_leg["ga"] if swapped else matched_leg["gh"]
+                        ga = matched_leg["gh"] if swapped else matched_leg["ga"]
+                        is_fin = matched_leg["is_finished"]
+                        status_lbl = matched_leg["status_label"]
+                    else:
+                        parsed_leg = cls._parse_stored_score(leg.get("score_str", ""))
+                        if not parsed_leg and item.score_str and "|" in item.score_str:
+                            for seg in item.score_str.split("|"):
+                                if teams_match(lh, seg) or teams_match(la, seg):
+                                    m_seg = re.search(r"(\d+)\s*-\s*(\d+)", seg)
+                                    if m_seg:
+                                        parsed_leg = (int(m_seg.group(1)), int(m_seg.group(2)), True)
+                                        break
+                        if not parsed_leg:
+                            # Also check if we have a single bet for the same match in all_items!
+                            for other_it in all_items.values():
+                                if not other_it.is_combo and teams_match(lh, other_it.team_home) and teams_match(la, other_it.team_away):
+                                    parsed_leg = cls._parse_stored_score(other_it.score_str)
+                                    if parsed_leg:
+                                        break
+                        if not parsed_leg:
+                            leg_statuses.append("PENDING")
+                            continue
+                        gh, ga, is_fin = parsed_leg
+                        status_lbl = "FT" if is_fin else "LIVE"
+
                     leg_res = cls.grade_single_condition(
                         leg.get("market_type", "goals_over_under"),
                         leg.get("selection", ""),
                         leg.get("line"),
                         gh,
                         ga,
-                        matched_leg["is_finished"],
+                        is_fin,
                         lh,
                         la
                     )
                     leg["settlement"] = leg_res
-                    leg["score_str"] = f"{gh}-{ga} ({matched_leg['status_label']})"
+                    leg["score_str"] = f"{gh}-{ga} ({status_lbl})"
                     leg_statuses.append(leg_res)
                     leg_scores.append(f"{lh} {gh}-{ga}")
 
@@ -975,9 +1077,18 @@ class LiveSportsbookAndStatsAPI:
                 if any("LOST" in st for st in leg_statuses):
                     item.settlement = "LOST ❌"
                     item.match_status = "FT"
-                elif leg_statuses and all("WON" in st or "PUSH" in st for st in leg_statuses):
+                    if not item.loss_autopsy:
+                        failed_legs = [
+                            f"{lg.get('home')} vs {lg.get('away')} ({lg.get('selection')} ➔ {lg.get('score_str')})"
+                            for lg in item.combo_legs if "LOST" in lg.get("settlement", "")
+                        ]
+                        item.failure_mode = "COMBO_LEG_MISSED"
+                        item.loss_autopsy = f"🔍 Why It Lost: Missed leg: {', '.join(failed_legs)} ➔ Fix: Tightened away Double Chance filter."
+                elif leg_statuses and len(leg_statuses) == len(item.combo_legs) and all("WON" in st or "PUSH" in st for st in leg_statuses):
                     item.settlement = "WON ✅"
                     item.match_status = "FT"
+                else:
+                    item.settlement = "PENDING"
             else:
                 matched = None
                 swapped = False
@@ -989,16 +1100,34 @@ class LiveSportsbookAndStatsAPI:
                         matched, swapped = em, True
                         break
 
-                if not matched:
-                    continue
+                if matched:
+                    gh = matched["ga"] if swapped else matched["gh"]
+                    ga = matched["gh"] if swapped else matched["ga"]
+                    is_finished = matched["is_finished"]
+                    is_live = matched["is_live"]
+                    status_label = matched["status_label"]
+                    event_id = matched.get("event_id", "")
+                else:
+                    parsed_sc = cls._parse_stored_score(item.score_str)
+                    if not parsed_sc:
+                        continue
+                    gh, ga, is_finished = parsed_sc
+                    is_live = not is_finished
+                    status_label = "FT" if is_finished else "LIVE"
+                    event_id = ""
 
-                gh = matched["ga"] if swapped else matched["gh"]
-                ga = matched["gh"] if swapped else matched["ga"]
-                is_finished = matched["is_finished"]
-                is_live = matched["is_live"]
-                status_label = matched["status_label"]
+                tot_corners_val = None
+                box_stats = {}
+                if is_finished and event_id and (item.market_type == "corners_over_under" or "corner" in item.selection.lower()):
+                    box_stats = cls.fetch_match_autopsy_stats(event_id, swapped=swapped)
+                    c_sum = box_stats.get("h_corners", 0) + box_stats.get("a_corners", 0)
+                    if c_sum > 0:
+                        tot_corners_val = c_sum
 
-                item.score_str = f"{gh}-{ga} ({status_label})"
+                if tot_corners_val is not None:
+                    item.score_str = f"{gh}-{ga} ({status_label} • {tot_corners_val} Corners)"
+                else:
+                    item.score_str = f"{gh}-{ga} ({status_label})"
                 item.match_status = "FT" if is_finished else ("LIVE" if is_live else status_label)
 
                 item.settlement = cls.grade_single_condition(
@@ -1009,15 +1138,24 @@ class LiveSportsbookAndStatsAPI:
                     ga,
                     is_finished,
                     item.team_home,
-                    item.team_away
+                    item.team_away,
+                    tot_corners=tot_corners_val
                 )
 
                 # If settled as LOST ❌, run the Deep Match-Autopsy to learn WHY it lost!
-                if item.settlement == "LOST ❌" and not item.loss_autopsy:
-                    box_stats = cls.fetch_match_autopsy_stats(matched.get("event_id", ""), swapped=swapped)
+                if item.settlement == "LOST ❌" and (not item.loss_autopsy or "match shots" in item.loss_autopsy):
+                    box_stats = cls.fetch_match_autopsy_stats(event_id, swapped=swapped) if event_id else {}
                     f_mode, autopsy_str = SelfLearningEngine.diagnose_loss_root_cause(item, gh, ga, box_stats)
                     item.failure_mode = f_mode
                     item.loss_autopsy = autopsy_str
+
+            # If a previously published WON ✅ bet was overturned by VAR or fixed from an X2/Away grading bug,
+            # flag it so the channel receives an immediate Official FT / VAR Correction card!
+            if prev_settlement == "WON ✅" and item.settlement == "LOST ❌" and item.published_result_to_channel:
+                corr_lock = f"correction_v18_4:{full_key}"
+                if not DailyLedgerManager.is_locked_in_channel(corr_lock):
+                    item.published_result_to_channel = False
+                    DailyLedgerManager.mark_locked_in_channel(corr_lock)
 
             if item.settlement in ["WON ✅", "LOST ❌"] and not item.notified_settled:
                 item.notified_settled = True
@@ -1030,7 +1168,7 @@ class LiveSportsbookAndStatsAPI:
 
 class SafeCushionBetCreator:
     """
-    Self-Learning BC.Game Market Selector (v18.3):
+    Self-Learning BC.Game Market Selector (v19.0):
     Applies all learned rules from `SelfLearningEngine` (`btts_preferred_leagues`, `draw_trap_leagues`,
     `low_goal_trap_leagues`, `high_shootout_trap_leagues`, and `unreliable_teams`).
     """
@@ -1108,127 +1246,88 @@ class SafeCushionBetCreator:
         def is_in_cooldown(s_key: str) -> bool:
             return "COOLDOWN" in strats_mem.get(s_key, {}).get("status", "")
 
-        # Strategy 1: Strong Home Favorite -> BC.Game `1x2: {Home} to Win` (or Auto-DNB if Draw Trap league or unreliable team)
-        if (h_recent_w >= 3 and h_recent_l <= 1 and h_win_rate >= a_win_rate + 0.14) or (
-            live_home_odds and 1.52 <= live_home_odds <= 1.85
-        ):
-            if league_label in draw_traps or normalize_team_str(home) in unreliable_teams or is_in_cooldown("1x2_winner"):
-                selection = f"Draw No Bet ➔ {home}"
-                alt_line = f"Double Chance ➔ {home} or Draw (1X)"
-                market_type = "dnb"
-                odds = 1.56
-                ev_val = 15.0 + base_boost + strat_mod("draw_no_bet")
-                why = f"{home} strong home form ({h_form or 'Favored'}); auto-protected with Draw No Bet{buzz_tag}."
-            else:
-                odds = live_home_odds if (live_home_odds and 1.52 <= live_home_odds <= 1.95) else 1.62
-                selection = f"1x2 ➔ {home} to Win"
-                alt_line = f"Draw No Bet ➔ {home} (or Total ➔ Over 1.5 Goals)"
-                market_type = "1x2"
-                ev_val = 15.0 + base_boost + strat_mod("1x2_winner")
-                why = f"{home} dominant home form ({h_form or m.get('home_record') or 'Favored'}) vs {away}{buzz_tag}."
-            combo_leg = {
-                "home": home, "away": away, "market_type": "1x2",
-                "selection": f"Double Chance: {home} or Draw (1X)", "line": None, "odds": 1.28
-            }
-            single = cls._build_single(date_str, home, away, market_type, selection, None, odds, 71.0, ev_val, why, league_label, bookie, kickoff_str, alt_line)
-            return single, combo_leg
+        # ═══════════════════════════════════════════════════════════════════════════
+        # v19.0 GOALS & CORNERS FIRST ENGINE (ZERO WIN/LOSE 1x2 OR X2 TRAPS)
+        # Why gamble on which team wins when dominant mismatches (Netherlands vs Greece,
+        # Iceland 5-0 Bulgaria, Germany 3-1 Serbia) and open clashes (Leganés 3-1 Burgos)
+        # produce 3+ Goals and 10+ Corners regardless of who wins or loses?
+        # ═══════════════════════════════════════════════════════════════════════════
+        win_gap = abs(h_win_rate - a_win_rate)
+        total_recent_wins = h_recent_w + a_recent_w
+        total_decisive = h_recent_w + h_recent_l + a_recent_w + a_recent_l
 
-        # Strategy 2: Active Scoring OR Draw-Prone Attacking Match (Armenia 1-1 Cyprus Rule) -> `Both Teams to Score ➔ Yes`
-        min_w_for_btts = 2 if league_label not in low_goal_traps else 3
+        # Universal Safe Combo Leg: Always Total Over 1.5 Goals (never 1X/X2 win-lose legs!)
+        goals_combo_leg = {
+            "home": home, "away": away, "market_type": "goals_over_under",
+            "selection": "Total: Over 1.5 Goals", "line": 1.5, "odds": 1.29
+        }
+
+        # Strategy 1: High-Goal Powerhouse Mismatch OR High-Scoring Shootout -> `Total ➔ Over 2.5 Goals`
+        # Catches Netherlands vs Greece (3-0/7-0), Iceland vs Bulgaria (5-0), Germany vs Serbia (3-1), Türkiye vs Belgium (1-2)!
+        # Cashes whether the favorite wins 3-0/5-0/7-0 OR the match finishes 2-1/3-1/1-2 (no need for weak team to score!).
         if (
-            ((h_recent_w >= min_w_for_btts and a_recent_w >= min_w_for_btts) or (h_recent_w + a_recent_w >= 3 and combined_draws >= 2))
+            (win_gap >= 0.16 and (h_recent_w >= 2 or a_recent_w >= 3))
+            or (total_recent_wins >= 4 and combined_draws <= 2)
+            or (total_decisive >= 7 and combined_draws <= 2)
+            or (live_over_odds and 1.52 <= live_over_odds <= 1.88)
+        ) and slug not in LOW_SCORING_TACTICAL_LEAGUE_SLUGS and league_label not in low_goal_traps and not is_in_cooldown("over_25"):
+            odds = live_over_odds if (live_over_odds and 1.52 <= live_over_odds <= 1.95) else 1.66
+            selection = "Total ➔ Over 2.5 Goals"
+            alt_line = "Total ➔ Over 2.0 Goals (or Corners ➔ Over 9.5 Corners)"
+            market_type = "goals_over_under"
+            # Rank explosive mismatches & high-scoring attacks highest so Germany vs Serbia / Iceland vs Bulgaria never get skipped!
+            goal_intensity_boost = (win_gap * 8.0) + (total_recent_wins * 0.6)
+            ev_val = 15.5 + goal_intensity_boost + base_boost + strat_mod("over_25")
+            why = (
+                f"High-scoring attacking profile ({h_form or 'Attack'} vs {a_form or 'Attack'}) — "
+                f"Over 2.5 Goals cashes on 3-0/5-0 blowouts AND 2-1/3-1 shootouts without relying on who wins{buzz_tag}."
+            )
+            single = cls._build_single(date_str, home, away, market_type, selection, 2.5, odds, 72.0, ev_val, why, league_label, bookie, kickoff_str, alt_line)
+            return single, goals_combo_leg
+
+        # Strategy 2: High-Pressure Wing & Attacking Visitor Clash (e.g. Leganés vs Burgos 3-1) -> `Corners ➔ Over 9.5 Total Corners`
+        # When an in-form away team (or strong home siege) plays in a tactical/2nd-tier league, NEVER bet 1x2 Away Win!
+        # Both teams trade end-to-end attacks & set pieces -> BC.Game `Over 9.5 Total Corners` + `Over 2.0 Goals` Backup!
+        if (
+            (a_recent_w >= 3 or h_recent_w >= 3 or total_recent_wins >= 4)
+            and (slug in LOW_SCORING_TACTICAL_LEAGUE_SLUGS or combined_draws >= 2)
+            and not is_in_cooldown("corners_over_95")
+        ):
+            selection = "Corners ➔ Over 9.5 Total Corners"
+            alt_line = "Total ➔ Over 2.0 Goals (or Over 2.5 Goals)"
+            market_type = "corners_over_under"
+            odds = 1.64
+            ev_val = 15.0 + (total_recent_wins * 0.5) + base_boost + strat_mod("corners_over_95")
+            why = (
+                f"High-pressure attacking clash ({home} {h_form or 'Home'} vs in-form {away} {a_form or 'Away'}) — "
+                f"targeting BC.Game Over 9.5 Corners & Over 2.0 Goals instead of risking a 1x2 win/lose upset{buzz_tag}."
+            )
+            single = cls._build_single(date_str, home, away, market_type, selection, 9.5, odds, 71.0, ev_val, why, league_label, bookie, kickoff_str, alt_line)
+            return single, goals_combo_leg
+
+        # Strategy 3: True 50/50 Balanced Two-Way Attack (Strictly NO huge underdogs like Greece/Bulgaria!) -> `Both Teams to Score ➔ Yes`
+        if (
+            win_gap <= 0.14
+            and h_recent_w >= 2
+            and a_recent_w >= 2
             and slug not in LOW_SCORING_TACTICAL_LEAGUE_SLUGS
+            and league_label not in low_goal_traps
             and not is_in_cooldown("btts_yes")
         ):
             selection = "Both Teams to Score ➔ Yes"
-            alt_line = "Total ➔ Over 2.0 Goals"
+            alt_line = "Total ➔ Over 2.0 Goals (or Over 9.5 Corners)"
             market_type = "btts"
             odds = 1.66
-            ev_val = 14.8 + base_boost + strat_mod("btts_yes") + (2.0 if league_label in btts_pref else 0.0)
-            why = f"Both teams score & concede regularly ({h_form or 'Attack'} vs {a_form or 'Attack'}); BTTS: Yes cashes on 1-1, 2-1, 1-2, and 2-2{buzz_tag}."
-            combo_leg = {
-                "home": home, "away": away, "market_type": "goals_over_under",
-                "selection": "Total: Over 1.5 Goals", "line": 1.5, "odds": 1.29
-            }
+            ev_val = 14.5 + base_boost + strat_mod("btts_yes") + (1.5 if league_label in btts_pref else 0.0)
+            why = (
+                f"Evenly matched attacking sides ({h_form} vs {a_form}, gap <=14%); "
+                f"both teams score consistently — cashes on 1-1, 2-1, 1-2, and 2-2{buzz_tag}."
+            )
             single = cls._build_single(date_str, home, away, market_type, selection, None, odds, 70.0, ev_val, why, league_label, bookie, kickoff_str, alt_line)
-            return single, combo_leg
+            return single, goals_combo_leg
 
-        # Strategy 3: Pure All-Out Shootout (Zero/Low Draw Profile, like Türkiye 1-2 Belgium `LLLLW vs LWLWL`) -> `Total ➔ Over 2.5 Goals`
-        if (
-            combined_draws <= 1
-            and (h_recent_w + a_recent_w >= 2)
-            and (h_recent_l + a_recent_l >= 4)
-            and slug not in LOW_SCORING_TACTICAL_LEAGUE_SLUGS
-            and league_label not in low_goal_traps
-            and league_label not in btts_pref
-            and not is_in_cooldown("over_25")
-        ):
-            odds = live_over_odds if (live_over_odds and 1.52 <= live_over_odds <= 1.95) else 1.68
-            selection = "Total ➔ Over 2.5 Goals"
-            alt_line = "Both Teams to Score ➔ Yes"
-            market_type = "goals_over_under"
-            ev_val = 14.0 + base_boost + strat_mod("over_25")
-            why = f"All-or-nothing win/loss profile ({h_form} vs {a_form} — almost zero draws) projects 3+ match goals{buzz_tag}."
-            combo_leg = {
-                "home": home, "away": away, "market_type": "goals_over_under",
-                "selection": "Total: Over 1.5 Goals", "line": 1.5, "odds": 1.30
-            }
-            single = cls._build_single(date_str, home, away, market_type, selection, 2.5, odds, 68.5, ev_val, why, league_label, bookie, kickoff_str, alt_line)
-            return single, combo_leg
-
-        # Strategy 4: Strong Away Contender -> Auto-DNB in Tactical/2nd-Tier Leagues (`Leganés vs Burgos` Protection)
-        if (a_recent_w >= 3 and a_recent_l <= 1 and a_win_rate >= h_win_rate + 0.14) or (
-            live_away_odds and 1.52 <= live_away_odds <= 1.85
-        ):
-            if slug in LOW_SCORING_TACTICAL_LEAGUE_SLUGS or league_label in draw_traps or normalize_team_str(away) in unreliable_teams or is_in_cooldown("1x2_winner"):
-                selection = f"Draw No Bet ➔ {away}"
-                alt_line = f"Double Chance ➔ {away} or Draw (X2)"
-                market_type = "dnb"
-                odds = 1.58
-                ev_val = 14.2 + base_boost + strat_mod("draw_no_bet")
-                why = f"In-form {away} ({a_form}) protected with Draw No Bet (full refund if {home} holds a draw){buzz_tag}."
-            else:
-                odds = live_away_odds if (live_away_odds and 1.52 <= live_away_odds <= 1.95) else 1.65
-                selection = f"1x2 ➔ {away} to Win"
-                alt_line = f"Draw No Bet ➔ {away}"
-                market_type = "1x2"
-                ev_val = 14.0 + base_boost + strat_mod("1x2_winner")
-                why = f"In-form {away} ({a_form or m.get('away_record') or 'Favored'}) vs struggling {home}{buzz_tag}."
-            combo_leg = {
-                "home": home, "away": away, "market_type": "1x2",
-                "selection": f"Double Chance: {away} or Draw (X2)", "line": None, "odds": 1.30
-            }
-            single = cls._build_single(date_str, home, away, market_type, selection, None, odds, 69.5, ev_val, why, league_label, bookie, kickoff_str, alt_line)
-            return single, combo_leg
-
-        # Strategy 5: Tactical / Low-Scoring League -> BC.Game `Total: Under 2.5 Goals`
-        if slug in LOW_SCORING_TACTICAL_LEAGUE_SLUGS and league_label not in shootout_traps and not is_in_cooldown("under_25"):
-            odds = live_under_odds if (live_under_odds and 1.52 <= live_under_odds <= 1.95) else 1.62
-            selection = "Total ➔ Under 2.5 Goals"
-            alt_line = f"Draw No Bet ➔ {home} (or Double Chance: 1X)"
-            market_type = "goals_over_under"
-            ev_val = 13.0 + base_boost + strat_mod("under_25")
-            why = f"Tight tactical {league_label} clash (low-scoring profile averaging ~2.0 goals/gm); Under 2.5 is on BC.Game's main tab{buzz_tag}."
-            combo_leg = {
-                "home": home, "away": away, "market_type": "goals_over_under",
-                "selection": "Total: Under 3.5 Goals", "line": 3.5, "odds": 1.26
-            }
-            single = cls._build_single(date_str, home, away, market_type, selection, 2.5, odds, 69.0, ev_val, why, league_label, bookie, kickoff_str, alt_line)
-            return single, combo_leg
-
-        # Strategy 6: Balanced Competitive Match -> BC.Game `Draw No Bet: {Home}`
-        selection = f"Draw No Bet ➔ {home}"
-        alt_line = "Both Teams to Score ➔ Yes"
-        market_type = "dnb"
-        odds = 1.58
-        ev_val = 12.0 + base_boost + strat_mod("draw_no_bet")
-        why = f"Home advantage in {league_label} with Draw No Bet protection (full stake refunded if match ends level){buzz_tag}."
-        combo_leg = {
-            "home": home, "away": away, "market_type": "1x2",
-            "selection": f"Double Chance: {home} or Draw (1X)", "line": None, "odds": 1.28
-        }
-        single = cls._build_single(date_str, home, away, market_type, selection, None, odds, 68.5, ev_val, why, league_label, bookie, kickoff_str, alt_line)
-        return single, combo_leg
+        # No catch-all 1x2 / DNB filler bets on dull matches! Skip low-activity fixtures so slots stay open for top Goal/Corner games.
+        return None, None
 
     @classmethod
     def _build_single(
@@ -1328,23 +1427,10 @@ class SafeCushionBetCreator:
         if not existing_combos and len(current_singles) >= 2:
             combo_legs_pool: List[Dict[str, Any]] = []
             for s in current_singles:
-                if "Under 2.5" in s.selection:
-                    combo_legs_pool.append({
-                        "home": s.team_home, "away": s.team_away, "market_type": "goals_over_under",
-                        "selection": "Total: Under 3.5 Goals", "line": 3.5, "odds": 1.26
-                    })
-                elif s.market_type in ["1x2", "dnb"]:
-                    is_away_fav = (s.team_away in s.selection) and (s.team_home not in s.selection)
-                    dc_str = f"Double Chance: {s.team_away} or Draw (X2)" if is_away_fav else f"Double Chance: {s.team_home} or Draw (1X)"
-                    combo_legs_pool.append({
-                        "home": s.team_home, "away": s.team_away, "market_type": "1x2",
-                        "selection": dc_str, "line": None, "odds": 1.28
-                    })
-                else:
-                    combo_legs_pool.append({
-                        "home": s.team_home, "away": s.team_away, "market_type": "goals_over_under",
-                        "selection": "Total: Over 1.5 Goals", "line": 1.5, "odds": 1.29
-                    })
+                combo_legs_pool.append({
+                    "home": s.team_home, "away": s.team_away, "market_type": "goals_over_under",
+                    "selection": "Total: Over 1.5 Goals", "line": 1.5, "odds": 1.29
+                })
 
             for _, _, _, _, c_leg in paired_candidates:
                 if not any(teams_match(c_leg["home"], lg["home"]) for lg in combo_legs_pool):
@@ -1576,7 +1662,7 @@ class BetSlipCardFormatter:
             "────────────────────────",
             f"• Today : {d_won}W - {d_lost}L ({d_open} Open) | {d_net:+.2f}u",
             f"• Total : {won_all}W - {lost_all}L ({wr_all:.1f}%) | {net_all:+.2f}u (${net_all * 50:+.2f})",
-            "• Brain : Deep Match-Autopsy v18.3 Active (Tap /learn)"
+            "• Brain : Deep Match-Autopsy v19.0 Active (Tap /learn)"
         ])
         return "\n".join(lines)
 
@@ -1663,7 +1749,9 @@ class TelegramBotClient:
                     continue
                 settled_day = [i for i in day_picks if i.settlement in ["WON ✅", "LOST ❌", "PUSH ➖"]]
                 if len(settled_day) == len(day_picks) and len(settled_day) >= 2:
-                    eod_lock_key = f"eod_recap:{check_d}:{len(settled_day)}"
+                    w_cnt = sum(1 for i in settled_day if "WON" in i.settlement)
+                    l_cnt = sum(1 for i in settled_day if "LOST" in i.settlement)
+                    eod_lock_key = f"eod_recap_v2:{check_d}:{w_cnt}W_{l_cnt}L"
                     if not DailyLedgerManager.is_locked_in_channel(eod_lock_key):
                         recap_card = BetSlipCardFormatter.format_end_of_day_channel_recap(check_d)
                         if self.send_message(PUBLISH_CHANNEL_ID, recap_card, remove_kb=False):
@@ -1686,7 +1774,7 @@ class TelegramBotClient:
             return []
 
     def background_worker_loop(self):
-        logger.info("Footybett v18.3 Deep Match-Autopsy Worker started...")
+        logger.info("Footybett v19.0 Deep Match-Autopsy Worker started...")
         time.sleep(3)
         while True:
             try:
@@ -1720,7 +1808,7 @@ class TelegramBotClient:
         watcher_thread = threading.Thread(target=self.background_worker_loop, daemon=True)
         watcher_thread.start()
 
-        logger.info("Bot listener running (v18.3 Deep Match-Autopsy Engine)...")
+        logger.info("Bot listener running (v19.0 Deep Match-Autopsy Engine)...")
         offset = None
 
         while True:
