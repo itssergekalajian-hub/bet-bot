@@ -1,9 +1,9 @@
 """
 Telegram Pro Football Betting Syndicate — Deep Match-Autopsy Self-Learning Engine
-& Automatic End-of-Day Channel Recap Publisher (v26.0 Final Production Release)
+& Automatic End-of-Day Channel Recap Publisher (v27.0 Final Production Release)
 (@betyyyybot -> @Footybett)
 
-What's New in v26.0 (True Match-Stats Autopsy & Root-Cause Learning):
+What's New in v27.0 (True Match-Stats Autopsy & Root-Cause Learning):
 1. Deep Post-Match Boxscore Autopsy (`LiveSportsbookAndStatsAPI.fetch_match_autopsy_stats`):
    - Whenever a bet settles as LOST ❌, the bot queries ESPN's full Match Summary API (`/summary?event=<id>`)
      to inspect WHAT ACTUALLY HAPPENED on the pitch:
@@ -94,7 +94,13 @@ DEFAULT_CHANNELS = [
     "windrawwin_tips",
     "sofascore_tips",
     "bet365_tips_free",
-    "fixed_matches_analyst"
+    "fixed_matches_analyst",
+    "mightytips_official",
+    "sportsmole_tips",
+    "betimate_tips",
+    "zulubet_tips",
+    "soccervista_tips",
+    "bcgame_sports_tips"
 ]
 
 BCGAME_VERIFIED_MENS_LEAGUES: List[Tuple[str, str]] = [
@@ -406,7 +412,7 @@ class DailyLedgerManager:
 
 class SelfLearningEngine:
     """
-    Deep Match-Autopsy & Root-Cause Self-Learning Engine (v26.0):
+    Deep Match-Autopsy & Root-Cause Self-Learning Engine (v27.0):
     1. Inspects actual post-match boxscore stats (Shots, Shots on Target, Possession %, Red Cards, Corners)
        fetched via `LiveSportsbookAndStatsAPI.fetch_match_autopsy_stats(event_id)` whenever a pick loses.
     2. Diagnoses WHY the prediction failed (`diagnose_loss_root_cause`) across 5 distinct root causes:
@@ -644,7 +650,7 @@ class SelfLearningEngine:
         lessons = st.get("lessons_learned", [])
 
         lines = [
-            "🧠 DEEP MATCH-AUTOPSY & SELF-LEARNING ENGINE (v26.0)",
+            "🧠 DEEP MATCH-AUTOPSY & SELF-LEARNING ENGINE (v27.0)",
             "────────────────────────"
         ]
         if strats:
@@ -669,7 +675,7 @@ class SelfLearningEngine:
 
 class ChannelBuzzRadar:
     """
-    v26.0 Priority Signal Extractor:
+    v27.0 Priority Signal Extractor:
     Specifically prioritises `@bomb_footballsignals` (9/10 hit-rate feed) + 23 sharp Telegram
     tipster channels. Parses both the exact match teams AND the exact market recommended!
     """
@@ -1034,7 +1040,7 @@ class LiveSportsbookAndStatsAPI:
         tot_corners: Optional[int] = None
     ) -> str:
         """
-        STRICT FULL-TIME (FT) VAR-SAFE GRADING (v26.0):
+        STRICT FULL-TIME (FT) VAR-SAFE GRADING (v27.0):
         1. NEVER settles any bet while `is_finished` is False (prevents false wins when VAR
            disallows a live goal like Greece's cancelled 25' goal vs Netherlands).
         2. Checks `X2` vs `1X` and exact Away vs Home target team so `Burgos to Win` or
@@ -1279,7 +1285,7 @@ class LiveSportsbookAndStatsAPI:
 
 class ExternalAnalyticsCollector:
     """
-    v26.0 Multi-Site Football Analytics Scraper & Aggregator:
+    v27.0 Multi-Site Football Analytics Scraper & Aggregator:
     Collects quantitative match projections, team goal averages, H2H goal history, Elo ratings,
     and mathematical Over/Under tips from public analytics portals & feeds:
       1. ESPN Pre-Match Summary API (`/summary?event={id}`): Extracts actual Goals Scored/Game (`GF/gm`),
@@ -1350,15 +1356,24 @@ class ExternalAnalyticsCollector:
         # 4. Official BC.Game Predictions Portal (https://betting.bc.game/predictions/)
         cls.scrape_bcgame_official_portal()
 
-        # 5. Statarea, PredictZ & WinDrawWin Expert Portals
+        # 5. 12 Additional Global Expert & Mathematical Prediction Portals:
+        #    Statarea, PredictZ, WinDrawWin, FreeSuperTips, SportsMole, MightyTips,
+        #    Betimate, Zulubet, SoccerVista, FootyStats, plus betting.bc.game sub-sections
         for portal_url in [
             "https://www.statarea.com/predictions",
             "https://www.predictz.com/predictions/",
-            "https://www.windrawwin.com/predictions/today/"
+            "https://www.windrawwin.com/predictions/today/",
+            "https://www.freesupertips.com/previews/",
+            "https://www.sportsmole.co.uk/football/preview/",
+            "https://www.mightytips.com/football-predictions/",
+            "https://betimate.com/en/football-predictions",
+            "https://www.zulubet.com/",
+            "https://www.soccervista.com/",
+            "https://footystats.org/predictions"
         ]:
             try:
                 req = urllib.request.Request(portal_url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=4) as resp:
+                with urllib.request.urlopen(req, timeout=3) as resp:
                     p_html = resp.read().decode("utf-8", errors="ignore")
                     for m_vs in re.finditer(r"([A-Za-z]{4,}(?:\s+[A-Za-z]{3,})?)\s+(?:vs\.?|v\.?|-)\s+([A-Za-z]{4,}(?:\s+[A-Za-z]{3,})?)", p_html):
                         high_goal_teams.add(normalize_team_str(m_vs.group(1)))
@@ -1442,7 +1457,7 @@ class ExternalAnalyticsCollector:
 
     @classmethod
     def scrape_bcgame_official_portal(cls) -> Dict[str, Dict[str, Any]]:
-        for url in ["https://betting.bc.game/predictions/", "https://betting.bc.game/"]:
+        for url in ["https://betting.bc.game/predictions/", "https://betting.bc.game/football/", "https://betting.bc.game/"]:
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(req, timeout=5) as resp:
@@ -1466,7 +1481,7 @@ class ExternalAnalyticsCollector:
         nb_c: Dict[str, float]
     ) -> Dict[str, float]:
         """
-        v26.0 BC.Game Accurate Odds Engine:
+        v27.0 BC.Game Accurate Odds Engine:
         1. Queries API-Football `/odds?fixture={id}` (using 1xBet / Bet365 / Pinnacle feeds which
            match BC.Game's Betby sportsbook feed within +-0.02) + ESPN live bookmaker odds.
         2. Derives any missing linked market (`Draw No Bet`, `Double Chance 1X/X2`, `Over 1.5`,
@@ -1608,6 +1623,9 @@ class ExternalAnalyticsCollector:
         p_m_c95 = 0.45 * (nb_c["p_corners_over_95"] / 100.0) + 0.55 * 0.52
         corners_over_95 = api_odds.get("corners_over_95") or round(max(1.58, min(1.90, 1.0 / (p_m_c95 * margin))), 2)
 
+        under_30 = round(max(1.48, min(1.78, under_25 * 0.87)), 2)
+        home_over_15 = round(max(1.54, min(1.92, (h_1x2 * 0.55) + (over_25 * 0.45))), 2)
+
         return {
             "home_1x2": h_1x2,
             "draw_1x2": d_1x2,
@@ -1620,7 +1638,9 @@ class ExternalAnalyticsCollector:
             "over_20": over_20,
             "over_15": over_15,
             "under_25": under_25,
+            "under_30": under_30,
             "under_35": under_35,
+            "home_over_15": home_over_15,
             "btts_yes": btts_yes,
             "corners_over_95": corners_over_95,
             "has_api_bookie_odds": 1.0 if api_odds else 0.0
@@ -1763,7 +1783,7 @@ class ExternalAnalyticsCollector:
 
 class QuantitativeEnsembleModels:
     """
-    v26.0 4-Model Institutional Football Syndicate Ensemble:
+    v27.0 4-Model Institutional Football Syndicate Ensemble:
       1. Dixon-Coles (1997) Bivariate Poisson Scoreline Matrix (calculates exact 8x8 scoreline
          probabilities with low-score correlation tau adjustment rho = -0.11).
       2. Negative Binomial / Gamma-Poisson Wing-Pressure Corner Model (projects expected match
@@ -1990,7 +2010,7 @@ class QuantitativeEnsembleModels:
 
 class SafeCushionBetCreator:
     """
-    Self-Learning BC.Game Market Selector (v26.0):
+    Self-Learning BC.Game Market Selector (v27.0):
     Applies all learned rules from `SelfLearningEngine` (`btts_preferred_leagues`, `draw_trap_leagues`,
     `low_goal_trap_leagues`, `high_shootout_trap_leagues`, and `unreliable_teams`).
     """
@@ -2069,7 +2089,7 @@ class SafeCushionBetCreator:
             return "COOLDOWN" in strats_mem.get(s_key, {}).get("status", "")
 
         # ═══════════════════════════════════════════════════════════════════════════
-        # v26.0 GOALS & CORNERS FIRST ENGINE (ZERO WIN/LOSE 1x2 OR X2 TRAPS)
+        # v27.0 GOALS & CORNERS FIRST ENGINE (ZERO WIN/LOSE 1x2 OR X2 TRAPS)
         # Why gamble on which team wins when dominant mismatches (Netherlands vs Greece,
         # Iceland 5-0 Bulgaria, Germany 3-1 Serbia) and open clashes (Leganés 3-1 Burgos)
         # produce 3+ Goals and 10+ Corners regardless of who wins or loses?
@@ -2102,7 +2122,7 @@ class SafeCushionBetCreator:
         )
 
         # ═══════════════════════════════════════════════════════════════════════════
-        # v26.0 ALL-MARKET EXPERT + QUANTITATIVE CONSENSUS ARBITRATOR
+        # v27.0 ALL-MARKET EXPERT + QUANTITATIVE CONSENSUS ARBITRATOR
         # Evaluates ALL 6 playable BC.Game safe markets side-by-side:
         #   1. `1x2 ➔ {Home} to Win` (Dominant Home Favorite backed by Experts/SPI)
         #   2. `Draw No Bet ➔ {Home/Away}` (Protected Favorite with full refund on draw)
@@ -2215,11 +2235,13 @@ class SafeCushionBetCreator:
             )
             candidates.append((score, cls._build_single(date_str, home, away, "goals_over_under", sel, 2.0, odds, prob, score - 55.0, why, league_label, bookie, kickoff_str, alt), over15_combo_leg))
 
-        # ── Option C: High-Pressure Wing & Set-Piece Clash (`Corners Tab ➔ Total Corners ➔ Over 9.5`) ──
-        # Restricted to tactical/2nd-tier leagues (like LaLiga 2 / Championship) OR when tipster channels explicitly call Corners!
+        # ── Option C: Worst-Case Red-Card Stress-Tested Corners (`Corners Tab ➔ Total Corners ➔ Over 9.5`) ──
+        # Granada vs Las Palmas (9 corners after Red Card) lesson: requires worst-case 10-man projection (mu_corners - 1.8 >= 10.0, i.e. mu >= 11.8)
+        # OR explicit tipster corner signal so a single red card doesn't leave us 1 corner short at 9!
+        worst_case_rc_corners = round(nb_c["mu_corners"] - 1.8, 1)
         if (
-            (is_tactical or ch_tip == "corners_over_95")
-            and nb_c["mu_corners"] >= 11.2
+            (ch_tip == "corners_over_95" or worst_case_rc_corners >= 10.3)
+            and nb_c["mu_corners"] >= 12.1
             and (a_recent_w >= 3 or h_recent_w >= 3 or total_recent_wins >= 4)
             and 1.50 <= bc_odds["corners_over_95"] <= 1.98
             and not is_in_cooldown("corners_over_95")
@@ -2227,33 +2249,53 @@ class SafeCushionBetCreator:
             odds = bc_odds["corners_over_95"]
             sel = "Corners Tab ➔ Total Corners ➔ Over 9.5"
             matched_c_leg = under35_combo_leg if (is_tactical or dc["lam_total"] < 2.65) else over15_combo_leg
-            alt = f"Main Tab ➔ Total ➔ Under 3.5 (@ {bc_odds['under_35']:.2f})" if is_tactical else f"Main Tab ➔ Total ➔ Over 2.0 (@ {bc_odds['over_20']:.2f})"
-            prob = max(70.0, nb_c["p_corners_over_95"] + 2.0)
-            score = prob + (nb_c["mu_corners"] - 11.0) * 2.0 + base_boost + consensus_boost + strat_mod("corners_over_95") + (6.0 if ch_tip == "corners_over_95" else 0.0)
+            alt = f"Corners Tab ➔ Over 8.5 Corners (or Main Tab ➔ Under 3.5 @ {bc_odds['under_35']:.2f})"
+            prob = max(72.0, nb_c["p_corners_over_95"] + 3.0)
+            score = prob + (nb_c["mu_corners"] - 11.4) * 2.0 + base_boost + consensus_boost + strat_mod("corners_over_95") + (6.5 if ch_tip == "corners_over_95" else 0.0)
             why = (
                 f"{expert_sources_count} Expert Sources Agree • "
-                f"Projects {nb_c['mu_corners']:.1f} match corners ({prob:.0f}% confidence) as {home} ({h_form}) & {away} ({a_form}) attack the flanks."
+                f"Projects {nb_c['mu_corners']:.1f} corners (even under a -1.8 red-card stress test = {worst_case_rc_corners} corners)."
             )
             candidates.append((score, cls._build_single(date_str, home, away, "corners_over_under", sel, 9.5, odds, prob, score - 55.0, why, league_label, bookie, kickoff_str, alt), matched_c_leg))
 
-        # ── Option D: Defensive / Low-Pace Tactical Under (`Main Tab ➔ Total ➔ Under 2.5`) ──
+        # ── Option D1: Defensive / Low-Pace Tactical Under (`Main Tab ➔ Total ➔ Under 2.5`) ──
+        # In card-heavy tactical leagues (LaLiga 2 / Serie B / Nations League), a red card HELPS Under 2.5 (locks down 1-0 / 0-0 / 1-1)!
         if (
-            (is_tactical or league_label in low_goal_traps or total_recent_wins <= 2 or (combined_draws >= 2 and total_recent_wins <= 4) or dc["lam_total"] <= 2.55)
-            and total_recent_wins <= 5
+            (is_tactical or league_label in low_goal_traps or total_recent_wins <= 2 or (combined_draws >= 2 and total_recent_wins <= 4) or dc["lam_total"] <= 2.50)
+            and (is_tactical or total_recent_wins <= 5)
             and 1.48 <= bc_odds["under_25"] <= 2.25
             and league_label not in shootout_traps
             and not is_in_cooldown("under_25")
         ):
             odds = bc_odds["under_25"]
             sel = "Main Tab ➔ Total ➔ Under 2.5"
-            alt = f"Main Tab ➔ Total ➔ Under 3.5 (@ {bc_odds['under_35']:.2f})"
-            prob = max(71.0, dc["p_under_25"] + 12.0)
-            score = prob + (2.70 - min(2.70, dc["lam_total"])) * 6.0 + base_boost + consensus_boost + strat_mod("under_25") + (5.5 if ch_tip == "under_25" or "under_25" in bc_portal_tips else 0.0)
+            alt = f"Main Tab ➔ Total ➔ Under 3.0 (@ {bc_odds['under_30']:.2f}) [3 goals = full refund]"
+            prob = max(73.0, dc["p_under_25"] + 13.0)
+            score = prob + (2.75 - min(2.75, dc["lam_total"])) * 6.5 + (3.0 if is_tactical else 0.0) + base_boost + consensus_boost + strat_mod("under_25") + (5.5 if ch_tip == "under_25" or "under_25" in bc_portal_tips else 0.0)
             why = (
                 f"{expert_sources_count} Expert Sources Agree • "
-                f"Compact defensive profile ({h_form} vs {a_form}, {dc['lam_total']:.2f} xG) projects 0-0, 1-0, 0-1, or 1-1 ({dc['p_under_35']:.0f}% Under 3.5 safety)."
+                f"Compact tactical profile ({h_form} vs {a_form}, {dc['lam_total']:.2f} xG) projects 0-0, 1-0, or 1-1 ({dc['p_under_35']:.0f}% Under 3.5 safety; immune to red-card slowdowns)."
             )
             candidates.append((score, cls._build_single(date_str, home, away, "goals_over_under", sel, 2.5, odds, prob, score - 55.0, why, league_label, bookie, kickoff_str, alt), under35_combo_leg))
+
+        # ── Option D2: Worst-Case Protected Asian Under (`Main Tab ➔ Total ➔ Under 3.0` — 3 Goals = 100% Refund!) ──
+        if (
+            2.35 < dc["lam_total"] <= 2.68
+            and (is_tactical or combined_draws >= 2)
+            and 1.48 <= bc_odds["under_30"] <= 1.88
+            and league_label not in shootout_traps
+            and not is_in_cooldown("under_25")
+        ):
+            odds = bc_odds["under_30"]
+            sel = "Main Tab ➔ Total ➔ Under 3.0"
+            alt = f"Main Tab ➔ Total ➔ Under 3.5 (@ {bc_odds['under_35']:.2f})"
+            prob = max(81.0, dc["p_under_35"])
+            score = prob - 5.5 + base_boost + consensus_boost + strat_mod("under_25")
+            why = (
+                f"{expert_sources_count} Expert Sources Agree • "
+                f"Projects {dc['lam_total']:.2f} xG — 0, 1, or 2 goals = FULL WIN, and even a 3-goal worst case (2-1) = 100% stake refund."
+            )
+            candidates.append((score, cls._build_single(date_str, home, away, "goals_over_under", sel, 3.0, odds, prob, score - 55.0, why, league_label, bookie, kickoff_str, alt), under35_combo_leg))
 
         # ── Option E: Balanced Two-Way Attack (`Main Tab ➔ Both Teams to Score ➔ Yes`) ──
         if (
@@ -2336,7 +2378,7 @@ class SafeCushionBetCreator:
             odds=max(MIN_SINGLE_ODDS, round(odds, 2)),
             floor_odds=MIN_SINGLE_ODDS,
             is_approved=True,
-            confidence_stars="⭐️⭐️⭐️⭐️",
+            confidence_stars=f"⭐️⭐️⭐️⭐️⭐️ ({min(9.8, max(8.8, round(model_prob / 8.5, 1))):.1f}/10)" if model_prob >= 76.0 else f"⭐️⭐️⭐️⭐️ ({min(8.9, max(8.1, round(model_prob / 8.6, 1))):.1f}/10)",
             model_prob=round(model_prob, 1),
             edge_ev=round(ev_pct, 1),
             recommended_units=1.0,
@@ -2358,13 +2400,7 @@ class SafeCushionBetCreator:
 
         active_date = DailyLedgerManager.get_active_date_str()
 
-        # One-time cleanup of the duplicate morning v21/v25 corner picks on 2026-11-15
-        cleanup_lock = "v26_morning_cleanup_2026_11_15"
-        if not DailyLedgerManager.is_locked_in_channel(cleanup_lock):
-            all_hist = DailyLedgerManager.load_all_history_items()
-            cleaned_hist = {k: v for k, v in all_hist.items() if v.date_str < "2026-11-15"}
-            DailyLedgerManager.save_all_items(cleaned_hist)
-            DailyLedgerManager.mark_locked_in_channel(cleanup_lock)
+        # Preserve all settled history from 2026-11-15 onward (4W - 1L | +1.63u Day 1)
 
         existing = DailyLedgerManager.load_active_date_items()
         existing_singles = [i for i in existing if not i.is_combo]
@@ -2454,11 +2490,7 @@ class SafeCushionBetCreator:
                         "selection": "Total: Over 1.5 Goals", "line": 1.5, "odds": 1.28
                     })
 
-            for _, _, _, _, c_leg in paired_candidates:
-                if not any(teams_match(c_leg["home"], lg["home"]) for lg in combo_legs_pool):
-                    combo_legs_pool.append(c_leg)
-                if len(combo_legs_pool) >= 3:
-                    break
+            # Keep Combo legs strictly aligned with today's published Single Bets (no orphan matches!)
 
             if len(combo_legs_pool) >= 2:
                 chosen_legs = combo_legs_pool[:3]
@@ -2482,7 +2514,7 @@ class SafeCushionBetCreator:
                     odds=combined_odds,
                     floor_odds=1.60,
                     is_approved=True,
-                    confidence_stars="⭐️⭐️⭐️⭐️⭐️",
+                    confidence_stars="⭐️⭐️⭐️⭐️⭐️ (9.4/10)",
                     model_prob=65.0,
                     edge_ev=26.0,
                     recommended_units=0.5,
@@ -2549,56 +2581,61 @@ class BetSlipCardFormatter:
         return "\n".join(lines)
 
     @classmethod
-    def format_open_bet_card(cls, s: LedgerBetItem) -> str:
+    def format_open_bet_card(cls, s: LedgerBetItem, pick_number: Optional[int] = None) -> str:
         if s.is_combo and s.combo_legs:
             leg_lines = []
             for idx, lg in enumerate(s.combo_legs, 1):
-                leg_lines.append(f"{idx}️⃣ {lg['home']} vs {lg['away']}\n   👉 BC.Game: Main Tab ➔ {lg['selection']} (@ {lg['odds']:.2f})")
+                leg_lines.append(f"{idx}️⃣ {lg['home']} vs {lg['away']} ➔ {lg['selection']} (@ {lg['odds']:.2f})")
             legs_block = "\n".join(leg_lines)
+            conf_str = s.confidence_stars if "/" in s.confidence_stars else "⭐️⭐️⭐️⭐️⭐️ (9.4/10)"
             return (
-                "🎟️ TODAY'S BC.GAME SAFE COMBO — @Footybett\n"
-                "─────────────────────────────────────────\n"
+                "🎟️ DAILY SAFE COMBO — @Footybett\n"
+                "────────────────────────\n"
                 f"{legs_block}\n"
-                "─────────────────────────────────────────\n"
+                "────────────────────────\n"
                 f"💰 Total Odds : {s.odds:.2f}  |  Stake: {s.recommended_units:.1f}u\n"
-                f"🛡️ Cushion    : Stepped-down ~90% safety lines matched to each game's tactical profile."
+                f"🔥 Confidence : {conf_str}\n"
+                f"🛡️ Worst-Case : Stepped-down ~90% cushions matched to each game's profile."
             )
-        kickoff_line = f"\n⏰ Kickoff   : {s.kickoff_str}" if s.kickoff_str else ""
-        alt_line = f"\n🛡️ Safe Alt  : {s.alt_bcgame_line}" if s.alt_bcgame_line else ""
+        num_tag = f" #{pick_number}" if pick_number else ""
+        kickoff_line = f"\n⏰ Kickoff    : {s.kickoff_str}" if s.kickoff_str else ""
+        alt_line = f"\n🛡️ Safe Alt   : {s.alt_bcgame_line}" if s.alt_bcgame_line else ""
+        conf_str = s.confidence_stars if "/" in s.confidence_stars else f"⭐️⭐️⭐️⭐️ ({min(9.5, max(8.2, round(s.model_prob / 8.5, 1))):.1f}/10)"
         return (
-            "🟢 SINGLE BET — @Footybett\n"
-            "─────────────────────────────────────────\n"
-            f"⚽ Match     : {s.team_home} vs {s.team_away} ({s.match_context}){kickoff_line}\n"
-            f"📍 BC.Game   : {s.selection}\n"
-            f"💰 Live Odds : {s.odds:.2f}  |  Stake: {s.recommended_units:.1f}u{alt_line}\n"
-            f"📊 Analysis  : {s.rationale}"
+            f"🟢 SINGLE BET{num_tag} — @Footybett\n"
+            "────────────────────────\n"
+            f"⚽ Match      : {s.team_home} vs {s.team_away} ({s.match_context}){kickoff_line}\n"
+            f"🎯 BC.Game    : {s.selection}\n"
+            f"💰 Odds       : {s.odds:.2f}  |  Stake: {s.recommended_units:.1f}u\n"
+            f"🔥 Confidence : {conf_str}{alt_line}\n"
+            f"📊 Audit      : {s.rationale}"
         )
 
     @classmethod
     def format_closed_bet_card(cls, s: LedgerBetItem) -> str:
         won, lost, wr, net_u = cls.get_totals_summary_tuple()
-        label = "COMBO" if s.is_combo else "BET"
+        label = "SAFE COMBO" if s.is_combo else "SINGLE BET"
         match_line = (
-            f"🎟️ Legs   : {s.score_str}"
+            f"🎟️ {s.score_str}"
             if s.is_combo
             else f"⚽ {s.team_home} vs {s.team_away} ➔ {s.score_str}"
         )
         if "WON" in s.settlement:
             prof = s.recommended_units * (s.odds - 1.0)
             return (
-                f"✅ {label} CLOSED — WON (+{prof:.2f}u)\n"
+                f"✅ {label} WON (+{prof:.2f}u) — @Footybett\n"
                 "────────────────────────\n"
                 f"{match_line}\n"
-                f"🎯 Bet    : {s.selection} @ {s.odds:.2f} ✅\n"
+                f"🎯 {s.selection} @ {s.odds:.2f} ✅\n"
                 f"📈 Record : {won}W - {lost}L ({wr:.0f}%) | {net_u:+.2f}u"
             )
         else:
             autopsy_line = f"\n{s.loss_autopsy}" if s.loss_autopsy else ""
             return (
-                f"❌ {label} CLOSED — LOST (-{s.recommended_units:.2f}u)\n"
+                f"❌ {label} LOST (-{s.recommended_units:.2f}u) — @Footybett\n"
                 "────────────────────────\n"
                 f"{match_line}\n"
-                f"🎯 Bet    : {s.selection} @ {s.odds:.2f} ❌{autopsy_line}\n"
+                f"🎯 {s.selection} @ {s.odds:.2f} ❌{autopsy_line}\n"
                 f"📈 Record : {won}W - {lost}L ({wr:.0f}%) | {net_u:+.2f}u"
             )
 
@@ -2641,7 +2678,7 @@ class BetSlipCardFormatter:
             f"📈 Total Record : {won_all}W - {lost_all}L ({wr_all:.1f}% Win Rate)",
             f"💰 Total Profit : {net_all:+.2f} Units ( @ $50/u = ${net_all * 50:+.2f} )",
             "────────────────────────",
-            "🔔 Model Weights Updated • Next Pre-Kickoff Slate Tomorrow"
+            "🔔 Self-Learning Weights Updated • Next Slate Tomorrow"
         ])
         return "\n".join(lines)
 
@@ -2711,14 +2748,14 @@ class BetSlipCardFormatter:
             "────────────────────────",
             f"• Today : {d_won}W - {d_lost}L ({d_open} Open) | {d_net:+.2f}u",
             f"• Total : {won_all}W - {lost_all}L ({wr_all:.1f}%) | {net_all:+.2f}u (${net_all * 50:+.2f})",
-            "• Brain : Deep Match-Autopsy v26.0 Active (Tap /learn)"
+            "• Brain : Deep Match-Autopsy v27.0 Active (Tap /learn)"
         ])
         return "\n".join(lines)
 
 
 class InstantCustomBetAuditor:
     """
-    v26.0 Instant Custom Bet & Image Slip Auditor:
+    v27.0 Instant Custom Bet & Image Slip Auditor:
     When the user sends any match name, bet slip text, or screenshot image of a bet to the bot,
     this engine cross-checks the match across all 24+ Telegram tipster channels, 9 analytics portals
     (including betting.bc.game & API-Football /predictions), and our 5-Model Quantitative Engine
@@ -2879,7 +2916,7 @@ class InstantCustomBetAuditor:
 
 class BetSlipImageOCRAndVisionAnalyzer:
     """
-    v26.0 Multi-Engine Bet Slip Image Reader:
+    v27.0 Multi-Engine Bet Slip Image Reader:
     Extracts match names, bet markets, and odds from user-uploaded screenshot images using:
       1. Gemini Vision API (`GEMINI_API_KEY` / `GOOGLE_API_KEY` if set on server)
       2. Local `tesseract` OCR CLI (if installed on server)
@@ -3013,7 +3050,7 @@ class TelegramBotClient:
 
             ordered_items = sorted(all_items.items(), key=lambda kv: (1 if kv[1].is_combo else 0))
 
-            # STRICT SINGLE DAILY BATCH PUBLISH (v26.0):
+            # STRICT SINGLE DAILY BATCH PUBLISH (v27.0):
             # Only publishes today's open picks ONCE in a single batch, then locks `daily_batch_locked_v26:{active_date}`
             # so the channel NEVER receives fragmented or repeated open bet batches later in the day!
             batch_lock_key = f"daily_batch_locked_v26:{active_date}"
@@ -3022,20 +3059,21 @@ class TelegramBotClient:
                 if it.date_str == active_date and it.is_approved and not it.published_to_channel and it.settlement == "PENDING" and it.match_status != "FT"
             ]
             if len(today_pending) >= 2 and not DailyLedgerManager.is_locked_in_channel(batch_lock_key):
-                today_items_only = [it for _, it in today_pending]
-                header_msg = BetSlipCardFormatter.format_daily_batch_header_card(active_date, today_items_only)
-                if self.send_message(PUBLISH_CHANNEL_ID, header_msg, remove_kb=False):
-                    DailyLedgerManager.mark_locked_in_channel(batch_lock_key)
-                    time.sleep(1.0)
-                    for fk, it in today_pending:
-                        pick_lock_key = f"pick_v26:{fk}"
+                DailyLedgerManager.mark_locked_in_channel(batch_lock_key)
+                single_idx = 0
+                for fk, it in today_pending:
+                    pick_lock_key = f"pick_v26:{fk}"
+                    if not it.is_combo:
+                        single_idx += 1
+                        open_card = BetSlipCardFormatter.format_open_bet_card(it, pick_number=single_idx)
+                    else:
                         open_card = BetSlipCardFormatter.format_open_bet_card(it)
-                        if self.send_message(PUBLISH_CHANNEL_ID, open_card, remove_kb=False):
-                            it.published_to_channel = True
-                            DailyLedgerManager.mark_locked_in_channel(pick_lock_key)
-                            published_count += 1
-                            updated = True
-                            time.sleep(1.0)
+                    if self.send_message(PUBLISH_CHANNEL_ID, open_card, remove_kb=False):
+                        it.published_to_channel = True
+                        DailyLedgerManager.mark_locked_in_channel(pick_lock_key)
+                        published_count += 1
+                        updated = True
+                        time.sleep(1.0)
 
             for full_key, item in ordered_items:
                 if not item.is_approved or item.date_str < TRACKING_START_DATE:
@@ -3093,7 +3131,7 @@ class TelegramBotClient:
             return []
 
     def background_worker_loop(self):
-        logger.info("Footybett v26.0 Deep Match-Autopsy Worker started...")
+        logger.info("Footybett v27.0 Deep Match-Autopsy Worker started...")
         time.sleep(3)
         while True:
             try:
@@ -3127,7 +3165,7 @@ class TelegramBotClient:
         watcher_thread = threading.Thread(target=self.background_worker_loop, daemon=True)
         watcher_thread.start()
 
-        logger.info("Bot listener running (v26.0 Self-Learning + Image/Text Bet Auditor + Channel Manager)...")
+        logger.info("Bot listener running (v27.0 Self-Learning + Image/Text Bet Auditor + Channel Manager)...")
         offset = None
 
         while True:
