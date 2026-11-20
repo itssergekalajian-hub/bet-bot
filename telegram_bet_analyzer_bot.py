@@ -1,9 +1,9 @@
 """
 Telegram Pro Football Betting Syndicate — Deep Match-Autopsy Self-Learning Engine
-& Automatic End-of-Day Channel Recap Publisher (v28.2 Final Production Release)
+& Automatic End-of-Day Channel Recap Publisher (v30.0 Final Production Release)
 (@betyyyybot -> @Footybett)
 
-What's New in v28.2 (True Match-Stats Autopsy & Root-Cause Learning):
+What's New in v30.0 (True Match-Stats Autopsy & Root-Cause Learning):
 1. Deep Post-Match Boxscore Autopsy (`LiveSportsbookAndStatsAPI.fetch_match_autopsy_stats`):
    - Whenever a bet settles as LOST ❌, the bot queries ESPN's full Match Summary API (`/summary?event=<id>`)
      to inspect WHAT ACTUALLY HAPPENED on the pitch:
@@ -59,9 +59,11 @@ DAILY_LEDGER_FILE = os.path.join(BASE_DIR, "daily_ledger.json")
 PUBLISHED_LOCKS_FILE = os.path.join(BASE_DIR, "published_channel_locks.json")
 LEARNING_WEIGHTS_FILE = os.path.join(BASE_DIR, "learning_weights.json")
 BANKROLL_CONFIG_FILE = os.path.join(BASE_DIR, "bankroll_config.json")
-DEFAULT_UNIT_USD = float(os.environ.get("UNIT_STAKE_USD", "50.0"))
+DEFAULT_UNIT_USD = float(os.environ.get("UNIT_STAKE_USD", "100.0"))
 
 API_FOOTBALL_KEY = os.environ.get("API_FOOTBALL_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
 PUBLISH_CHANNEL_ID = os.environ.get("PUBLISH_CHANNEL_ID", "@Footybett")
 
 TRACKING_START_DATE = "2026-11-15"
@@ -102,7 +104,12 @@ DEFAULT_CHANNELS = [
     "betimate_tips",
     "zulubet_tips",
     "soccervista_tips",
-    "bcgame_sports_tips"
+    "bcgame_sports_tips",
+    "bettingexpert_tips",
+    "soccerstats_pro",
+    "understat_xg_tips",
+    "clubelo_analytics",
+    "asianbookie_syndicate"
 ]
 
 BCGAME_VERIFIED_MENS_LEAGUES: List[Tuple[str, str]] = [
@@ -141,7 +148,16 @@ BCGAME_VERIFIED_MENS_LEAGUES: List[Tuple[str, str]] = [
 ]
 
 LOW_SCORING_TACTICAL_LEAGUE_SLUGS = {
-    "bra.2", "arg.1", "ita.2", "esp.2", "fra.2", "col.1", "fifa.worldq.conmebol", "fifa.worldq.caf"
+    "bra.2", "arg.1", "ita.2", "col.1", "fifa.worldq.caf"
+}
+
+LEAGUE_AVG_GOALS_MAP: Dict[str, float] = {
+    "ger.1": 3.18, "ger.2": 3.08, "ned.1": 3.15, "eng.1": 3.05, "uefa.champions": 3.04,
+    "uefa.europa": 2.94, "uefa.europa.conf": 2.88, "bel.1": 2.94, "tur.1": 2.92,
+    "usa.1": 2.96, "sco.1": 2.88, "fra.1": 2.82, "mex.1": 2.80, "eng.3": 2.78,
+    "eng.2": 2.72, "ita.1": 2.72, "esp.1": 2.70, "por.1": 2.74, "uefa.nations": 2.68,
+    "fra.2": 2.62, "esp.2": 2.46, "bra.1": 2.58, "chi.1": 2.66, "ita.2": 2.40,
+    "arg.1": 2.24, "bra.2": 2.18, "col.1": 2.28
 }
 
 BANNED_RAW_JSON_TERMS = [
@@ -324,18 +340,27 @@ class LedgerBetItem:
     notified_settled: bool = False
     published_to_channel: bool = False
     published_result_to_channel: bool = False
+    channel_message_id: Optional[int] = None
+    won_via_safe_alt: bool = False
+    settled_odds: float = 0.0
+    settled_note: str = ""
+    match_stats_summary: str = ""
 
 
 class BankrollStakeSizer:
     """
-    v28.2 Dynamic Fractional-Kelly & Confidence-Tiered Bankroll Sizer:
-    Tells the user EXACTLY how many Dollars ($ USD) and Units to bet on each Single,
-    the 2-Leg Safe Combo, and the $5 High-Odds (10x-20x) Lotto Jackpot Combo.
+    v30.0 Prop-Style R-Multiple Risk/Reward Bankroll Sizer:
+    1.00R = $100.00 Risk on every rated bet. Reward is expressed directly in R and $
+    (e.g. @ 1.68 odds -> Risk: 1.00R ($100) | Reward: +0.68R (+$68.00)).
+    Bonus $5 Lotto tickets are unrated fun plays and 100% excluded from Official W-L & R totals!
     """
 
     @classmethod
     def get_unit_usd(cls) -> float:
         cfg = load_json_dict(BANKROLL_CONFIG_FILE)
+        if not cfg.get("v29_100r_initialized"):
+            save_json_dict(BANKROLL_CONFIG_FILE, {"unit_usd": DEFAULT_UNIT_USD, "v29_100r_initialized": True})
+            return DEFAULT_UNIT_USD
         val = cfg.get("unit_usd")
         try:
             return float(val) if val and float(val) > 0 else DEFAULT_UNIT_USD
@@ -344,30 +369,47 @@ class BankrollStakeSizer:
 
     @classmethod
     def set_unit_usd(cls, new_unit_usd: float) -> float:
-        val = max(5.0, round(float(new_unit_usd), 2))
-        save_json_dict(BANKROLL_CONFIG_FILE, {"unit_usd": val})
+        val = max(10.0, round(float(new_unit_usd), 2))
+        save_json_dict(BANKROLL_CONFIG_FILE, {"unit_usd": val, "v29_100r_initialized": True})
         return val
 
     @classmethod
     def compute_single_stake_units_and_tier(cls, model_prob: float, expert_sources: int, odds: float) -> Tuple[float, str]:
-        """
-        Allocates higher stake ($60 / 1.2u) to 9.3+/10 Max Bankers, standard stake ($50 / 1.0u)
-        to Core Safe Singles, and scaled-down stake ($35 / 0.7u) to Measured Edge Singles.
-        """
-        if (model_prob >= 83.0 or (model_prob >= 78.0 and expert_sources >= 4)) and odds <= 1.70:
-            return 1.20, "Tier 1 Max Banker"
-        elif model_prob >= 75.0 or expert_sources >= 4:
-            return 1.00, "Tier 2 Core Single"
+        if model_prob >= 82.0:
+            return 1.00, "1R Tier-1 Banker"
+        elif model_prob >= 75.0:
+            return 1.00, "1R Core Play"
         else:
-            return 0.70, "Tier 3 Measured Single"
+            return 1.00, "1R Verified Edge"
+
+    @classmethod
+    def get_effective_win_odds(cls, item: LedgerBetItem) -> float:
+        if item.won_via_safe_alt and item.settled_odds > 1.01:
+            return item.settled_odds
+        if item.settled_odds > 1.01:
+            return item.settled_odds
+        return item.odds
+
+    @classmethod
+    def get_item_r_profit(cls, item: LedgerBetItem) -> float:
+        """Returns net R-multiple (+R on win, -1.00R on loss, 0.00R on push/lotto)."""
+        if item.is_lotto_combo or item.market_type == "lotto_parlay":
+            return 0.0
+        r_risk = 1.0
+        if "WON" in item.settlement:
+            eff_odds = cls.get_effective_win_odds(item)
+            return round(r_risk * (eff_odds - 1.0), 2)
+        elif "LOST" in item.settlement:
+            return -1.00
+        return 0.0
 
     @classmethod
     def format_stake_plan_line(cls, units: float, odds: float, tier_label: str) -> str:
-        u_usd = cls.get_unit_usd()
-        stake_dlr = units * u_usd
-        ret_dlr = stake_dlr * odds
-        prof_dlr = ret_dlr - stake_dlr
-        return f"${stake_dlr:.0f} ({units:.2f}u • {tier_label}) ➔ Returns ${ret_dlr:.2f} (+${prof_dlr:.2f} Profit)"
+        r_usd = cls.get_unit_usd()
+        rew_r = odds - 1.0
+        rew_dlr = rew_r * r_usd
+        tot_dlr = r_usd + rew_dlr
+        return f"Risk 1.00R (${r_usd:.0f}) ➔ Reward +{rew_r:.2f}R (+${rew_dlr:.2f} | Payout ${tot_dlr:.2f})"
 
 
 class DailyLedgerManager:
@@ -460,7 +502,7 @@ class DailyLedgerManager:
 
 class SelfLearningEngine:
     """
-    Deep Match-Autopsy & Root-Cause Self-Learning Engine (v28.2):
+    Deep Match-Autopsy & Root-Cause Self-Learning Engine (v30.0):
     1. Inspects actual post-match boxscore stats (Shots, Shots on Target, Possession %, Red Cards, Corners)
        fetched via `LiveSportsbookAndStatsAPI.fetch_match_autopsy_stats(event_id)` whenever a pick loses.
     2. Diagnoses WHY the prediction failed (`diagnose_loss_root_cause`) across 5 distinct root causes:
@@ -601,7 +643,10 @@ class SelfLearningEngine:
     @classmethod
     def recalibrate_from_ledger(cls) -> Dict[str, Any]:
         all_items = list(DailyLedgerManager.load_all_history_items().values())
-        settled = [i for i in all_items if i.is_approved and i.settlement in ["WON ✅", "LOST ❌"]]
+        settled = [
+            i for i in all_items
+            if i.is_approved and not (i.is_lotto_combo or i.market_type == "lotto_parlay") and i.settlement in ["WON ✅", "LOST ❌"]
+        ]
 
         strat_stats: Dict[str, Dict[str, Any]] = {}
         league_stats: Dict[str, Dict[str, Any]] = {}
@@ -621,7 +666,7 @@ class SelfLearningEngine:
             lg = league_stats.setdefault(lg_key, {"won": 0, "lost": 0, "net_u": 0.0, "ev_mod": 0.0})
 
             if is_win:
-                prof = item.recommended_units * (item.odds - 1.0)
+                prof = BankrollStakeSizer.get_item_r_profit(item)
                 st["won"] += 1
                 st["net_u"] = round(st["net_u"] + prof, 2)
                 lg["won"] += 1
@@ -700,7 +745,7 @@ class SelfLearningEngine:
         lessons = st.get("lessons_learned", [])
 
         lines = [
-            "🧠 DEEP MATCH-AUTOPSY & SELF-LEARNING ENGINE (v28.2)",
+            "🧠 DEEP MATCH-AUTOPSY & SELF-LEARNING ENGINE (v30.0)",
             "────────────────────────"
         ]
         if strats:
@@ -725,7 +770,7 @@ class SelfLearningEngine:
 
 class ChannelBuzzRadar:
     """
-    v28.2 Priority Signal Extractor:
+    v30.0 Priority Signal Extractor:
     Specifically prioritises `@bomb_footballsignals` (9/10 hit-rate feed) + 23 sharp Telegram
     tipster channels. Parses both the exact match teams AND the exact market recommended!
     """
@@ -1090,7 +1135,7 @@ class LiveSportsbookAndStatsAPI:
         tot_corners: Optional[int] = None
     ) -> str:
         """
-        STRICT FULL-TIME (FT) VAR-SAFE GRADING (v28.2):
+        STRICT FULL-TIME (FT) VAR-SAFE GRADING (v30.0):
         1. NEVER settles any bet while `is_finished` is False (prevents false wins when VAR
            disallows a live goal like Greece's cancelled 25' goal vs Netherlands).
         2. Checks `X2` vs `1X` and exact Away vs Home target team so `Burgos to Win` or
@@ -1297,7 +1342,7 @@ class LiveSportsbookAndStatsAPI:
                     item.score_str = f"{gh}-{ga} ({status_label})"
                 item.match_status = "FT" if is_finished else ("LIVE" if is_live else status_label)
 
-                item.settlement = cls.grade_single_condition(
+                primary_res = cls.grade_single_condition(
                     item.market_type,
                     item.selection,
                     item.line,
@@ -1308,10 +1353,59 @@ class LiveSportsbookAndStatsAPI:
                     item.team_away,
                     tot_corners=tot_corners_val
                 )
+                item.settlement = primary_res
+                if primary_res == "WON ✅":
+                    item.won_via_safe_alt = False
+                    item.settled_odds = item.odds
+                    item.settled_note = ""
 
-                # If settled as LOST ❌, run the Deep Match-Autopsy to learn WHY it lost!
+                # v30.0 SAFE ALT WIN CREDIT:
+                # If Primary PUSHED or MISSED at Full Time, check if `🛡️ Safe Alt` (`item.alt_bcgame_line`) HIT!
+                # If the bot recommended it in Safe Alt and it hit (e.g. Metz vs Boulogne Under 3.5 @ 1.30), count it as WON ✅!
+                if is_finished and primary_res in ["PUSH ➖", "LOST ❌"] and item.alt_bcgame_line:
+                    alt_raw = item.alt_bcgame_line.split("(or")[0].split("[")[0].strip()
+                    m_alt_odd = re.search(r"@\s*(\d+\.\d+)", alt_raw)
+                    alt_odd_val = float(m_alt_odd.group(1)) if m_alt_odd else 1.28
+                    alt_sel_clean = re.sub(r"\(\s*@\s*\d+\.\d+\s*\)", "", alt_raw).strip()
+                    alt_low = alt_sel_clean.lower()
+                    if "corner" in alt_low:
+                        alt_mtype = "corners_over_under"
+                    elif "over" in alt_low or "under" in alt_low:
+                        alt_mtype = "goals_over_under"
+                    elif "draw no bet" in alt_low:
+                        alt_mtype = "dnb"
+                    elif "both teams" in alt_low or "btts" in alt_low:
+                        alt_mtype = "btts"
+                    else:
+                        alt_mtype = "1x2"
+                    m_alt_ln = re.search(r"(?:over|under)\s+(\d+\.\d+|\d+)", alt_low)
+                    alt_ln_val = float(m_alt_ln.group(1)) if m_alt_ln else None
+
+                    alt_res = cls.grade_single_condition(
+                        alt_mtype, alt_sel_clean, alt_ln_val, gh, ga, is_finished,
+                        item.team_home, item.team_away, tot_corners=tot_corners_val
+                    )
+                    if alt_res == "WON ✅":
+                        item.settlement = "WON ✅"
+                        item.won_via_safe_alt = True
+                        item.settled_odds = alt_odd_val
+                        item.settled_note = f"🛡️ Safe Alt Hit: {alt_sel_clean} @ {alt_odd_val:.2f} (Primary: {primary_res.split()[0]})"
+                        item.loss_autopsy = ""
+
+                # Fetch full match boxscore details for BOTH wins and losses when finished!
+                if is_finished and event_id and not box_stats:
+                    box_stats = cls.fetch_match_autopsy_stats(event_id, swapped=swapped)
+                if box_stats and (box_stats.get("h_shots", 0) + box_stats.get("a_shots", 0)) > 0:
+                    hs, as_ = box_stats.get("h_shots", 0), box_stats.get("a_shots", 0)
+                    hsot, asot = box_stats.get("h_sot", 0), box_stats.get("a_sot", 0)
+                    hp, ap = box_stats.get("h_poss", 50), box_stats.get("a_poss", 50)
+                    hc, ac = box_stats.get("h_corners", 0), box_stats.get("a_corners", 0)
+                    item.match_stats_summary = f"{hs}+{as_}={hs+as_} Shots ({hsot+asot} SOT) • {hp}%-{ap}% Poss • {hc+ac} Corners"
+
+                # If still settled as LOST ❌, run the Deep Match-Autopsy to learn WHY it lost!
                 if item.settlement == "LOST ❌" and (not item.loss_autopsy or "match shots" in item.loss_autopsy):
-                    box_stats = cls.fetch_match_autopsy_stats(event_id, swapped=swapped) if event_id else {}
+                    if not box_stats and event_id:
+                        box_stats = cls.fetch_match_autopsy_stats(event_id, swapped=swapped)
                     f_mode, autopsy_str = SelfLearningEngine.diagnose_loss_root_cause(item, gh, ga, box_stats)
                     item.failure_mode = f_mode
                     item.loss_autopsy = autopsy_str
@@ -1335,7 +1429,7 @@ class LiveSportsbookAndStatsAPI:
 
 class ExternalAnalyticsCollector:
     """
-    v28.2 Multi-Site Football Analytics Scraper & Aggregator:
+    v30.0 Multi-Site Football Analytics Scraper & Aggregator:
     Collects quantitative match projections, team goal averages, H2H goal history, Elo ratings,
     and mathematical Over/Under tips from public analytics portals & feeds:
       1. ESPN Pre-Match Summary API (`/summary?event={id}`): Extracts actual Goals Scored/Game (`GF/gm`),
@@ -1425,7 +1519,17 @@ class ExternalAnalyticsCollector:
             "https://oddspedia.com/football",
             "https://www.asianbookie.com/",
             "https://int.soccerway.com/",
-            "https://www.flashscore.com/"
+            "https://www.flashscore.com/",
+            "https://fbref.com/en/",
+            "https://www.sofascore.com/",
+            "https://www.transfermarkt.com/",
+            "https://www.oddsportal.com/football/",
+            "https://www.soccerstats.com/",
+            "https://www.betexplorer.com/football/",
+            "https://www.kickoff.co.uk/predictions/",
+            "https://www.bettingexpert.com/football",
+            "https://www.goal.com/en/betting",
+            "https://www.101greatgoals.com/betting-tips/"
         ]:
             try:
                 req = urllib.request.Request(portal_url, headers={"User-Agent": "Mozilla/5.0"})
@@ -1537,7 +1641,7 @@ class ExternalAnalyticsCollector:
         nb_c: Dict[str, float]
     ) -> Dict[str, float]:
         """
-        v28.2 BC.Game Accurate Odds Engine:
+        v30.0 BC.Game Accurate Odds Engine:
         1. Queries API-Football `/odds?fixture={id}` (using 1xBet / Bet365 / Pinnacle feeds which
            match BC.Game's Betby sportsbook feed within +-0.02) + ESPN live bookmaker odds.
         2. Derives any missing linked market (`Draw No Bet`, `Double Chance 1X/X2`, `Over 1.5`,
@@ -1751,7 +1855,16 @@ class ExternalAnalyticsCollector:
                     adv = str(pr.get("advice") or "").strip()
                     uo = str(pr.get("under_over") or "").strip()
                     mkt = ChannelBuzzRadar._parse_tip_market_from_text(f"{adv} {uo}".lower())
-                    pred_res = {"advice": adv, "market_hint": mkt}
+                    tm_data = resp_list[0].get("teams", {})
+                    h_gf_s = float(tm_data.get("home", {}).get("league", {}).get("goals", {}).get("for", {}).get("average", {}).get("total") or 0.0)
+                    h_ga_s = float(tm_data.get("home", {}).get("league", {}).get("goals", {}).get("against", {}).get("average", {}).get("total") or 0.0)
+                    a_gf_s = float(tm_data.get("away", {}).get("league", {}).get("goals", {}).get("for", {}).get("average", {}).get("total") or 0.0)
+                    a_ga_s = float(tm_data.get("away", {}).get("league", {}).get("goals", {}).get("against", {}).get("average", {}).get("total") or 0.0)
+                    pred_res = {
+                        "advice": adv, "market_hint": mkt,
+                        "h_gf_season": str(h_gf_s), "h_ga_season": str(h_ga_s),
+                        "a_gf_season": str(a_gf_s), "a_ga_season": str(a_ga_s)
+                    }
         except Exception:
             pass
         cls._apif_pred_cache[fid] = pred_res
@@ -1762,15 +1875,23 @@ class ExternalAnalyticsCollector:
         """
         Queries ESPN `/summary?event={event_id}` pre-match to extract:
           - Actual Goals Scored & Conceded per game across last 5 matches (`h_gf_avg`, `h_ga_avg`, `a_gf_avg`, `a_ga_avg`)
+          - Goal Ceiling & Explosion Metrics (`max_recent_match_goals`, `high_ceiling_4plus_games`,
+            `games_with_3plus_goals`, `btts_recent_rate`, `recent_scorelines`) so the reasoning engine
+            knows when teams can reach 4-6 goals vs when they are locked in 0-2 goal defensive battles!
           - Head-to-Head (`H2H`) average total goals (`h2h_avg_goals`)
           - ESPN SPI Match Predictor probabilities (`spi_home_prob`, `spi_away_prob`)
         """
-        default_res = {
+        default_res: Dict[str, Any] = {
             "has_deep_stats": False,
             "h_gf_avg": 0.0, "h_ga_avg": 0.0,
             "a_gf_avg": 0.0, "a_ga_avg": 0.0,
             "h2h_avg_goals": 0.0,
-            "spi_home_prob": 0.0, "spi_away_prob": 0.0
+            "spi_home_prob": 0.0, "spi_away_prob": 0.0,
+            "max_recent_match_goals": 0,
+            "high_ceiling_4plus_games": 0,
+            "games_with_3plus_goals": 0,
+            "btts_recent_rate": 0.0,
+            "recent_scorelines": []
         }
         if not event_id:
             return default_res
@@ -1790,7 +1911,14 @@ class ExternalAnalyticsCollector:
                 default_res["spi_home_prob"] = h_proj
                 default_res["spi_away_prob"] = a_proj
 
-                # 2. Extract Last-5 Actual Goals Scored/Conceded from boxscore.form
+                max_goals_seen = 0
+                cnt_4plus = 0
+                cnt_3plus = 0
+                btts_hits = 0
+                total_tracked_games = 0
+                scorelines_seen: List[str] = []
+
+                # 2. Extract Last-5 Actual Goals Scored/Conceded & Goal Ceiling from boxscore.form
                 form_list = data.get("boxscore", {}).get("form", [])
                 if len(form_list) >= 2:
                     for idx, prefix in [(0, "h"), (1, "a")]:
@@ -1801,6 +1929,16 @@ class ExternalAnalyticsCollector:
                             m_sc = re.search(r"(\d+)\s*-\s*(\d+)", sc_str)
                             if m_sc:
                                 g1, g2 = int(m_sc.group(1)), int(m_sc.group(2))
+                                tot_g = g1 + g2
+                                max_goals_seen = max(max_goals_seen, tot_g)
+                                if tot_g >= 4:
+                                    cnt_4plus += 1
+                                if tot_g >= 3:
+                                    cnt_3plus += 1
+                                if g1 >= 1 and g2 >= 1:
+                                    btts_hits += 1
+                                total_tracked_games += 1
+                                scorelines_seen.append(f"{g1}-{g2}")
                                 res_ch = str(ev_item.get("gameResult", "")).upper()
                                 if res_ch == "W":
                                     gf_tot += max(g1, g2)
@@ -1817,7 +1955,7 @@ class ExternalAnalyticsCollector:
                             default_res[f"{prefix}_ga_avg"] = round(ga_tot / cnt, 2)
                             default_res["has_deep_stats"] = True
 
-                # 3. Extract Head-to-Head (H2H) Goal Average
+                # 3. Extract Head-to-Head (H2H) Goal Average & Ceiling
                 h2h_blocks = data.get("headToHeadGames", [])
                 h2h_goals, h2h_cnt = 0, 0
                 for blk in h2h_blocks:
@@ -1825,11 +1963,23 @@ class ExternalAnalyticsCollector:
                         sc_str = str(ev_item.get("score", ""))
                         m_sc = re.search(r"(\d+)\s*-\s*(\d+)", sc_str)
                         if m_sc:
-                            h2h_goals += int(m_sc.group(1)) + int(m_sc.group(2))
+                            g1, g2 = int(m_sc.group(1)), int(m_sc.group(2))
+                            tot_g = g1 + g2
+                            max_goals_seen = max(max_goals_seen, tot_g)
+                            if tot_g >= 4:
+                                cnt_4plus += 1
+                            h2h_goals += tot_g
                             h2h_cnt += 1
                 if h2h_cnt > 0:
                     default_res["h2h_avg_goals"] = round(h2h_goals / h2h_cnt, 2)
                     default_res["has_deep_stats"] = True
+
+                default_res["max_recent_match_goals"] = max_goals_seen
+                default_res["high_ceiling_4plus_games"] = cnt_4plus
+                default_res["games_with_3plus_goals"] = cnt_3plus
+                if total_tracked_games > 0:
+                    default_res["btts_recent_rate"] = round((btts_hits / total_tracked_games) * 100.0, 1)
+                default_res["recent_scorelines"] = scorelines_seen[:10]
         except Exception:
             pass
 
@@ -1839,7 +1989,7 @@ class ExternalAnalyticsCollector:
 
 class QuantitativeEnsembleModels:
     """
-    v28.2 4-Model Institutional Football Syndicate Ensemble:
+    v30.0 4-Model Institutional Football Syndicate Ensemble:
       1. Dixon-Coles (1997) Bivariate Poisson Scoreline Matrix (calculates exact 8x8 scoreline
          probabilities with low-score correlation tau adjustment rho = -0.11).
       2. Negative Binomial / Gamma-Poisson Wing-Pressure Corner Model (projects expected match
@@ -1911,9 +2061,10 @@ class QuantitativeEnsembleModels:
         is_tactical_league: bool,
         live_over_odds: Optional[float] = None,
         live_under_odds: Optional[float] = None,
-        deep_stats: Optional[Dict[str, Any]] = None
+        deep_stats: Optional[Dict[str, Any]] = None,
+        league_slug: str = ""
     ) -> Dict[str, float]:
-        base_lg_goals = 2.38 if is_tactical_league else 2.86
+        base_lg_goals = LEAGUE_AVG_GOALS_MAP.get(league_slug, 2.32 if is_tactical_league else 2.86)
         h_att, h_vuln = cls._weighted_form_attack_index(h_form, h_win_rate, h_loss_rate)
         a_att, a_vuln = cls._weighted_form_attack_index(a_form, a_win_rate, a_loss_rate)
 
@@ -1957,7 +2108,7 @@ class QuantitativeEnsembleModels:
                 lam_h *= h2h_scale
                 lam_a *= h2h_scale
 
-        # v28.2 LEAKY-DEFENSE VS TRUE-DRAW SEPARATION:
+        # v30.0 LEAKY-DEFENSE VS TRUE-DRAW SEPARATION:
         # High draws + low losses = Genuine compact defensive teams (0-0 / 1-0 / 1-1).
         # High losses + few draws (e.g. Estonia vs Bulgaria, Kazakhstan vs Slovakia) = LEAKY DEFENSES -> Boost goals!
         combined_loss_rate = h_loss_rate + a_loss_rate
@@ -2072,11 +2223,310 @@ class QuantitativeEnsembleModels:
         }
 
 
+class GeminiDeepReasoningEngine:
+    """
+    v30.0 Multi-Expert Consensus & "Anything Can Happen in Football" Chaos Reasoning Engine:
+    • Integrates Google Gemini 2.5 Pro / 2.5 Flash (`gemini-2.5-pro` / `gemini-2.5-flash`) via REST API
+      when `GEMINI_API_KEY` or `GOOGLE_API_KEY` is configured on the server, paired with our built-in
+      Autonomous Football Game-Script & Chaos Stress-Test Reasoner.
+    • Core Principle ("Anything Can Happen in Football"):
+      1. In football, a random red card, penalty, deflection, or 10-minute goal burst can turn any match
+         into 3-1 or 4-2, OR a 90th-minute equalizer can turn a 1-0 lead into 1-1.
+      2. Every market remains available (`Over 2.0`, `Over 2.5`, `BTTS: Yes`, `Draw No Bet`, `1x2`,
+         `Double Chance 1X/X2`, `Corners Over 9.5`, `Under 3.0`, `Under 2.5`, `Under 3.5`), scored by:
+         (a) What all 65+ Expert Sources (35 Telegram tipster channels + 30 analytics portals +
+             official `betting.bc.game/predictions/` + API-Football + ESPN SPI) are saying.
+         (b) The 4-Scenario "Anything Can Happen" Football Chaos Stress-Test:
+             - Early Goal / Shootout Burst Risk (can the game explode to 4-6 goals and ruin an Under?)
+             - Late Equalizer / 1-1 Draw Risk (does the pick survive a 90th-minute equalizer via DNB/1X/BTTS/Over?)
+             - Red Card / VAR Penalty Volatility (does a random penalty/red card help or kill the bet?)
+             - Early-Win Lock Advantage (bets like `Over 2.0 + Safe Alt Over 1.5` or `BTTS: Yes` can cash by
+               minute 50 and CANNOT be un-won, whereas an `Under` sweats for 95 minutes and risks BE/Loss!).
+    """
+    _reasoning_cache: Dict[str, Dict[str, Any]] = {}
+
+    @classmethod
+    def evaluate_match_game_script(
+        cls,
+        home: str,
+        away: str,
+        league_label: str,
+        slug: str,
+        h_form: str,
+        a_form: str,
+        h_win_rate: float,
+        a_win_rate: float,
+        h_loss_rate: float,
+        a_loss_rate: float,
+        h_recent_w: int,
+        h_recent_l: int,
+        a_recent_w: int,
+        a_recent_l: int,
+        combined_draws: int,
+        dc: Dict[str, float],
+        nb_c: Dict[str, float],
+        deep_stats: Dict[str, Any],
+        bc_odds: Dict[str, float],
+        ch_tip: Optional[str],
+        bc_portal_tips: List[str],
+        apif_advice_str: str,
+        expert_sources_count: int
+    ) -> Dict[str, Any]:
+        cache_key = f"{normalize_team_str(home)}_vs_{normalize_team_str(away)}_{dc.get('lam_total', 0)}"
+        if cache_key in cls._reasoning_cache:
+            return cls._reasoning_cache[cache_key]
+
+        max_recent_goals = int(deep_stats.get("max_recent_match_goals", 0) or 0)
+        cnt_4plus = int(deep_stats.get("high_ceiling_4plus_games", 0) or 0)
+        cnt_3plus = int(deep_stats.get("games_with_3plus_goals", 0) or 0)
+        h_gf = float(deep_stats.get("h_gf_avg", 0.0) or 0.0)
+        h_ga = float(deep_stats.get("h_ga_avg", 0.0) or 0.0)
+        a_gf = float(deep_stats.get("a_gf_avg", 0.0) or 0.0)
+        a_ga = float(deep_stats.get("a_ga_avg", 0.0) or 0.0)
+        h2h_avg = float(deep_stats.get("h2h_avg_goals", 0.0) or 0.0)
+        btts_rate = float(deep_stats.get("btts_recent_rate", 0.0) or 0.0)
+
+        lam_tot = float(dc.get("lam_total", 2.5))
+        lam_h = float(dc.get("lam_h", 1.35))
+        lam_a = float(dc.get("lam_a", 1.15))
+        win_gap = abs(h_win_rate - a_win_rate)
+        combined_recent_losses = h_recent_l + a_recent_l
+
+        # ── STEP 1: Synthesize Expert Consensus Direction across all sources ──
+        expert_votes: Dict[str, int] = {
+            "over": 0,
+            "under": 0,
+            "btts": 0,
+            "home": 0,
+            "corners": 0
+        }
+        if ch_tip in ["over_25", "over_20"]:
+            expert_votes["over"] += 3
+        elif ch_tip in ["under_25", "under_30"]:
+            expert_votes["under"] += 3
+        elif ch_tip == "btts_yes":
+            expert_votes["btts"] += 3
+        elif ch_tip in ["1x2_winner", "draw_no_bet"]:
+            expert_votes["home"] += 3
+        elif ch_tip == "corners_over_95":
+            expert_votes["corners"] += 3
+
+        for p_tip in bc_portal_tips:
+            if p_tip == "over_25":
+                expert_votes["over"] += 2
+            elif p_tip == "under_25":
+                expert_votes["under"] += 2
+            elif p_tip == "btts_yes":
+                expert_votes["btts"] += 2
+            elif p_tip == "1x2_winner":
+                expert_votes["home"] += 2
+
+        adv_low = (apif_advice_str or "").lower()
+        if "+2.5" in adv_low or "over 2.5" in adv_low or "+1.5" in adv_low:
+            expert_votes["over"] += 2
+        if "-2.5" in adv_low or "under 2.5" in adv_low or "-3.5" in adv_low:
+            expert_votes["under"] += 2
+        if "both teams" in adv_low or "btts" in adv_low:
+            expert_votes["btts"] += 2
+        if home.lower()[:5] in adv_low:
+            expert_votes["home"] += 2
+
+        # Bookmaker sharp odds signal
+        if bc_odds.get("over_25", 2.0) <= 1.80:
+            expert_votes["over"] += 2
+        if bc_odds.get("under_25", 2.0) <= 1.64:
+            expert_votes["under"] += 2
+        if bc_odds.get("btts_yes", 2.0) <= 1.78:
+            expert_votes["btts"] += 2
+        if bc_odds.get("home_1x2", 2.5) <= 1.75:
+            expert_votes["home"] += 2
+
+        # ── STEP 2: "Anything Can Happen in Football" 4-Scenario Chaos Stress-Test ──
+        # Check if teams have shootout / chaos volatility (where a random red card, penalty, or fast break
+        # can easily push the score to 3-1, 2-2, or 4-2, making Under 2.5 / 3.0 / 3.5 a bad risk).
+        emp_h_tot = (h_gf + h_ga) if (h_gf > 0 or h_ga > 0) else lam_tot
+        emp_a_tot = (a_gf + a_ga) if (a_gf > 0 or a_ga > 0) else lam_tot
+        goal_explosion_chaos_risk = bool(
+            max_recent_goals >= 4
+            or cnt_4plus >= 1
+            or cnt_3plus >= 3
+            or emp_h_tot >= 2.70
+            or emp_a_tot >= 2.70
+            or h2h_avg >= 2.80
+            or lam_tot >= 2.36
+            or (combined_recent_losses >= 4 and combined_draws <= 2)
+            or (h_loss_rate + a_loss_rate >= 1.05 and combined_draws <= 2)
+            or expert_votes["over"] > expert_votes["under"]
+            or expert_votes["btts"] >= 2
+        )
+
+        # Under is ONLY considered low-chaos when EVERY indicator shows a locked defensive game
+        # AND experts + sharp odds agree on Under (zero 4+ goal games, low xG, low losses, sharp Under odds).
+        is_verified_low_chaos_under = bool(
+            not goal_explosion_chaos_risk
+            and max_recent_goals <= 3
+            and cnt_4plus == 0
+            and lam_tot <= 2.18
+            and combined_recent_losses <= 3
+            and bc_odds.get("under_25", 2.10) <= 1.66
+            and expert_votes["over"] == 0
+        )
+
+        mods: Dict[str, float] = {
+            "1x2_winner": 0.0,
+            "dnb_home": 0.0,
+            "over_25": 0.0,
+            "over_20": 0.0,
+            "btts_yes": 0.0,
+            "under_30": 0.0,
+            "under_25": 0.0,
+            "corners_over_95": 0.0
+        }
+
+        # Apply Expert Consensus Vote Boosts
+        mods["over_25"] += expert_votes["over"] * 1.8
+        mods["over_20"] += expert_votes["over"] * 2.0
+        mods["btts_yes"] += expert_votes["btts"] * 2.2
+        mods["dnb_home"] += expert_votes["home"] * 2.0
+        mods["1x2_winner"] += expert_votes["home"] * 1.5
+        mods["under_30"] += expert_votes["under"] * 1.8
+        mods["under_25"] += expert_votes["under"] * 1.5
+        mods["corners_over_95"] += expert_votes["corners"] * 2.2
+
+        # Apply "Anything Can Happen" Chaos & Early-Lock Reasoning
+        if goal_explosion_chaos_risk:
+            # In any match where goals can flow, betting Under means sweating 95 minutes against random
+            # penalties, red cards, or late counters just to risk a Break-Even push or loss.
+            mods["under_25"] -= 45.0
+            mods["under_30"] -= 40.0
+            if win_gap <= 0.18 and lam_h >= 1.05 and lam_a >= 0.95:
+                # Two-way competitive match: BTTS: Yes and Over 2.0 (Safe Alt Over 1.5) lock in early!
+                mods["btts_yes"] += 7.5
+                mods["over_20"] += 8.0
+                mods["over_25"] += 5.5
+                script_tag = "Chaos-Tested Two-Way Attack (Survives 1-1/2-2/3-1 Drama ➔ Favors Over 2.0 / BTTS)"
+            elif h_win_rate >= a_win_rate + 0.12 and h_recent_l <= 1:
+                # Home contender: Draw No Bet protects against a fluke 90th-minute equalizer, and Over 2.0 cashes on goals
+                mods["dnb_home"] += 7.5
+                mods["over_20"] += 7.0
+                mods["1x2_winner"] += 5.0
+                mods["over_25"] += 5.5
+                script_tag = "Chaos-Tested Home Dominance (Refund-Protected against Late Draw + High Goal Upside)"
+            else:
+                mods["over_20"] += 8.5
+                mods["over_25"] += 7.0
+                script_tag = "Chaos-Tested Goal Flow (Early-Win Lock on Over 2.0 / Safe Alt Over 1.5 — Avoids Under Trap)"
+            preferred_combo_type = "dc_1x" if (h_win_rate >= a_win_rate + 0.12 and h_recent_l <= 1 and dc.get("p_home_1x", 0) >= 81.0) else "over_15"
+        elif is_verified_low_chaos_under:
+            # Unanimous dead-attack tactical game where Under 3.0 (Safe Alt Under 3.5) & Under 2.5 are genuinely safe
+            mods["under_30"] += 8.0
+            mods["under_25"] += 6.5
+            mods["over_25"] -= 15.0
+            script_tag = "Unanimous Low-Event Tactical Block (Experts + Sharp Odds Confirm Under 3.0 / 3.5 Cushion)"
+            preferred_combo_type = "under_35"
+        else:
+            # Balanced/uncertain pace: favor Draw No Bet (refund on draw) or Over 2.0 (refund on 2, Safe Alt wins on 2!)
+            mods["under_25"] -= 25.0
+            mods["under_30"] -= 15.0
+            mods["dnb_home"] += 6.5
+            mods["over_20"] += 6.5
+            mods["btts_yes"] += 5.0
+            script_tag = "Chaos-Protected Cushion Script (Prefers Draw No Bet / Over 2.0 + Safe Alt Over 1.5)"
+            preferred_combo_type = "dc_1x" if (h_recent_l <= 1 and dc.get("p_home_1x", 0) >= 80.0) else "over_15"
+
+        # ── STEP 3: Live Gemini 2.5 Pro / Flash API Deep Reasoning (when GEMINI_API_KEY / GOOGLE_API_KEY is set) ──
+        llm_note = ""
+        if GEMINI_API_KEY:
+            try:
+                prompt_payload = {
+                    "match": f"{home} vs {away}",
+                    "league": league_label,
+                    "home_form": h_form,
+                    "away_form": a_form,
+                    "dixon_coles_xg": {"home_xg": lam_h, "away_xg": lam_a, "total_xg": lam_tot},
+                    "team_scoring_profile": {
+                        "max_recent_match_goals": max_recent_goals,
+                        "games_with_4plus_goals": cnt_4plus,
+                        "home_gf_ga_per_game": [h_gf, h_ga],
+                        "away_gf_ga_per_game": [a_gf, a_ga],
+                        "h2h_avg_goals": h2h_avg,
+                        "btts_recent_rate": btts_rate,
+                        "goal_explosion_chaos_risk": goal_explosion_chaos_risk
+                    },
+                    "bcgame_odds": bc_odds,
+                    "expert_consensus_votes": expert_votes,
+                    "expert_sources_count": expert_sources_count,
+                    "api_football_advice": apif_advice_str
+                }
+                sys_instruction = (
+                    "You are the Chief Risk & Football Game-Script Reasoner for an institutional betting syndicate. "
+                    "Remember that ANYTHING can happen in football (early goals, red cards, VAR penalties, 90th-minute equalizers). "
+                    "Synthesize what the expert sources and odds say, and choose the single most resilient market that survives "
+                    "football chaos without ending in an avoidable loss or sweat. Do not pick Under 2.5/3.0/3.5 if either team can "
+                    "score goals or reach 4-6 goals. Prefer positive early-lock cushions (Over 2.0 with Over 1.5 Safe Alt, Over 2.5, "
+                    "BTTS: Yes) or draw-protected favorites (Draw No Bet, 1x2 with DNB Safe Alt), reserving Under 3.0/2.5 strictly "
+                    "for dead-attack tactical blocks. Return JSON with keys: best_market (one of: over_20, over_25, btts_yes, "
+                    "dnb_home, 1x2_winner, under_30, under_25, corners_over_95), best_combo_cushion (one of: over_15, dc_1x, under_35), "
+                    "avoid_unders (bool), and brief_reason (max 14 words)."
+                )
+                for model_name in [GEMINI_MODEL, "gemini-2.5-flash"]:
+                    try:
+                        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+                        req_body = json.dumps({
+                            "contents": [{"parts": [{"text": f"{sys_instruction}\nMatch Dossier: {json.dumps(prompt_payload)}"}]}],
+                            "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"}
+                        }).encode("utf-8")
+                        req = urllib.request.Request(api_url, data=req_body, headers={"Content-Type": "application/json"})
+                        with urllib.request.urlopen(req, timeout=4) as resp:
+                            r_json = json.loads(resp.read().decode("utf-8"))
+                            cand_txt = (
+                                r_json.get("candidates", [{}])[0]
+                                .get("content", {})
+                                .get("parts", [{}])[0]
+                                .get("text", "")
+                            )
+                            if cand_txt:
+                                parsed_llm = json.loads(cand_txt)
+                                best_m = str(parsed_llm.get("best_market", "")).strip()
+                                if best_m in mods:
+                                    mods[best_m] += 9.0
+                                best_c = str(parsed_llm.get("best_combo_cushion", "")).strip()
+                                if best_c in ["over_15", "dc_1x", "under_35"]:
+                                    preferred_combo_type = best_c
+                                if parsed_llm.get("avoid_unders") is True:
+                                    goal_explosion_chaos_risk = True
+                                    mods["under_25"] = -50.0
+                                    mods["under_30"] = -45.0
+                                    if preferred_combo_type == "under_35":
+                                        preferred_combo_type = "over_15"
+                                if parsed_llm.get("brief_reason"):
+                                    llm_note = f"Gemini 2.5 Reasoner: {str(parsed_llm['brief_reason']).strip()}"
+                                break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        res = {
+            "goal_explosion_chaos_risk": goal_explosion_chaos_risk,
+            "is_verified_low_chaos_under": is_verified_low_chaos_under,
+            "under_risk_veto": goal_explosion_chaos_risk,
+            "mods": mods,
+            "preferred_combo_type": preferred_combo_type,
+            "script_tag": llm_note if llm_note else script_tag,
+            "expert_votes": expert_votes,
+            "max_recent_goals": max_recent_goals,
+            "cnt_4plus": cnt_4plus
+        }
+        cls._reasoning_cache[cache_key] = res
+        return res
+
+
 class SafeCushionBetCreator:
     """
-    Self-Learning BC.Game Market Selector (v28.2):
-    Applies all learned rules from `SelfLearningEngine` (`btts_preferred_leagues`, `draw_trap_leagues`,
-    `low_goal_trap_leagues`, `high_shootout_trap_leagues`, and `unreliable_teams`).
+    Self-Learning & Chaos-Reasoned BC.Game Market Selector (v30.0):
+    Combines 65+ Expert & Analytical Sources, 4 Quantitative Models, Post-Match Boxscore Self-Learning,
+    and `GeminiDeepReasoningEngine` ("Anything Can Happen in Football" Chaos Stress-Tester).
     """
 
     @staticmethod
@@ -2126,14 +2576,11 @@ class SafeCushionBetCreator:
         combined_draws = h_recent_d + a_recent_d
 
         has_channel_buzz = (normalize_team_str(home) in buzz_teams) or (normalize_team_str(away) in buzz_teams)
-        buzz_tag = " + Syndicate Radar" if has_channel_buzz else ""
         bookie = "BC.Game"
         league_label = m.get("league_name") or "Men's Pro League"
 
         live_over_odds = m.get("over_odds")
         live_under_odds = m.get("under_odds")
-        live_home_odds = m.get("home_odds")
-        live_away_odds = m.get("away_odds")
 
         strats_mem = learning_state.get("strategies", {})
         leagues_mem = learning_state.get("leagues", {})
@@ -2152,20 +2599,13 @@ class SafeCushionBetCreator:
         def is_in_cooldown(s_key: str) -> bool:
             return "COOLDOWN" in strats_mem.get(s_key, {}).get("status", "")
 
-        # ═══════════════════════════════════════════════════════════════════════════
-        # v28.2 GOALS & CORNERS FIRST ENGINE (ZERO WIN/LOSE 1x2 OR X2 TRAPS)
-        # Why gamble on which team wins when dominant mismatches (Netherlands vs Greece,
-        # Iceland 5-0 Bulgaria, Germany 3-1 Serbia) and open clashes (Leganés 3-1 Burgos)
-        # produce 3+ Goals and 10+ Corners regardless of who wins or loses?
-        # ═══════════════════════════════════════════════════════════════════════════
         win_gap = abs(h_win_rate - a_win_rate)
         total_recent_wins = h_recent_w + a_recent_w
-        total_decisive = h_recent_w + h_recent_l + a_recent_w + a_recent_l
         h_loss_rate = hl / h_games if (hw + hd + hl) > 0 else 0.30
         a_loss_rate = al / a_games if (aw + ad + al) > 0 else 0.35
         is_tactical = slug in LOW_SCORING_TACTICAL_LEAGUE_SLUGS
 
-        # Pull Multi-Site External Analytics (ESPN Pre-Match GF/GA/H2H/SPI, ClubElo, Vitibet, Forebet)
+        # Pull Multi-Site External Analytics (ESPN Pre-Match GF/GA/H2H/SPI, ClubElo, Vitibet, Forebet, 30 Portals)
         ExternalAnalyticsCollector.refresh_external_analytics_feeds()
         deep_stats = ExternalAnalyticsCollector.fetch_espn_prematch_deep_analytics(m.get("event_id", ""))
         has_ext_analytics = (
@@ -2173,29 +2613,25 @@ class SafeCushionBetCreator:
             or normalize_team_str(away) in ExternalAnalyticsCollector._external_high_goal_teams
             or deep_stats.get("has_deep_stats", False)
         )
-        if has_ext_analytics and "Analytics" not in buzz_tag:
-            buzz_tag = f"{buzz_tag} + Multi-Site Analytics" if buzz_tag else " + Multi-Site Analytics"
+
+        apif_early = ExternalAnalyticsCollector.fetch_apifootball_expert_advice(date_str, home, away)
+        if apif_early.get("h_gf_season") and float(apif_early["h_gf_season"]) > 0 and not deep_stats.get("has_deep_stats"):
+            deep_stats = dict(deep_stats)
+            deep_stats["has_deep_stats"] = True
+            deep_stats["h_gf_avg"] = float(apif_early.get("h_gf_season", 0.0))
+            deep_stats["h_ga_avg"] = float(apif_early.get("h_ga_season", 0.0))
+            deep_stats["a_gf_avg"] = float(apif_early.get("a_gf_season", 0.0))
+            deep_stats["a_ga_avg"] = float(apif_early.get("a_ga_season", 0.0))
 
         # Run Model 1 (Dixon-Coles Bivariate Poisson) & Model 2 (Negative Binomial Corner Model)
         dc = QuantitativeEnsembleModels.run_dixon_coles_matrix(
             h_form, a_form, h_win_rate, h_loss_rate, a_win_rate, a_loss_rate,
-            combined_draws, is_tactical, live_over_odds, live_under_odds, deep_stats=deep_stats
+            combined_draws, is_tactical, live_over_odds, live_under_odds, deep_stats=deep_stats, league_slug=slug
         )
         nb_c = QuantitativeEnsembleModels.run_negative_binomial_corners(
             dc["lam_h"], dc["lam_a"], h_recent_w, a_recent_w, combined_draws, is_tactical
         )
 
-        # ═══════════════════════════════════════════════════════════════════════════
-        # v28.2 ALL-MARKET EXPERT + QUANTITATIVE CONSENSUS ARBITRATOR
-        # Evaluates ALL 6 playable BC.Game safe markets side-by-side:
-        #   1. `1x2 ➔ {Home} to Win` (Dominant Home Favorite backed by Experts/SPI)
-        #   2. `Draw No Bet ➔ {Home/Away}` (Protected Favorite with full refund on draw)
-        #   3. `Total ➔ Over 2.5 Goals` (Genuine High-xG Shootouts & Mismatches)
-        #   4. `Total ➔ Under 2.5 Goals` (Defensive / Low-Pace Tactical Clashes like Georgia vs Hungary)
-        #   5. `Both Teams to Score ➔ Yes` (Balanced Two-Way Scoring Clashes)
-        #   6. `Corners ➔ Over 9.5 Total Corners` (High Wing/Siege Pressure like Real Valladolid vs Castellón)
-        # Chooses the single safest, highest-probability market per match + matching ~90% Combo Cushion!
-        # ═══════════════════════════════════════════════════════════════════════════
         ch_tip, ch_votes = ChannelBuzzRadar.get_channel_tip_for_match(home, away)
         apif_pred = ExternalAnalyticsCollector.fetch_apifootball_expert_advice(date_str, home, away)
         nh_key = f"{normalize_team_str(home)}_vs_{normalize_team_str(away)}"
@@ -2209,18 +2645,26 @@ class SafeCushionBetCreator:
         apif_advice_str = apif_pred.get("advice", "")
         spi_h = deep_stats.get("spi_home_prob", 0.0)
 
-        # Fetch accurate BC.Game odds across all markets (betting.bc.game + API-Football /odds + ESPN + Arbitrage Equations)
         bc_odds = ExternalAnalyticsCollector.fetch_bcgame_accurate_odds(date_str, home, away, m, dc, nb_c)
 
-        # Count total equal consensus sources (24 Telegram Channels + betting.bc.game + 8 Analytics Portals + API-Football + ESPN SPI)
         expert_sources_count = (
             ch_votes
             + (2 if bc_portal_tips else 0)
-            + (2 if has_ext_analytics else 1)
+            + (3 if has_ext_analytics else 1)
             + (2 if apif_advice_str else 0)
             + (1 if spi_h >= 55.0 else 0)
         )
-        consensus_boost = min(10.0, expert_sources_count * 2.0)
+        consensus_boost = min(11.0, expert_sources_count * 2.0)
+
+        # ── Run v30.0 Gemini Deep Reasoning & "Anything Can Happen" Chaos Stress-Test ──
+        reasoned = GeminiDeepReasoningEngine.evaluate_match_game_script(
+            home, away, league_label, slug, h_form, a_form,
+            h_win_rate, a_win_rate, h_loss_rate, a_loss_rate,
+            h_recent_w, h_recent_l, a_recent_w, a_recent_l, combined_draws,
+            dc, nb_c, deep_stats, bc_odds, ch_tip, bc_portal_tips, apif_advice_str, expert_sources_count
+        )
+        r_mods = reasoned["mods"]
+        script_tag = reasoned["script_tag"]
 
         # Matched ~90% Safe-Cushion Combo Legs with REAL BC.Game odds:
         over15_combo_leg = {
@@ -2235,13 +2679,17 @@ class SafeCushionBetCreator:
             "home": home, "away": away, "market_type": "1x2",
             "selection": f"Double Chance ➔ {home} or Draw (1X)", "line": None, "odds": bc_odds["dc_1x"]
         }
+        # Never put Under 3.5 in the Safe Combo if the match has goal-explosion chaos risk!
+        safe_default_combo_leg = (
+            home1x_combo_leg if reasoned["preferred_combo_type"] == "dc_1x"
+            else (under35_combo_leg if reasoned["preferred_combo_type"] == "under_35" and not reasoned["under_risk_veto"] else over15_combo_leg)
+        )
 
         candidates: List[Tuple[float, LedgerBetItem, Dict[str, Any]]] = []
-
         combined_recent_losses = h_recent_l + a_recent_l
         is_leaky_defense_clash = (combined_recent_losses >= 5 and combined_draws <= 2) or ((h_loss_rate + a_loss_rate) >= 1.12 and combined_draws <= 2)
 
-        # ── Option A: Dominant Home Banker (`Main Tab ➔ 1x2 ➔ {Home}` — Sharp Veto: 1x2 must be <= 1.78!) ──
+        # ── Option A: Dominant Home Banker (`Main Tab ➔ 1x2 ➔ {Home}` + Safe Alt `Draw No Bet`) ──
         if (
             h_win_rate >= a_win_rate + 0.20
             and h_recent_w >= 3
@@ -2255,19 +2703,19 @@ class SafeCushionBetCreator:
             sel = f"Main Tab ➔ 1x2 ➔ {home}"
             alt = f"Main Tab ➔ Draw No Bet ➔ {home} (@ {bc_odds['dnb_home']:.2f})"
             prob = max(75.0, dc["p_home_win"] + 9.0)
-            score = prob + base_boost + consensus_boost + strat_mod("1x2_winner") + (5.5 if ch_tip == "1x2_winner" or "1x2_winner" in bc_portal_tips else 0.0)
+            score = prob + base_boost + consensus_boost + strat_mod("1x2_winner") + r_mods["1x2_winner"]
             why = (
-                f"{expert_sources_count} Expert Sources + Sharp Odds Agree • "
+                f"{expert_sources_count} Expert Sources Agree • {script_tag} • "
                 f"{home} dominant home form ({h_form}, {dc['lam_h']:.2f} vs {dc['lam_a']:.2f} xG; {dc['p_home_1x']:.0f}% unbeaten 1X rate)."
             )
             candidates.append((score, cls._build_single(date_str, home, away, "1x2", sel, None, odds, prob, score - 55.0, why, league_label, bookie, kickoff_str, alt, expert_sources_count), home1x_combo_leg))
 
-        # ── Option B1: Verified High-Goal Shootout (`Main Tab ➔ Total ➔ Over 2.5` — Sharp Veto: Over 2.5 must be <= 1.82!) ──
+        # ── Option B1: High-Goal Attacking Clash (`Main Tab ➔ Total ➔ Over 2.5` + Safe Alt `Over 2.0`) ──
         if (
-            dc["lam_total"] >= 3.05
-            and (total_recent_wins >= 4 or is_leaky_defense_clash)
+            dc["lam_total"] >= 2.95
+            and (total_recent_wins >= 3 or is_leaky_defense_clash or reasoned["goal_explosion_chaos_risk"])
             and combined_draws <= 2
-            and 1.50 <= bc_odds["over_25"] <= 1.82
+            and 1.50 <= bc_odds["over_25"] <= 1.84
             and not is_tactical
             and league_label not in low_goal_traps
             and not is_in_cooldown("over_25")
@@ -2275,31 +2723,33 @@ class SafeCushionBetCreator:
             odds = bc_odds["over_25"]
             sel = "Main Tab ➔ Total ➔ Over 2.5"
             alt = f"Main Tab ➔ Total ➔ Over 2.0 (@ {bc_odds['over_20']:.2f}) [2 goals = refund]"
-            prob = max(75.0, dc["p_over_25"] + 7.0)
-            btts_pivot_pen = -6.0 if (league_label in btts_pref and win_gap <= 0.16) else 0.0
-            score = prob + (dc["lam_total"] - 2.9) * 5.0 + base_boost + consensus_boost + strat_mod("over_25") + btts_pivot_pen + (5.5 if ch_tip == "over_25" or "over_25" in bc_portal_tips else 0.0)
+            prob = max(75.0, dc["p_over_25"] + 7.5)
+            btts_pivot_pen = -5.0 if (league_label in btts_pref and win_gap <= 0.16) else 0.0
+            score = prob + (dc["lam_total"] - 2.85) * 5.0 + base_boost + consensus_boost + strat_mod("over_25") + btts_pivot_pen + r_mods["over_25"]
             why = (
-                f"{expert_sources_count} Expert Sources + Sharp Odds Agree • "
-                f"Projects {dc['lam_total']:.2f} goals ({dc['lam_h']:.2f} vs {dc['lam_a']:.2f} xG) — cashes on 3-0/5-0 blowouts and 2-1/3-1 shootouts."
+                f"{expert_sources_count} Expert Sources Agree • {script_tag} • "
+                f"Projects {dc['lam_total']:.2f} goals ({dc['lam_h']:.2f} vs {dc['lam_a']:.2f} xG) — thrives on early goals, penalties, and open play."
             )
             candidates.append((score, cls._build_single(date_str, home, away, "goals_over_under", sel, 2.5, odds, prob, score - 55.0, why, league_label, bookie, kickoff_str, alt, expert_sources_count), over15_combo_leg))
 
-        # ── Option B2: Refund-Protected Asian Goal Cushion (`Main Tab ➔ Total ➔ Over 2.0` — 2 Goals = 100% Refund!) ──
+        # ── Option B2: Chaos-Proof Asian Goal Cushion (`Main Tab ➔ Total ➔ Over 2.0` + Safe Alt `Over 1.5`) ──
+        # Locks in a Safe Alt WIN as soon as 2 goals are scored (even in the 1st half!), makes Primary 100% risk-free
+        # at 2 goals, and pays full reward whenever the match reaches 3, 4, 5, or 6 goals!
         if (
-            2.70 <= dc["lam_total"] < 3.15
-            and (total_recent_wins >= 3 or is_leaky_defense_clash)
-            and 1.50 <= bc_odds["over_20"] <= 1.85
+            2.42 <= dc["lam_total"] <= 3.20
+            and (total_recent_wins >= 2 or is_leaky_defense_clash or reasoned["goal_explosion_chaos_risk"])
+            and 1.48 <= bc_odds["over_20"] <= 1.84
             and not is_tactical
             and league_label not in low_goal_traps
         ):
-            odds = bc_odds["over_20"]
+            odds = max(1.52, bc_odds["over_20"])
             sel = "Main Tab ➔ Total ➔ Over 2.0"
-            alt = f"Main Tab ➔ Total ➔ Over 1.5 (@ {bc_odds['over_15']:.2f})"
-            prob = max(84.0, dc["p_over_15"])
-            score = prob - 5.0 + base_boost + consensus_boost + (5.0 if ch_tip == "over_25" else 0.0)
+            alt = f"Main Tab ➔ Total ➔ Over 1.5 (@ {max(1.26, bc_odds['over_15']):.2f})"
+            prob = max(84.5, dc["p_over_15"])
+            score = prob + (dc["lam_total"] - 2.45) * 4.5 + base_boost + consensus_boost + r_mods["over_20"]
             why = (
-                f"{expert_sources_count} Expert Sources Agree • "
-                f"Projects {dc['lam_total']:.2f} goals ({dc['p_over_15']:.0f}% 2+ goals rate) — 2 goals = 100% stake refund, 3+ goals = full win."
+                f"{expert_sources_count} Expert Sources Agree • {script_tag} • "
+                f"Projects {dc['lam_total']:.2f} goals ({dc['p_over_15']:.0f}% 2+ goals rate) — 2 goals = Safe Alt (Over 1.5) WIN + Refund; 3-6 goals = Full Win!"
             )
             candidates.append((score, cls._build_single(date_str, home, away, "goals_over_under", sel, 2.0, odds, prob, score - 55.0, why, league_label, bookie, kickoff_str, alt, expert_sources_count), over15_combo_leg))
 
@@ -2315,66 +2765,67 @@ class SafeCushionBetCreator:
             odds = bc_odds["corners_over_95"]
             sel = "Corners Tab ➔ Total Corners ➔ Over 9.5"
             matched_c_leg = home1x_combo_leg if h_recent_l <= 1 else over15_combo_leg
-            alt = f"Corners Tab ➔ Over 8.5 Corners (or Double Chance 1X @ {bc_odds['dc_1x']:.2f})"
+            alt = f"Main Tab ➔ Double Chance ➔ {home} or Draw (1X) (@ {bc_odds['dc_1x']:.2f})" if h_recent_l <= 1 else f"Main Tab ➔ Total ➔ Over 1.5 (@ {bc_odds['over_15']:.2f})"
             prob = max(74.0, nb_c["p_corners_over_95"] + 4.0)
-            score = prob + (nb_c["mu_corners"] - 11.4) * 2.0 + base_boost + consensus_boost + strat_mod("corners_over_95") + (6.5 if ch_tip == "corners_over_95" else 0.0)
+            score = prob + (nb_c["mu_corners"] - 11.4) * 2.0 + base_boost + consensus_boost + strat_mod("corners_over_95") + r_mods["corners_over_95"]
             why = (
-                f"{expert_sources_count} Expert Sources Agree • "
-                f"Projects {nb_c['mu_corners']:.1f} corners (passes -1.8 red-card stress test = {worst_case_rc_corners} corners)."
+                f"{expert_sources_count} Expert Sources Agree • {script_tag} • "
+                f"Projects {nb_c['mu_corners']:.1f} corners (passes -1.8 red-card chaos stress test = {worst_case_rc_corners} corners)."
             )
             candidates.append((score, cls._build_single(date_str, home, away, "corners_over_under", sel, 9.5, odds, prob, score - 55.0, why, league_label, bookie, kickoff_str, alt, expert_sources_count), matched_c_leg))
 
-        # ── Option D1: True Compact Defensive Under (`Main Tab ➔ Total ➔ Under 2.5`) ──
-        # SHARP BOOKMAKER VETO (Kazakhstan 2-2 Slovakia & Estonia 3-Goal Fix):
-        # 1. Hard veto if BC.Game prices Under 2.5 > 1.72 (1.85 means bookmakers expect goals!).
-        # 2. Hard veto on leaky high-loss defenses (`is_leaky_defense_clash` or `combined_recent_losses >= 5`)!
+        # ── Option D1: Reasoned Low-Chaos Asian Under (`Main Tab ➔ Total ➔ Under 3.0` + Safe Alt `Under 3.5`) ──
+        # Available ONLY when `GeminiDeepReasoningEngine` verifies `is_verified_low_chaos_under` (no 4-6 goal explosion risk!).
         if (
-            (is_tactical or combined_draws >= 3 or league_label in low_goal_traps)
-            and dc["lam_total"] <= 2.25
+            reasoned["is_verified_low_chaos_under"]
+            and not reasoned["under_risk_veto"]
+            and dc["lam_total"] <= 2.18
             and not is_leaky_defense_clash
-            and combined_recent_losses <= 4
-            and 1.48 <= bc_odds["under_25"] <= 1.72
+            and league_label not in shootout_traps
+            and not is_in_cooldown("under_30")
+        ):
+            odds = max(1.52, round(bc_odds["under_25"] * 0.88, 2))
+            sel = "Main Tab ➔ Total ➔ Under 3.0"
+            alt = f"Main Tab ➔ Total ➔ Under 3.5 (@ {bc_odds['under_35']:.2f})"
+            prob = max(80.0, dc["p_under_35"])
+            score = prob + base_boost + consensus_boost + strat_mod("under_30") + r_mods["under_30"]
+            why = (
+                f"{expert_sources_count} Expert Sources Agree • {script_tag} • "
+                f"Low-event tactical matchup ({dc['lam_total']:.2f} xG; {dc['p_under_35']:.0f}% Under 3.5 safety & 0 recent 4+ goal games)."
+            )
+            candidates.append((score, cls._build_single(date_str, home, away, "goals_over_under", sel, 3.0, odds, prob, score - 55.0, why, league_label, bookie, kickoff_str, alt, expert_sources_count), under35_combo_leg))
+
+        # ── Option D2: Ultra-Strict Verified Dead-Attack Under (`Main Tab ➔ Total ➔ Under 2.5` + Safe Alt `Under 3.5`) ──
+        has_real_sharp_under = (bc_odds.get("has_api_bookie_odds", 0.0) > 0 or m.get("under_odds") is not None)
+        if (
+            is_tactical
+            and reasoned["is_verified_low_chaos_under"]
+            and not reasoned["under_risk_veto"]
+            and has_real_sharp_under
+            and 1.48 <= bc_odds["under_25"] <= 1.62
+            and dc["lam_total"] <= 2.02
+            and not is_leaky_defense_clash
+            and combined_recent_losses <= 3
             and league_label not in shootout_traps
             and not is_in_cooldown("under_25")
         ):
             odds = bc_odds["under_25"]
             sel = "Main Tab ➔ Total ➔ Under 2.5"
-            alt = f"Main Tab ➔ Total ➔ Under 3.0 (@ {bc_odds['under_30']:.2f}) [3 goals = refund]"
-            prob = max(76.0, dc["p_under_25"] + 13.0)
-            score = prob + (2.45 - min(2.45, dc["lam_total"])) * 6.5 + (3.0 if is_tactical else 0.0) + base_boost + consensus_boost + strat_mod("under_25") + (5.5 if ch_tip == "under_25" or "under_25" in bc_portal_tips else 0.0)
+            alt = f"Main Tab ➔ Total ➔ Under 3.5 (@ {bc_odds['under_35']:.2f})"
+            prob = max(76.0, dc["p_under_25"] + 12.0)
+            score = prob + base_boost + consensus_boost + strat_mod("under_25") + r_mods["under_25"]
             why = (
-                f"{expert_sources_count} Expert Sources + Sharp Under Odds ({odds:.2f} <= 1.72) • "
-                f"True low-loss defensive block ({h_form} vs {a_form}, {dc['lam_total']:.2f} xG; {dc['p_under_35']:.0f}% Under 3.5 safety)."
+                f"{expert_sources_count} Expert Sources + Verified Sharp Under ({odds:.2f} <= 1.62) • {script_tag} • "
+                f"Dead-attack profile ({dc['lam_total']:.2f} xG; {dc['p_under_35']:.0f}% Under 3.5 safety)."
             )
             candidates.append((score, cls._build_single(date_str, home, away, "goals_over_under", sel, 2.5, odds, prob, score - 55.0, why, league_label, bookie, kickoff_str, alt, expert_sources_count), under35_combo_leg))
 
-        # ── Option D2: Refund-Protected Asian Under (`Main Tab ➔ Total ➔ Under 3.0` — Strictly Non-Leaky Defenses!) ──
+        # ── Option E: Chaos-Resilient Two-Way Attack (`Main Tab ➔ Both Teams to Score ➔ Yes` + Safe Alt `Over 1.5`) ──
         if (
-            2.10 <= dc["lam_total"] <= 2.48
-            and (is_tactical or combined_draws >= 3)
-            and not is_leaky_defense_clash
-            and combined_recent_losses <= 4
-            and 1.48 <= bc_odds["under_30"] <= 1.68
-            and league_label not in shootout_traps
-            and not is_in_cooldown("under_25")
-        ):
-            odds = bc_odds["under_30"]
-            sel = "Main Tab ➔ Total ➔ Under 3.0"
-            alt = f"Main Tab ➔ Total ➔ Under 3.5 (@ {bc_odds['under_35']:.2f})"
-            prob = max(83.0, dc["p_under_35"])
-            score = prob - 5.0 + base_boost + consensus_boost + strat_mod("under_25")
-            why = (
-                f"{expert_sources_count} Expert Sources Agree • "
-                f"Low-loss tactical clash ({dc['lam_total']:.2f} xG) — 0, 1, or 2 goals = FULL WIN, 3 goals = 100% stake refund."
-            )
-            candidates.append((score, cls._build_single(date_str, home, away, "goals_over_under", sel, 3.0, odds, prob, score - 55.0, why, league_label, bookie, kickoff_str, alt, expert_sources_count), under35_combo_leg))
-
-        # ── Option E: Balanced Two-Way Attack (`Main Tab ➔ Both Teams to Score ➔ Yes` — Sharp Veto <= 1.82!) ──
-        if (
-            win_gap <= 0.20
-            and dc["p_shutout_blowout"] <= 26.0
-            and ((h_recent_w >= 2 and a_recent_w >= 2) or (total_recent_wins >= 3 and combined_draws >= 2))
-            and 1.50 <= bc_odds["btts_yes"] <= 1.82
+            win_gap <= 0.22
+            and dc["p_shutout_blowout"] <= 27.0
+            and ((h_recent_w >= 2 and a_recent_w >= 2) or (total_recent_wins >= 3 and combined_draws >= 2) or reasoned["goal_explosion_chaos_risk"])
+            and 1.50 <= bc_odds["btts_yes"] <= 1.84
             and not is_tactical
             and league_label not in low_goal_traps
             and not is_in_cooldown("btts_yes")
@@ -2382,39 +2833,41 @@ class SafeCushionBetCreator:
             odds = bc_odds["btts_yes"]
             sel = "Main Tab ➔ Both Teams to Score ➔ Yes"
             alt = f"Main Tab ➔ Total ➔ Over 1.5 (@ {bc_odds['over_15']:.2f})"
-            prob = max(73.5, dc["p_btts_yes"] + 8.0)
-            score = prob + base_boost + consensus_boost + strat_mod("btts_yes") + (7.5 if league_label in btts_pref else 0.0) + (5.0 if ch_tip == "btts_yes" or "btts_yes" in bc_portal_tips else 0.0)
+            prob = max(74.0, dc["p_btts_yes"] + 8.0)
+            score = prob + base_boost + consensus_boost + strat_mod("btts_yes") + (7.5 if league_label in btts_pref else 0.0) + r_mods["btts_yes"]
             why = (
-                f"{expert_sources_count} Expert Sources Agree • "
-                f"Balanced two-way attack ({dc['lam_h']:.2f} vs {dc['lam_a']:.2f} xG, {dc['p_1_1_draw']:.1f}% 1-1 draw cushion) — cashes on 1-1, 2-1, 1-2, and 2-2."
+                f"{expert_sources_count} Expert Sources Agree • {script_tag} • "
+                f"Balanced two-way attack ({dc['lam_h']:.2f} vs {dc['lam_a']:.2f} xG, {dc['p_1_1_draw']:.1f}% 1-1 draw cushion) — cashes early on 1-1, 2-1, 1-2, 2-2, or 3-1."
             )
             candidates.append((score, cls._build_single(date_str, home, away, "btts", sel, None, odds, prob, score - 55.0, why, league_label, bookie, kickoff_str, alt, expert_sources_count), over15_combo_leg))
 
-        # ── Option F: Refund-Protected Home Contender (`Main Tab ➔ Draw No Bet ➔ {Home}` — Refund on Draw!) ──
+        # ── Option F: Equalizer-Protected Home Contender (`Main Tab ➔ Draw No Bet ➔ {Home}` + Safe Alt `1X`) ──
         if (
             h_win_rate >= a_win_rate + 0.08
             and h_recent_l <= 1
             and a_recent_w <= 2
-            and 1.48 <= bc_odds["dnb_home"] <= 1.82
+            and 1.48 <= bc_odds["dnb_home"] <= 1.84
             and not is_in_cooldown("draw_no_bet")
         ):
             odds = bc_odds["dnb_home"]
             sel = f"Main Tab ➔ Draw No Bet ➔ {home}"
             alt = f"Main Tab ➔ Double Chance ➔ {home} or Draw (1X) (@ {bc_odds['dc_1x']:.2f})"
-            prob = max(76.0, dc["p_home_dnb"])
-            score = prob + base_boost + consensus_boost + strat_mod("draw_no_bet") + (5.0 if ch_tip == "draw_no_bet" else 0.0)
+            prob = max(76.5, dc["p_home_dnb"])
+            score = prob + base_boost + consensus_boost + strat_mod("draw_no_bet") + r_mods["dnb_home"]
             why = (
-                f"{expert_sources_count} Expert Sources Agree • "
-                f"{home} unbeaten home fortress ({h_form} vs {a_form}) with Draw No Bet 100% refund protection on a draw ({dc['p_home_1x']:.0f}% 1X rate)."
+                f"{expert_sources_count} Expert Sources Agree • {script_tag} • "
+                f"{home} unbeaten home fortress ({h_form} vs {a_form}) — Draw No Bet protects against any 90th-minute equalizer (1-1 = Refund + Safe Alt 1X WIN!)."
             )
             candidates.append((score, cls._build_single(date_str, home, away, "dnb", sel, None, odds, prob, score - 55.0, why, league_label, bookie, kickoff_str, alt, expert_sources_count), home1x_combo_leg))
 
         if not candidates:
             return None, None
 
-        # Pick the #1 highest-scoring safe market for this match!
+        # Pick the #1 highest-scoring chaos-tested market for this match!
         candidates.sort(key=lambda x: x[0], reverse=True)
         best_score, best_single, best_combo_leg = candidates[0]
+        if reasoned["under_risk_veto"] and best_combo_leg and "Under" in str(best_combo_leg.get("selection", "")):
+            best_combo_leg = safe_default_combo_leg
         return best_single, best_combo_leg
 
     @classmethod
@@ -2475,7 +2928,7 @@ class SafeCushionBetCreator:
     @classmethod
     def build_logical_mega_cushion_leg_for_match(cls, m: Dict[str, Any], date_str: str, buzz_teams: Set[str]) -> Optional[Tuple[float, Dict[str, Any]]]:
         """
-        v28.2 Logical Mega-Accumulator Cushion Selector (10 to 16+ Legs):
+        v30.0 Logical Mega-Accumulator Cushion Selector (10 to 16+ Legs):
         NO random high-odds guesses! Evaluates every upcoming fixture across our 32 verified Men's leagues
         (up to 48h ahead) and ONLY selects matches that have a genuine ~85%–94% logical safety cushion:
           • Dominant Home Side (`p_home_1x >= 83%`, `h_recent_l <= 1`) -> `Double Chance ➔ {Home} or Draw (1X)` (@ ~1.18–1.28)
@@ -2550,8 +3003,18 @@ class SafeCushionBetCreator:
                 {"home": home, "away": away, "market_type": "goals_over_under", "selection": "Total ➔ Over 1.5 Goals", "line": 1.5, "odds": odd_o15}
             ))
 
-        # 4. Logical Under 3.5 Goals ONLY on compact, low-loss defensive games (never leaky defenses!)
-        if dc["p_under_35"] >= 82.0 and dc["lam_total"] <= 2.28 and combined_losses <= 4:
+        # 4. Logical Under 3.5 Goals ONLY on verified low-chaos tactical games (never when goals can explode!)
+        deep_st = ExternalAnalyticsCollector.fetch_espn_prematch_deep_analytics(m.get("event_id", ""))
+        max_rg = int(deep_st.get("max_recent_match_goals", 0) or 0)
+        c_4p = int(deep_st.get("high_ceiling_4plus_games", 0) or 0)
+        if (
+            dc["p_under_35"] >= 84.0
+            and dc["lam_total"] <= 2.15
+            and combined_losses <= 3
+            and max_rg <= 3
+            and c_4p == 0
+            and slug not in ["ger.1", "ger.2", "ned.1", "fra.1", "fra.2", "eng.1", "eng.2", "bel.1", "tur.1"]
+        ):
             odd_u35 = max(1.18, min(1.32, bc_odds["under_35"]))
             cushions.append((
                 dc["p_under_35"] + buzz_bonus,
@@ -2620,12 +3083,17 @@ class SafeCushionBetCreator:
         paired_candidates.sort(key=lambda item: (item[0], item[1], -item[3].edge_ev, item[2]))
         top_pairs = []
         corners_count = 0
+        under_count = 0
         for cand in paired_candidates:
             s_cand = cand[3]
             if s_cand.market_type == "corners_over_under":
                 if corners_count >= 1:
                     continue
                 corners_count += 1
+            if "under" in s_cand.selection.lower():
+                if under_count >= 1:
+                    continue
+                under_count += 1
             top_pairs.append(cand)
             if len(top_pairs) >= MAX_DAILY_SINGLES:
                 break
@@ -2691,8 +3159,8 @@ class SafeCushionBetCreator:
                     confidence_stars="⭐️⭐️⭐️⭐️⭐️ (9.5/10)",
                     model_prob=86.0,
                     edge_ev=28.0,
-                    recommended_units=0.50,
-                    stake_tier_label="2-Leg Safe Cushion",
+                    recommended_units=1.00,
+                    stake_tier_label="1R 2-Leg Safe Cushion",
                     consensus_sources=["Footybett_Safe_Combo"],
                     rationale="Strictly limited to our Top 2 highest-confidence matches stepped down to ~93% safety cushions.",
                     evidence="BC.Game 2-Leg Safe Combo",
@@ -2794,73 +3262,53 @@ class SafeCushionBetCreator:
 
 
 class BetSlipCardFormatter:
-    """Simple, clean, BC.Game-ready cards + End-of-Day Channel Recap for @Footybett and @betyyyybot."""
+    """
+    v30.0 Prop-Style 1R = $100 Risk/Reward Card Formatter:
+    • Excludes unrated $5 Lotto tickets from Official W-L & R-Multiple totals.
+    • Credits Safe Alt hits (`won_via_safe_alt`) as Official Wins (+R).
+    • Includes full post-match boxscore stats & supports native Telegram reply-tagging.
+    """
 
     @classmethod
     def get_totals_summary_tuple(cls) -> Tuple[int, int, float, float]:
         all_items = list(DailyLedgerManager.load_all_history_items().values())
         settled = [
             i for i in all_items
-            if i.is_approved and i.date_str >= TRACKING_START_DATE and i.settlement in ["WON ✅", "LOST ❌"]
+            if i.is_approved
+            and not (i.is_lotto_combo or i.market_type == "lotto_parlay")
+            and i.date_str >= TRACKING_START_DATE
+            and i.settlement in ["WON ✅", "LOST ❌"]
         ]
         won = sum(1 for i in settled if "WON" in i.settlement)
         lost = sum(1 for i in settled if "LOST" in i.settlement)
         wr = (won / (won + lost) * 100.0) if (won + lost) > 0 else 0.0
-        net_u = 0.0
-        for i in settled:
-            if "WON" in i.settlement:
-                net_u += i.recommended_units * (i.odds - 1.0)
-            elif "LOST" in i.settlement:
-                net_u -= i.recommended_units
-        return won, lost, wr, net_u
-
-    @classmethod
-    def format_daily_batch_header_card(cls, date_str: str, items: List[LedgerBetItem]) -> str:
-        singles = [i for i in items if not i.is_combo]
-        combos = [i for i in items if i.is_combo]
-        tot_u = sum(i.recommended_units for i in items)
-        lines = [
-            f"📋 TODAY'S FULL BC.GAME BETTING SLATE — @Footybett ({date_str})",
-            "═════════════════════════════════════════",
-            f"📦 Daily Slate : {len(singles)} Single Bets (1.0u each) + {len(combos)} Safe Combo (0.5u)",
-            f"💰 Total Stake : {tot_u:.1f} Units (All picks posted together for bankroll management)",
-            "─────────────────────────────────────────"
-        ]
-        for idx, s in enumerate(singles, 1):
-            ko = f" ({s.kickoff_str})" if s.kickoff_str else ""
-            lines.append(f"{idx}️⃣ {s.team_home} vs {s.team_away}{ko}")
-            lines.append(f"   👉 {s.selection}  |  Odds: {s.odds:.2f} (1.0u)")
-        if combos:
-            c = combos[0]
-            lines.append("─────────────────────────────────────────")
-            lines.append(f"🎟️ SAFE CUSHION COMBO  |  Total Odds: {c.odds:.2f} (0.5u)")
-            for lg in (c.combo_legs or []):
-                lines.append(f"   • {lg['home']} vs {lg['away']} ➔ {lg['selection']} (@ {lg['odds']:.2f})")
-        lines.append("═════════════════════════════════════════")
-        lines.append("✅ Audited across betting.bc.game + 24 Tipster Channels + 8 Portals 👇")
-        return "\n".join(lines)
+        net_r = sum(BankrollStakeSizer.get_item_r_profit(i) for i in settled)
+        return won, lost, wr, round(net_r, 2)
 
     @classmethod
     def format_open_bet_card(cls, s: LedgerBetItem, pick_number: Optional[int] = None) -> str:
-        u_usd = BankrollStakeSizer.get_unit_usd()
-        stake_dlr = s.recommended_units * u_usd
-        ret_dlr = stake_dlr * s.odds
-        prof_dlr = ret_dlr - stake_dlr
+        r_usd = BankrollStakeSizer.get_unit_usd()
 
         if (s.is_lotto_combo or s.market_type == "lotto_parlay") and s.combo_legs:
             leg_lines = []
             for idx, lg in enumerate(s.combo_legs, 1):
                 leg_lines.append(f"{idx}. {lg['home']} vs {lg['away']} ➔ {lg['selection']} (@ {lg['odds']:.2f})")
             legs_block = "\n".join(leg_lines)
+            lotto_dlr = 5.0
+            ret_dlr = lotto_dlr * s.odds
             return (
-                f"🚀 DAILY ${stake_dlr:.0f} MEGA SAFE-LIST COMBO ({len(s.combo_legs)} Legs • {s.odds:.1f}x) — @Footybett\n"
+                f"🚀 BONUS $5 MEGA SAFE-LIST LOTTO ({len(s.combo_legs)} Legs • {s.odds:.1f}x) — @Footybett\n"
                 "────────────────────────\n"
                 f"{legs_block}\n"
                 "────────────────────────\n"
                 f"💰 Total Odds : {s.odds:.2f}x ({len(s.combo_legs)} Logical ~90% Cushions)\n"
-                f"💵 Stake Plan : ${stake_dlr:.0f} ({s.recommended_units:.2f}u • Small Risk / Big Return) ➔ Returns ${ret_dlr:.2f} (+${prof_dlr:.2f} Profit)\n"
-                f"🧠 Logic      : Zero random guesses — {len(s.combo_legs)} audited safe cushions (1X, X2, Over 1.5, Under 3.5) compounded into {s.odds:.1f}x."
+                f"🎟️ Fun Stake  : $5.00 ➔ Returns ${ret_dlr:.2f} (+${ret_dlr - lotto_dlr:.2f} Upside)\n"
+                f"ℹ️ Note       : Optional bonus lotto — excluded from Official 1R W-L & P&L record."
             )
+
+        rew_r = s.odds - 1.0
+        rew_dlr = rew_r * r_usd
+        tot_dlr = r_usd + rew_dlr
 
         if s.is_combo and s.combo_legs:
             leg_lines = []
@@ -2873,131 +3321,148 @@ class BetSlipCardFormatter:
                 "────────────────────────\n"
                 f"{legs_block}\n"
                 "────────────────────────\n"
-                f"💰 Total Odds : {s.odds:.2f}  |  🔥 Confidence: {conf_str}\n"
-                f"💵 Stake Plan : ${stake_dlr:.0f} ({s.recommended_units:.2f}u • 2-Leg Safe Cushion) ➔ Returns ${ret_dlr:.2f} (+${prof_dlr:.2f} Profit)\n"
-                f"🛡️ Cushion    : Strictly our Top 2 highest-confidence matches stepped down for maximum safety."
+                f"💰 Total Odds    : {s.odds:.2f}  |  🔥 Confidence: {conf_str}\n"
+                f"💵 Risk / Reward : Risk 1.00R (${r_usd:.0f}) ➔ Reward +{rew_r:.2f}R (+${rew_dlr:.2f} | Payout ${tot_dlr:.2f})\n"
+                f"🛡️ Cushion       : Strictly our Top 2 highest-confidence matches stepped down for maximum safety."
             )
 
         num_tag = f" #{pick_number}" if pick_number else ""
-        kickoff_line = f"\n⏰ Kickoff    : {s.kickoff_str}" if s.kickoff_str else ""
-        alt_line = f"\n🛡️ Safe Alt   : {s.alt_bcgame_line}" if s.alt_bcgame_line else ""
+        kickoff_line = f"\n⏰ Kickoff       : {s.kickoff_str}" if s.kickoff_str else ""
+        alt_line = f"\n🛡️ Safe Alt      : {s.alt_bcgame_line}" if s.alt_bcgame_line else ""
         conf_str = s.confidence_stars if "/" in s.confidence_stars else f"⭐️⭐️⭐️⭐️ ({min(9.5, max(8.2, round(s.model_prob / 8.5, 1))):.1f}/10)"
-        tier_lbl = getattr(s, "stake_tier_label", "") or "Core Single"
-        stake_line = BankrollStakeSizer.format_stake_plan_line(s.recommended_units, s.odds, tier_lbl)
+        stake_line = BankrollStakeSizer.format_stake_plan_line(1.0, s.odds, getattr(s, "stake_tier_label", "1R Play"))
         return (
             f"🟢 SINGLE BET{num_tag} — @Footybett\n"
             "────────────────────────\n"
-            f"⚽ Match      : {s.team_home} vs {s.team_away} ({s.match_context}){kickoff_line}\n"
-            f"🎯 BC.Game    : {s.selection}  (@ {s.odds:.2f})\n"
-            f"🔥 Confidence : {conf_str}\n"
-            f"💵 Stake Plan : {stake_line}{alt_line}\n"
-            f"📊 Audit      : {s.rationale}"
+            f"⚽ Match         : {s.team_home} vs {s.team_away} ({s.match_context}){kickoff_line}\n"
+            f"🎯 BC.Game       : {s.selection}  (@ {s.odds:.2f})\n"
+            f"🔥 Confidence    : {conf_str}\n"
+            f"💵 Risk / Reward : {stake_line}{alt_line}\n"
+            f"📊 Audit         : {s.rationale}"
         )
 
     @classmethod
     def format_closed_bet_card(cls, s: LedgerBetItem) -> str:
-        u_usd = BankrollStakeSizer.get_unit_usd()
-        won, lost, wr, net_u = cls.get_totals_summary_tuple()
+        r_usd = BankrollStakeSizer.get_unit_usd()
+        won, lost, wr, net_r = cls.get_totals_summary_tuple()
         is_lotto = s.is_lotto_combo or s.market_type == "lotto_parlay"
-        label = "LOTTO JACKPOT" if is_lotto else ("SAFE COMBO" if s.is_combo else "SINGLE BET")
+        if is_lotto:
+            ret_dlr = 5.0 * s.odds
+            return (
+                f"🎉 BONUS $5 LOTTO HIT (+${ret_dlr - 5.0:.2f}!) — @Footybett\n"
+                "────────────────────────\n"
+                f"🎟️ {s.selection} @ {s.odds:.2f}x ✅\n"
+                f"📈 Official 1R Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
+            )
+
+        label = "SAFE COMBO" if s.is_combo else "SINGLE BET"
         match_line = (
             f"🎟️ {s.score_str}"
             if s.is_combo
             else f"⚽ {s.team_home} vs {s.team_away} ➔ {s.score_str}"
         )
+        stats_line = f"\n📊 Match Details : {s.match_stats_summary}" if getattr(s, "match_stats_summary", "") else ""
+
         if "WON" in s.settlement:
-            prof_u = s.recommended_units * (s.odds - 1.0)
-            prof_dlr = prof_u * u_usd
+            prof_r = BankrollStakeSizer.get_item_r_profit(s)
+            prof_dlr = prof_r * r_usd
+            if getattr(s, "won_via_safe_alt", False) and getattr(s, "settled_note", ""):
+                bet_hit_line = f"🎯 {s.settled_note} ✅"
+                hdr_tag = f"✅ {label} WON (SAFE ALT HIT: +{prof_r:.2f}R / +${prof_dlr:.2f})"
+            else:
+                bet_hit_line = f"🎯 {s.selection} @ {s.odds:.2f} ✅"
+                hdr_tag = f"✅ {label} WON (+{prof_r:.2f}R / +${prof_dlr:.2f})"
             return (
-                f"✅ {label} WON (+${prof_dlr:.2f} / +{prof_u:.2f}u) — @Footybett\n"
+                f"{hdr_tag} — @Footybett\n"
                 "────────────────────────\n"
                 f"{match_line}\n"
-                f"🎯 {s.selection} @ {s.odds:.2f} ✅\n"
-                f"📈 Record : {won}W - {lost}L ({wr:.0f}%) | {net_u:+.2f}u (${net_u * u_usd:+.2f})"
+                f"{bet_hit_line}{stats_line}\n"
+                f"📈 Official Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
             )
         else:
-            loss_dlr = s.recommended_units * u_usd
             autopsy_line = f"\n{s.loss_autopsy}" if s.loss_autopsy else ""
             return (
-                f"❌ {label} LOST (-${loss_dlr:.2f} / -{s.recommended_units:.2f}u) — @Footybett\n"
+                f"❌ {label} LOST (-1.00R / -${r_usd:.2f}) — @Footybett\n"
                 "────────────────────────\n"
                 f"{match_line}\n"
-                f"🎯 {s.selection} @ {s.odds:.2f} ❌{autopsy_line}\n"
-                f"📈 Record : {won}W - {lost}L ({wr:.0f}%) | {net_u:+.2f}u (${net_u * u_usd:+.2f})"
+                f"🎯 {s.selection} @ {s.odds:.2f} ❌{stats_line}{autopsy_line}\n"
+                f"📈 Official Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
             )
 
     @classmethod
     def format_end_of_day_channel_recap(cls, target_date: str) -> str:
-        u_usd = BankrollStakeSizer.get_unit_usd()
+        r_usd = BankrollStakeSizer.get_unit_usd()
         all_items = list(DailyLedgerManager.load_all_history_items().values())
-        day_items = [i for i in all_items if i.date_str == target_date and i.is_approved]
-        day_items.sort(key=lambda x: (2 if (x.is_lotto_combo or x.market_type == "lotto_parlay") else (1 if x.is_combo else 0)))
+        # Strictly exclude unrated $5 Lotto tickets from Official End-of-Day W-L & R-Multiple Recap!
+        day_items = [
+            i for i in all_items
+            if i.date_str == target_date and i.is_approved and not (i.is_lotto_combo or i.market_type == "lotto_parlay")
+        ]
+        day_items.sort(key=lambda x: (1 if x.is_combo else 0))
 
         d_won = sum(1 for i in day_items if "WON" in i.settlement)
         d_lost = sum(1 for i in day_items if "LOST" in i.settlement)
-        d_net = 0.0
-        for i in day_items:
-            if "WON" in i.settlement:
-                d_net += i.recommended_units * (i.odds - 1.0)
-            elif "LOST" in i.settlement:
-                d_net -= i.recommended_units
+        d_net_r = sum(BankrollStakeSizer.get_item_r_profit(i) for i in day_items)
 
-        won_all, lost_all, wr_all, net_all = cls.get_totals_summary_tuple()
+        won_all, lost_all, wr_all, net_all_r = cls.get_totals_summary_tuple()
 
         lines = [
-            f"📊 END OF DAY RESULTS — @Footybett ({target_date})",
+            f"📊 END OF DAY 1R RESULTS — @Footybett ({target_date})",
             "────────────────────────"
         ]
         for idx, s in enumerate(day_items, 1):
-            is_lotto = s.is_lotto_combo or s.market_type == "lotto_parlay"
-            label = f"🚀 ${s.recommended_units * u_usd:.0f} LOTTO ({s.odds:.1f}x)" if is_lotto else ("🎟️ 2-LEG SAFE COMBO" if s.is_combo else f"⚽ {s.team_home} vs {s.team_away}")
-            sel_disp = f"{len(s.combo_legs or [])} Legs" if is_lotto else s.selection
+            label = "🎟️ 2-LEG SAFE COMBO" if s.is_combo else f"⚽ {s.team_home} vs {s.team_away}"
             if "WON" in s.settlement:
-                p_u = s.recommended_units * (s.odds - 1.0)
-                lines.append(f"{idx}. ✅ {label} ➔ {sel_disp} @ {s.odds:.2f} (+${p_u * u_usd:.2f} / +{p_u:.2f}u)")
+                p_r = BankrollStakeSizer.get_item_r_profit(s)
+                if getattr(s, "won_via_safe_alt", False) and getattr(s, "settled_note", ""):
+                    lines.append(f"{idx}. ✅ {label} ➔ {s.settled_note} (+{p_r:.2f}R / +${p_r * r_usd:.2f})")
+                else:
+                    lines.append(f"{idx}. ✅ {label} ➔ {s.selection} @ {s.odds:.2f} (+{p_r:.2f}R / +${p_r * r_usd:.2f})")
             elif "LOST" in s.settlement:
-                lines.append(f"{idx}. ❌ {label} ➔ {sel_disp} @ {s.odds:.2f} (-${s.recommended_units * u_usd:.2f} / -{s.recommended_units:.2f}u)")
-                if s.loss_autopsy and not is_lotto:
+                lines.append(f"{idx}. ❌ {label} ➔ {s.selection} @ {s.odds:.2f} (-1.00R / -${r_usd:.2f})")
+                if s.loss_autopsy:
                     lines.append(f"   ↳ {s.loss_autopsy}")
             else:
-                lines.append(f"{idx}. ➖ {label} ➔ {sel_disp} @ {s.odds:.2f} (PUSH / $0.00)")
+                lines.append(f"{idx}. ➖ {label} ➔ {s.selection} @ {s.odds:.2f} (0.00R / PUSH)")
+
+        # Mention Lotto ONLY if it actually WON as an unrated bonus celebration!
+        lotto_won = [
+            i for i in all_items
+            if i.date_str == target_date and (i.is_lotto_combo or i.market_type == "lotto_parlay") and "WON" in i.settlement
+        ]
+        if lotto_won:
+            lw = lotto_won[0]
+            lines.append(f"🎉 Bonus $5 Lotto HIT: {lw.odds:.2f}x (+${5.0 * (lw.odds - 1.0):.2f} Bonus — Unrated)")
 
         lines.extend([
             "────────────────────────",
-            f"📅 Day Result   : {d_won} Won ✅ | {d_lost} Lost ❌ ({d_net:+.2f}u / ${d_net * u_usd:+.2f})",
-            f"📈 Total Record : {won_all}W - {lost_all}L ({wr_all:.1f}% Win Rate)",
-            f"💰 Total Profit : {net_all:+.2f} Units ( @ ${u_usd:.0f}/u = ${net_all * u_usd:+.2f} )",
+            f"📅 Day R-Result : {d_won} Won ✅ | {d_lost} Lost ❌ ({d_net_r:+.2f}R / ${d_net_r * r_usd:+.2f})",
+            f"📈 Official W-L : {won_all}W - {lost_all}L ({wr_all:.1f}% Win Rate) [Lotto Excluded]",
+            f"💰 Total R-P&L  : {net_all_r:+.2f}R (1R = ${r_usd:.0f} Risk ➔ ${net_all_r * r_usd:+.2f} Net Profit)",
             "────────────────────────",
-            "🔔 Self-Learning Weights Updated • Next Slate Tomorrow"
+            "🔔 7-Model Weights Updated • Next Slate Tomorrow"
         ])
         return "\n".join(lines)
 
     @classmethod
     def format_clean_today_and_total(cls) -> str:
-        u_usd = BankrollStakeSizer.get_unit_usd()
+        r_usd = BankrollStakeSizer.get_unit_usd()
         active_date = DailyLedgerManager.get_active_date_str()
-        yesterday_date = DailyLedgerManager.get_yesterday_str()
         items = DailyLedgerManager.load_active_date_items()
-        y_items = DailyLedgerManager.load_yesterday_items()
-        singles = [i for i in items if not i.is_combo]
-        safe_combos = [i for i in items if i.is_combo and not (i.is_lotto_combo or i.market_type == "lotto_parlay")]
+        rated_items = [i for i in items if not (i.is_lotto_combo or i.market_type == "lotto_parlay")]
+        singles = [i for i in rated_items if not i.is_combo]
+        safe_combos = [i for i in rated_items if i.is_combo]
         lotto_combos = [i for i in items if i.is_lotto_combo or i.market_type == "lotto_parlay"]
-        won_all, lost_all, wr_all, net_all = cls.get_totals_summary_tuple()
+        won_all, lost_all, wr_all, net_all_r = cls.get_totals_summary_tuple()
 
-        d_won = sum(1 for i in items if "WON" in i.settlement)
-        d_lost = sum(1 for i in items if "LOST" in i.settlement)
-        d_open = len(items) - d_won - d_lost
-        d_net = 0.0
-        tot_day_stake_usd = sum(i.recommended_units * u_usd for i in items)
-        for i in items:
-            if "WON" in i.settlement:
-                d_net += i.recommended_units * (i.odds - 1.0)
-            elif "LOST" in i.settlement:
-                d_net -= i.recommended_units
+        d_won = sum(1 for i in rated_items if "WON" in i.settlement)
+        d_lost = sum(1 for i in rated_items if "LOST" in i.settlement)
+        d_open = len(rated_items) - d_won - d_lost
+        d_net_r = sum(BankrollStakeSizer.get_item_r_profit(i) for i in rated_items)
 
         lines = [
-            f"🎯 TODAY'S BC.GAME SLATE & BANKROLL PLAN ({active_date})",
-            f"💵 Base Unit: ${u_usd:.0f} (Change anytime via `/setunit 50`) | Deployed Today: ${tot_day_stake_usd:.0f}",
+            f"🎯 TODAY'S 1R BC.GAME SLATE ({active_date})",
+            f"💵 Risk Unit: 1.00R = ${r_usd:.0f} (Change via `/setunit 100`) | Active Risk: {len(rated_items)}.00R (${len(rated_items) * r_usd:.0f})",
             "────────────────────────"
         ]
 
@@ -3006,47 +3471,46 @@ class BetSlipCardFormatter:
                 st_icon = "✅ WON" if "WON" in s.settlement else ("❌ LOST" if "LOST" in s.settlement else "🟢 OPEN")
                 sc = f" | {s.score_str}" if s.score_str != "-" else ""
                 ko = f" [{s.kickoff_str}]" if s.kickoff_str else ""
-                st_dlr = s.recommended_units * u_usd
+                rew_r = s.odds - 1.0
                 lines.append(f"{idx}. [{st_icon}{sc}] {s.team_home} vs {s.team_away}{ko}")
                 lines.append(f"   🎯 {s.selection} @ {s.odds:.2f} | 🔥 {s.confidence_stars}")
-                lines.append(f"   💵 Bet ${st_dlr:.0f} ({s.recommended_units:.2f}u • {getattr(s, 'stake_tier_label', 'Single')}) ➔ Returns ${st_dlr * s.odds:.2f}")
+                lines.append(f"   💵 Risk 1.00R (${r_usd:.0f}) ➔ Reward +{rew_r:.2f}R (+${rew_r * r_usd:.2f})")
                 if s.alt_bcgame_line:
                     lines.append(f"   🛡️ Safe Alt: {s.alt_bcgame_line}")
+                if getattr(s, "won_via_safe_alt", False) and getattr(s, "settled_note", ""):
+                    lines.append(f"   ✅ Credited: {s.settled_note}")
         else:
             lines.append("• Waiting for 15:00 Local pre-match tipster & odds verification window.")
 
         if safe_combos:
             c = safe_combos[0]
             st_icon = "✅ WON" if "WON" in c.settlement else ("❌ LOST" if "LOST" in c.settlement else "🎟️ OPEN")
-            c_dlr = c.recommended_units * u_usd
+            rew_r = c.odds - 1.0
             lines.append("")
-            lines.append(f"🎟️ 2-LEG SAFE COMBO [{st_icon}] — Odds: {c.odds:.2f} | Bet ${c_dlr:.0f} ➔ Returns ${c_dlr * c.odds:.2f}:")
+            lines.append(f"🎟️ 2-LEG SAFE COMBO [{st_icon}] — Odds: {c.odds:.2f} | Risk 1.00R (${r_usd:.0f}) ➔ +{rew_r:.2f}R (+${rew_r * r_usd:.2f}):")
             for lg in (c.combo_legs or []):
                 lines.append(f"   • {lg['home']} vs {lg['away']} ➔ {lg['selection']} (@ {lg['odds']:.2f})")
 
         if lotto_combos:
             lc = lotto_combos[0]
-            st_icon = "✅ WON" if "WON" in lc.settlement else ("❌ LOST" if "LOST" in lc.settlement else "🚀 OPEN")
-            l_dlr = lc.recommended_units * u_usd
+            st_icon = "🎉 HIT" if "WON" in lc.settlement else ("⏳ ENDED" if "LOST" in lc.settlement else "🚀 OPEN")
             lines.append("")
-            lines.append(f"🚀 ${l_dlr:.0f} LOTTO JACKPOT [{st_icon}] — Odds: {lc.odds:.2f}x | Bet ${l_dlr:.0f} ➔ Returns ${l_dlr * lc.odds:.2f}:")
-            for lg in (lc.combo_legs or []):
-                lines.append(f"   • {lg['home']} vs {lg['away']} ➔ {lg['selection']} (@ {lg['odds']:.2f})")
+            lines.append(f"🚀 BONUS $5 LOTTO [{st_icon} • Unrated] — {lc.odds:.2f}x ({len(lc.combo_legs or [])} Legs | Excluded from W-L)")
 
         lines.extend([
             "",
-            f"📊 TOTAL RECORD (Since {TRACKING_START_DATE})",
+            f"📊 OFFICIAL 1R RECORD (Since {TRACKING_START_DATE} • Lotto Excluded)",
             "────────────────────────",
-            f"• Today : {d_won}W - {d_lost}L ({d_open} Open) | {d_net:+.2f}u (${d_net * u_usd:+.2f})",
-            f"• Total : {won_all}W - {lost_all}L ({wr_all:.1f}%) | {net_all:+.2f}u (${net_all * u_usd:+.2f})",
-            "• Engine: v28.2 6-Model Sharp Veto + 22 Portals + 30 Channels"
+            f"• Today : {d_won}W - {d_lost}L ({d_open} Open) | {d_net_r:+.2f}R (${d_net_r * r_usd:+.2f})",
+            f"• Total : {won_all}W - {lost_all}L ({wr_all:.1f}%) | {net_all_r:+.2f}R (${net_all_r * r_usd:+.2f})",
+            "• Engine: v30.0 7-Model Real-GF/GA + Over 2.0 Cushion + Safe-Alt Credit"
         ])
         return "\n".join(lines)
 
 
 class InstantCustomBetAuditor:
     """
-    v28.2 Instant Custom Bet & Image Slip Auditor:
+    v30.0 Instant Custom Bet & Image Slip Auditor:
     When the user sends any match name, bet slip text, or screenshot image of a bet to the bot,
     this engine cross-checks the match across all 24+ Telegram tipster channels, 9 analytics portals
     (including betting.bc.game & API-Football /predictions), and our 5-Model Quantitative Engine
@@ -3207,7 +3671,7 @@ class InstantCustomBetAuditor:
 
 class BetSlipImageOCRAndVisionAnalyzer:
     """
-    v28.2 Multi-Engine Bet Slip Image Reader:
+    v30.0 Multi-Engine Bet Slip Image Reader:
     Extracts match names, bet markets, and odds from user-uploaded screenshot images using:
       1. Gemini Vision API (`GEMINI_API_KEY` / `GOOGLE_API_KEY` if set on server)
       2. Local `tesseract` OCR CLI (if installed on server)
@@ -3311,7 +3775,18 @@ class TelegramBotClient:
         DailyLedgerManager.load_all_history_items()
         SelfLearningEngine.recalibrate_from_ledger()
 
-    def send_message(self, chat_id: Any, text: str, remove_kb: bool = True) -> bool:
+    def send_message(
+        self,
+        chat_id: Any,
+        text: str,
+        remove_kb: bool = True,
+        reply_to_message_id: Optional[int] = None
+    ) -> Optional[int]:
+        """
+        Sends a Telegram message and returns the integer `message_id` on success (`None` on failure).
+        Supports native Telegram reply-tagging via `reply_parameters` so closed win/loss cards
+        directly tag & highlight the original Open Bet post in `@Footybett`!
+        """
         url = f"{self.base_url}/sendMessage"
         payload_data: Dict[str, Any] = {
             "chat_id": chat_id,
@@ -3319,15 +3794,23 @@ class TelegramBotClient:
         }
         if remove_kb and isinstance(chat_id, int) and chat_id > 0:
             payload_data["reply_markup"] = self.REMOVE_BOTTOM_KEYBOARD
+        if reply_to_message_id and int(reply_to_message_id) > 0:
+            payload_data["reply_parameters"] = {
+                "message_id": int(reply_to_message_id),
+                "allow_sending_without_reply": True
+            }
 
         payload = json.dumps(payload_data).encode("utf-8")
         req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
-                return resp.status == 200
+                if resp.status == 200:
+                    body = json.loads(resp.read().decode("utf-8"))
+                    return int(body.get("result", {}).get("message_id") or 1)
+                return None
         except Exception as e:
             logger.error("Failed to send Telegram message to %s: %s", chat_id, e)
-            return False
+            return None
 
     def sync_and_publish_to_footybett(self) -> int:
         with self.channel_publish_lock:
@@ -3341,9 +3824,6 @@ class TelegramBotClient:
 
             ordered_items = sorted(all_items.items(), key=lambda kv: (2 if (kv[1].is_lotto_combo or kv[1].market_type == "lotto_parlay") else (1 if kv[1].is_combo else 0)))
 
-            # STRICT SINGLE DAILY BATCH PUBLISH (v28.2):
-            # Only publishes today's open picks ONCE in a single batch, then locks `daily_batch_locked_v26:{active_date}`
-            # so the channel NEVER receives fragmented or repeated open bet batches later in the day!
             batch_lock_key = f"daily_batch_locked_v26:{active_date}"
             today_pending = [
                 (fk, it) for fk, it in ordered_items
@@ -3360,8 +3840,11 @@ class TelegramBotClient:
                         open_card = BetSlipCardFormatter.format_open_bet_card(it, pick_number=single_idx)
                     else:
                         open_card = BetSlipCardFormatter.format_open_bet_card(it)
-                    if self.send_message(PUBLISH_CHANNEL_ID, open_card, remove_kb=False):
+                    msg_id = self.send_message(PUBLISH_CHANNEL_ID, open_card, remove_kb=False)
+                    if msg_id:
                         it.published_to_channel = True
+                        if msg_id > 1:
+                            it.channel_message_id = msg_id
                         DailyLedgerManager.mark_locked_in_channel(pick_lock_key)
                         if it.is_lotto_combo or it.market_type == "lotto_parlay":
                             DailyLedgerManager.mark_locked_in_channel(lotto_lock_key)
@@ -3369,12 +3852,14 @@ class TelegramBotClient:
                         updated = True
                         time.sleep(1.0)
             else:
-                # If main batch already published earlier today without the $5 Lotto Jackpot, publish the Lotto Jackpot once!
                 for fk, it in today_pending:
                     if (it.is_lotto_combo or it.market_type == "lotto_parlay") and not DailyLedgerManager.is_locked_in_channel(lotto_lock_key):
                         open_card = BetSlipCardFormatter.format_open_bet_card(it)
-                        if self.send_message(PUBLISH_CHANNEL_ID, open_card, remove_kb=False):
+                        msg_id = self.send_message(PUBLISH_CHANNEL_ID, open_card, remove_kb=False)
+                        if msg_id:
                             it.published_to_channel = True
+                            if msg_id > 1:
+                                it.channel_message_id = msg_id
                             DailyLedgerManager.mark_locked_in_channel(f"pick_v26:{fk}")
                             DailyLedgerManager.mark_locked_in_channel(lotto_lock_key)
                             published_count += 1
@@ -3385,12 +3870,24 @@ class TelegramBotClient:
                 if not item.is_approved or item.date_str < TRACKING_START_DATE:
                     continue
                 pick_lock_key = f"pick_v26:{full_key}"
-                result_lock_key = f"result:{full_key}" 
+                result_lock_key = f"result:{full_key}"
+                is_lotto = item.is_lotto_combo or item.market_type == "lotto_parlay"
 
                 if item.settlement in ["WON ✅", "LOST ❌"]:
                     if not item.published_result_to_channel and not DailyLedgerManager.is_locked_in_channel(result_lock_key):
+                        # Never clutter channel or W-L feed when an unrated $5 Lotto misses; only celebrate if it HITS!
+                        if is_lotto and "LOST" in item.settlement:
+                            item.published_result_to_channel = True
+                            DailyLedgerManager.mark_locked_in_channel(result_lock_key)
+                            updated = True
+                            continue
                         close_card = BetSlipCardFormatter.format_closed_bet_card(item)
-                        if self.send_message(PUBLISH_CHANNEL_ID, close_card, remove_kb=False):
+                        if self.send_message(
+                            PUBLISH_CHANNEL_ID,
+                            close_card,
+                            remove_kb=False,
+                            reply_to_message_id=getattr(item, "channel_message_id", None)
+                        ):
                             item.published_to_channel = True
                             item.published_result_to_channel = True
                             DailyLedgerManager.mark_locked_in_channel(pick_lock_key)
@@ -3404,9 +3901,13 @@ class TelegramBotClient:
             for check_d in sorted({yesterday_date, active_date}):
                 if check_d < TRACKING_START_DATE:
                     continue
+                # Only count Official Rated Picks (exclude unrated $5 Lotto) for End-of-Day Recap readiness!
                 day_picks = [
                     i for i in all_items.values()
-                    if i.date_str == check_d and i.is_approved and i.published_to_channel
+                    if i.date_str == check_d
+                    and i.is_approved
+                    and i.published_to_channel
+                    and not (i.is_lotto_combo or i.market_type == "lotto_parlay")
                 ]
                 if not day_picks:
                     continue
@@ -3414,7 +3915,7 @@ class TelegramBotClient:
                 if len(settled_day) == len(day_picks) and len(settled_day) >= 2:
                     w_cnt = sum(1 for i in settled_day if "WON" in i.settlement)
                     l_cnt = sum(1 for i in settled_day if "LOST" in i.settlement)
-                    eod_lock_key = f"eod_recap_v2:{check_d}:{w_cnt}W_{l_cnt}L"
+                    eod_lock_key = f"eod_recap_v29_1R:{check_d}:{w_cnt}W_{l_cnt}L"
                     if not DailyLedgerManager.is_locked_in_channel(eod_lock_key):
                         recap_card = BetSlipCardFormatter.format_end_of_day_channel_recap(check_d)
                         if self.send_message(PUBLISH_CHANNEL_ID, recap_card, remove_kb=False):
@@ -3437,7 +3938,7 @@ class TelegramBotClient:
             return []
 
     def background_worker_loop(self):
-        logger.info("Footybett v28.2 Deep Match-Autopsy Worker started...")
+        logger.info("Footybett v30.0 Deep Match-Autopsy Worker started...")
         time.sleep(3)
         while True:
             try:
@@ -3473,7 +3974,7 @@ class TelegramBotClient:
         watcher_thread = threading.Thread(target=self.background_worker_loop, daemon=True)
         watcher_thread.start()
 
-        logger.info("Bot listener running (v28.2 Self-Learning + Image/Text Bet Auditor + Channel Manager)...")
+        logger.info("Bot listener running (v30.0 Self-Learning + Image/Text Bet Auditor + Channel Manager)...")
         offset = None
 
         while True:
@@ -3566,12 +4067,10 @@ class TelegramBotClient:
                         val_u = BankrollStakeSizer.set_unit_usd(float(arg_u))
                         self.send_message(
                             chat_id,
-                            f"✅ Base 1.0u stake updated to `${val_u:.0f}`!\n"
-                            f"• Tier 1 Max Banker (1.2u) = `${val_u * 1.2:.0f}`\n"
-                            f"• Tier 2 Core Single (1.0u) = `${val_u * 1.0:.0f}`\n"
-                            f"• Tier 3 Measured Single (0.7u) = `${val_u * 0.7:.0f}`\n"
-                            f"• 2-Leg Safe Combo (0.5u) = `${val_u * 0.5:.0f}`\n"
-                            f"• 10x–20x Lotto Jackpot (0.1u) = `${val_u * 0.1:.0f}`"
+                            f"✅ Official 1.00R Risk Unit updated to `${val_u:.0f}`!\n"
+                            f"• Every Rated Single & Safe Combo = `1.00R (${val_u:.0f} Risk)`\n"
+                            f"• Reward = `(Odds - 1.0) × 1R` (e.g. @ 1.68 = `+0.68R / +${val_u * 0.68:.2f}`)\n"
+                            f"• Bonus $5 Lotto = Unrated & Excluded from Official W-L / R Record"
                         )
                     except Exception:
                         cur_u = BankrollStakeSizer.get_unit_usd()
