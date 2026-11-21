@@ -1,9 +1,9 @@
 """
 Telegram Pro Football Betting Syndicate — Deep Match-Autopsy Self-Learning Engine
-& Automatic End-of-Day Channel Recap Publisher (v30.0 Final Production Release)
+& Automatic End-of-Day Channel Recap Publisher (v30.1 Final Production Release)
 (@betyyyybot -> @Footybett)
 
-What's New in v30.0 (True Match-Stats Autopsy & Root-Cause Learning):
+What's New in v30.1 (True Match-Stats Autopsy & Root-Cause Learning):
 1. Deep Post-Match Boxscore Autopsy (`LiveSportsbookAndStatsAPI.fetch_match_autopsy_stats`):
    - Whenever a bet settles as LOST ❌, the bot queries ESPN's full Match Summary API (`/summary?event=<id>`)
      to inspect WHAT ACTUALLY HAPPENED on the pitch:
@@ -349,7 +349,7 @@ class LedgerBetItem:
 
 class BankrollStakeSizer:
     """
-    v30.0 Prop-Style R-Multiple Risk/Reward Bankroll Sizer:
+    v30.1 Prop-Style R-Multiple Risk/Reward Bankroll Sizer:
     1.00R = $100.00 Risk on every rated bet. Reward is expressed directly in R and $
     (e.g. @ 1.68 odds -> Risk: 1.00R ($100) | Reward: +0.68R (+$68.00)).
     Bonus $5 Lotto tickets are unrated fun plays and 100% excluded from Official W-L & R totals!
@@ -390,10 +390,19 @@ class BankrollStakeSizer:
             return item.settled_odds
         return item.odds
 
+    @staticmethod
+    def is_optional_combo_or_lotto(item: LedgerBetItem) -> bool:
+        """Returns True for both 2-Leg Safe Combos and $5 Mega Lottos (excluded from Official Singles W-L & P&L)."""
+        return bool(
+            item.is_combo
+            or item.is_lotto_combo
+            or item.market_type in ("daily_parlay", "lotto_parlay")
+        )
+
     @classmethod
     def get_item_r_profit(cls, item: LedgerBetItem) -> float:
-        """Returns net R-multiple (+R on win, -1.00R on loss, 0.00R on push/lotto)."""
-        if item.is_lotto_combo or item.market_type == "lotto_parlay":
+        """Returns Official Singles net R-multiple (+R on win, -1.00R on loss, 0.00R on push or optional combos/lottos)."""
+        if cls.is_optional_combo_or_lotto(item):
             return 0.0
         r_risk = 1.0
         if "WON" in item.settlement:
@@ -502,7 +511,7 @@ class DailyLedgerManager:
 
 class SelfLearningEngine:
     """
-    Deep Match-Autopsy & Root-Cause Self-Learning Engine (v30.0):
+    Deep Match-Autopsy & Root-Cause Self-Learning Engine (v30.1):
     1. Inspects actual post-match boxscore stats (Shots, Shots on Target, Possession %, Red Cards, Corners)
        fetched via `LiveSportsbookAndStatsAPI.fetch_match_autopsy_stats(event_id)` whenever a pick loses.
     2. Diagnoses WHY the prediction failed (`diagnose_loss_root_cause`) across 5 distinct root causes:
@@ -645,7 +654,7 @@ class SelfLearningEngine:
         all_items = list(DailyLedgerManager.load_all_history_items().values())
         settled = [
             i for i in all_items
-            if i.is_approved and not (i.is_lotto_combo or i.market_type == "lotto_parlay") and i.settlement in ["WON ✅", "LOST ❌"]
+            if i.is_approved and not BankrollStakeSizer.is_optional_combo_or_lotto(i) and i.settlement in ["WON ✅", "LOST ❌"]
         ]
 
         strat_stats: Dict[str, Dict[str, Any]] = {}
@@ -745,7 +754,7 @@ class SelfLearningEngine:
         lessons = st.get("lessons_learned", [])
 
         lines = [
-            "🧠 DEEP MATCH-AUTOPSY & SELF-LEARNING ENGINE (v30.0)",
+            "🧠 DEEP MATCH-AUTOPSY & SELF-LEARNING ENGINE (v30.1)",
             "────────────────────────"
         ]
         if strats:
@@ -770,7 +779,7 @@ class SelfLearningEngine:
 
 class ChannelBuzzRadar:
     """
-    v30.0 Priority Signal Extractor:
+    v30.1 Priority Signal Extractor:
     Specifically prioritises `@bomb_footballsignals` (9/10 hit-rate feed) + 23 sharp Telegram
     tipster channels. Parses both the exact match teams AND the exact market recommended!
     """
@@ -1135,7 +1144,7 @@ class LiveSportsbookAndStatsAPI:
         tot_corners: Optional[int] = None
     ) -> str:
         """
-        STRICT FULL-TIME (FT) VAR-SAFE GRADING (v30.0):
+        STRICT FULL-TIME (FT) VAR-SAFE GRADING (v30.1):
         1. NEVER settles any bet while `is_finished` is False (prevents false wins when VAR
            disallows a live goal like Greece's cancelled 25' goal vs Netherlands).
         2. Checks `X2` vs `1X` and exact Away vs Home target team so `Burgos to Win` or
@@ -1359,7 +1368,7 @@ class LiveSportsbookAndStatsAPI:
                     item.settled_odds = item.odds
                     item.settled_note = ""
 
-                # v30.0 SAFE ALT WIN CREDIT:
+                # v30.1 SAFE ALT WIN CREDIT:
                 # If Primary PUSHED or MISSED at Full Time, check if `🛡️ Safe Alt` (`item.alt_bcgame_line`) HIT!
                 # If the bot recommended it in Safe Alt and it hit (e.g. Metz vs Boulogne Under 3.5 @ 1.30), count it as WON ✅!
                 if is_finished and primary_res in ["PUSH ➖", "LOST ❌"] and item.alt_bcgame_line:
@@ -1429,7 +1438,7 @@ class LiveSportsbookAndStatsAPI:
 
 class ExternalAnalyticsCollector:
     """
-    v30.0 Multi-Site Football Analytics Scraper & Aggregator:
+    v30.1 Multi-Site Football Analytics Scraper & Aggregator:
     Collects quantitative match projections, team goal averages, H2H goal history, Elo ratings,
     and mathematical Over/Under tips from public analytics portals & feeds:
       1. ESPN Pre-Match Summary API (`/summary?event={id}`): Extracts actual Goals Scored/Game (`GF/gm`),
@@ -1641,7 +1650,7 @@ class ExternalAnalyticsCollector:
         nb_c: Dict[str, float]
     ) -> Dict[str, float]:
         """
-        v30.0 BC.Game Accurate Odds Engine:
+        v30.1 BC.Game Accurate Odds Engine:
         1. Queries API-Football `/odds?fixture={id}` (using 1xBet / Bet365 / Pinnacle feeds which
            match BC.Game's Betby sportsbook feed within +-0.02) + ESPN live bookmaker odds.
         2. Derives any missing linked market (`Draw No Bet`, `Double Chance 1X/X2`, `Over 1.5`,
@@ -1989,7 +1998,7 @@ class ExternalAnalyticsCollector:
 
 class QuantitativeEnsembleModels:
     """
-    v30.0 4-Model Institutional Football Syndicate Ensemble:
+    v30.1 4-Model Institutional Football Syndicate Ensemble:
       1. Dixon-Coles (1997) Bivariate Poisson Scoreline Matrix (calculates exact 8x8 scoreline
          probabilities with low-score correlation tau adjustment rho = -0.11).
       2. Negative Binomial / Gamma-Poisson Wing-Pressure Corner Model (projects expected match
@@ -2108,7 +2117,7 @@ class QuantitativeEnsembleModels:
                 lam_h *= h2h_scale
                 lam_a *= h2h_scale
 
-        # v30.0 LEAKY-DEFENSE VS TRUE-DRAW SEPARATION:
+        # v30.1 LEAKY-DEFENSE VS TRUE-DRAW SEPARATION:
         # High draws + low losses = Genuine compact defensive teams (0-0 / 1-0 / 1-1).
         # High losses + few draws (e.g. Estonia vs Bulgaria, Kazakhstan vs Slovakia) = LEAKY DEFENSES -> Boost goals!
         combined_loss_rate = h_loss_rate + a_loss_rate
@@ -2225,7 +2234,7 @@ class QuantitativeEnsembleModels:
 
 class GeminiDeepReasoningEngine:
     """
-    v30.0 Multi-Expert Consensus & "Anything Can Happen in Football" Chaos Reasoning Engine:
+    v30.1 Multi-Expert Consensus & "Anything Can Happen in Football" Chaos Reasoning Engine:
     • Integrates Google Gemini 2.5 Pro / 2.5 Flash (`gemini-2.5-pro` / `gemini-2.5-flash`) via REST API
       when `GEMINI_API_KEY` or `GOOGLE_API_KEY` is configured on the server, paired with our built-in
       Autonomous Football Game-Script & Chaos Stress-Test Reasoner.
@@ -2524,7 +2533,7 @@ class GeminiDeepReasoningEngine:
 
 class SafeCushionBetCreator:
     """
-    Self-Learning & Chaos-Reasoned BC.Game Market Selector (v30.0):
+    Self-Learning & Chaos-Reasoned BC.Game Market Selector (v30.1):
     Combines 65+ Expert & Analytical Sources, 4 Quantitative Models, Post-Match Boxscore Self-Learning,
     and `GeminiDeepReasoningEngine` ("Anything Can Happen in Football" Chaos Stress-Tester).
     """
@@ -2656,7 +2665,7 @@ class SafeCushionBetCreator:
         )
         consensus_boost = min(11.0, expert_sources_count * 2.0)
 
-        # ── Run v30.0 Gemini Deep Reasoning & "Anything Can Happen" Chaos Stress-Test ──
+        # ── Run v30.1 Gemini Deep Reasoning & "Anything Can Happen" Chaos Stress-Test ──
         reasoned = GeminiDeepReasoningEngine.evaluate_match_game_script(
             home, away, league_label, slug, h_form, a_form,
             h_win_rate, a_win_rate, h_loss_rate, a_loss_rate,
@@ -2928,7 +2937,7 @@ class SafeCushionBetCreator:
     @classmethod
     def build_logical_mega_cushion_leg_for_match(cls, m: Dict[str, Any], date_str: str, buzz_teams: Set[str]) -> Optional[Tuple[float, Dict[str, Any]]]:
         """
-        v30.0 Logical Mega-Accumulator Cushion Selector (10 to 16+ Legs):
+        v30.1 Logical Mega-Accumulator Cushion Selector (10 to 16+ Legs):
         NO random high-odds guesses! Evaluates every upcoming fixture across our 32 verified Men's leagues
         (up to 48h ahead) and ONLY selects matches that have a genuine ~85%–94% logical safety cushion:
           • Dominant Home Side (`p_home_1x >= 83%`, `h_recent_l <= 1`) -> `Double Chance ➔ {Home} or Draw (1X)` (@ ~1.18–1.28)
@@ -3263,26 +3272,28 @@ class SafeCushionBetCreator:
 
 class BetSlipCardFormatter:
     """
-    v30.0 Prop-Style 1R = $100 Risk/Reward Card Formatter:
-    • Excludes unrated $5 Lotto tickets from Official W-L & R-Multiple totals.
-    • Credits Safe Alt hits (`won_via_safe_alt`) as Official Wins (+R).
-    • Includes full post-match boxscore stats & supports native Telegram reply-tagging.
+    v30.1 Singles-Only Official Record + Explicit Optional Combo/Lotto W/L Formatter:
+    • Official W-L, Win Rate %, and R-Multiple / $ Net Profit count ONLY Official Singles (`not is_combo`).
+    • Optional 2-Leg Safe Combos and Optional $5 Mega Lottos still report their explicit W or L status
+      on settlement reply cards and in a dedicated Optional Bonus section of the End-of-Day Recap,
+      without inflating or hurting the Official Singles calculation!
+    • Credits Safe Alt hits (`won_via_safe_alt`) on Singles as Official Wins (+R).
     """
 
     @classmethod
     def get_totals_summary_tuple(cls) -> Tuple[int, int, float, float]:
         all_items = list(DailyLedgerManager.load_all_history_items().values())
-        settled = [
+        settled_singles = [
             i for i in all_items
             if i.is_approved
-            and not (i.is_lotto_combo or i.market_type == "lotto_parlay")
+            and not BankrollStakeSizer.is_optional_combo_or_lotto(i)
             and i.date_str >= TRACKING_START_DATE
             and i.settlement in ["WON ✅", "LOST ❌"]
         ]
-        won = sum(1 for i in settled if "WON" in i.settlement)
-        lost = sum(1 for i in settled if "LOST" in i.settlement)
+        won = sum(1 for i in settled_singles if "WON" in i.settlement)
+        lost = sum(1 for i in settled_singles if "LOST" in i.settlement)
         wr = (won / (won + lost) * 100.0) if (won + lost) > 0 else 0.0
-        net_r = sum(BankrollStakeSizer.get_item_r_profit(i) for i in settled)
+        net_r = sum(BankrollStakeSizer.get_item_r_profit(i) for i in settled_singles)
         return won, lost, wr, round(net_r, 2)
 
     @classmethod
@@ -3297,13 +3308,13 @@ class BetSlipCardFormatter:
             lotto_dlr = 5.0
             ret_dlr = lotto_dlr * s.odds
             return (
-                f"🚀 BONUS $5 MEGA SAFE-LIST LOTTO ({len(s.combo_legs)} Legs • {s.odds:.1f}x) — @Footybett\n"
+                f"🚀 OPTIONAL $5 MEGA SAFE-LIST LOTTO ({len(s.combo_legs)} Legs • {s.odds:.1f}x) — @Footybett\n"
                 "────────────────────────\n"
                 f"{legs_block}\n"
                 "────────────────────────\n"
                 f"💰 Total Odds : {s.odds:.2f}x ({len(s.combo_legs)} Logical ~90% Cushions)\n"
                 f"🎟️ Fun Stake  : $5.00 ➔ Returns ${ret_dlr:.2f} (+${ret_dlr - lotto_dlr:.2f} Upside)\n"
-                f"ℹ️ Note       : Optional bonus lotto — excluded from Official 1R W-L & P&L record."
+                f"ℹ️ Note       : Optional bonus lotto — W/L reported separately & excluded from Official Singles W-L."
             )
 
         rew_r = s.odds - 1.0
@@ -3316,14 +3327,16 @@ class BetSlipCardFormatter:
                 leg_lines.append(f"{idx}️⃣ {lg['home']} vs {lg['away']} ➔ {lg['selection']} (@ {lg['odds']:.2f})")
             legs_block = "\n".join(leg_lines)
             conf_str = s.confidence_stars if "/" in s.confidence_stars else "⭐️⭐️⭐️⭐️⭐️ (9.5/10)"
+            opt_stake = round(r_usd * 0.50, 0)
+            opt_win = opt_stake * rew_r
             return (
-                "🎟️ DAILY 2-LEG SAFE COMBO — @Footybett\n"
+                "🎟️ OPTIONAL 2-LEG SAFE COMBO — @Footybett\n"
                 "────────────────────────\n"
                 f"{legs_block}\n"
                 "────────────────────────\n"
                 f"💰 Total Odds    : {s.odds:.2f}  |  🔥 Confidence: {conf_str}\n"
-                f"💵 Risk / Reward : Risk 1.00R (${r_usd:.0f}) ➔ Reward +{rew_r:.2f}R (+${rew_dlr:.2f} | Payout ${tot_dlr:.2f})\n"
-                f"🛡️ Cushion       : Strictly our Top 2 highest-confidence matches stepped down for maximum safety."
+                f"💵 Optional Plan : ${opt_stake:.0f} Optional Cushion ➔ +${opt_win:.2f} Profit (Payout ${opt_stake + opt_win:.2f})\n"
+                f"ℹ️ Note          : Safer cushion built from today's Singles — W/L reported separately & excluded from Official Singles Record."
             )
 
         num_tag = f" #{pick_number}" if pick_number else ""
@@ -3346,21 +3359,53 @@ class BetSlipCardFormatter:
         r_usd = BankrollStakeSizer.get_unit_usd()
         won, lost, wr, net_r = cls.get_totals_summary_tuple()
         is_lotto = s.is_lotto_combo or s.market_type == "lotto_parlay"
-        if is_lotto:
-            ret_dlr = 5.0 * s.odds
-            return (
-                f"🎉 BONUS $5 LOTTO HIT (+${ret_dlr - 5.0:.2f}!) — @Footybett\n"
-                "────────────────────────\n"
-                f"🎟️ {s.selection} @ {s.odds:.2f}x ✅\n"
-                f"📈 Official 1R Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
-            )
 
-        label = "SAFE COMBO" if s.is_combo else "SINGLE BET"
-        match_line = (
-            f"🎟️ {s.score_str}"
-            if s.is_combo
-            else f"⚽ {s.team_home} vs {s.team_away} ➔ {s.score_str}"
-        )
+        # 1. Optional $5 Mega Lotto Result Card (Reports W or L clearly, Excluded from Official Singles W-L)
+        if is_lotto:
+            if "WON" in s.settlement:
+                ret_dlr = 5.0 * s.odds
+                return (
+                    f"🎉 OPTIONAL $5 LOTTO — WON ✅ (+${ret_dlr - 5.0:.2f} Upside!) — @Footybett\n"
+                    "────────────────────────\n"
+                    f"🚀 Result : W ✅ ({s.selection} @ {s.odds:.2f}x)\n"
+                    f"ℹ️ Note   : Optional Bonus Hit (Excluded from Official Singles Calculation)\n"
+                    f"📈 Official Singles Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
+                )
+            else:
+                missed_detail = f"\n🔎 Status : {s.score_str}" if s.score_str and s.score_str != "-" else ""
+                return (
+                    f"❌ OPTIONAL $5 LOTTO — LOST ❌ ($5.00 Fun Ticket) — @Footybett\n"
+                    "────────────────────────\n"
+                    f"🚀 Result : L ❌ ({s.selection} @ {s.odds:.2f}x){missed_detail}\n"
+                    f"ℹ️ Note   : Optional Bonus Ticket — Excluded from Official Singles W-L & P&L\n"
+                    f"📈 Official Singles Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
+                )
+
+        # 2. Optional 2-Leg Safe Combo Result Card (Reports W or L clearly, Excluded from Official Singles W-L)
+        if s.is_combo:
+            opt_stake = round(r_usd * 0.50, 0)
+            if "WON" in s.settlement:
+                opt_win = opt_stake * (s.odds - 1.0)
+                return (
+                    f"✅ OPTIONAL 2-LEG SAFE COMBO — WON ✅ (+${opt_win:.2f} Optional) — @Footybett\n"
+                    "────────────────────────\n"
+                    f"🎟️ Result : W ✅ ({s.score_str})\n"
+                    f"🎯 Ticket : {s.selection} @ {s.odds:.2f} ✅\n"
+                    f"ℹ️ Note   : Optional Combo Hit — Excluded from Official Singles W-L & P&L\n"
+                    f"📈 Official Singles Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
+                )
+            else:
+                return (
+                    f"❌ OPTIONAL 2-LEG SAFE COMBO — LOST ❌ (Optional Cushion) — @Footybett\n"
+                    "────────────────────────\n"
+                    f"🎟️ Result : L ❌ ({s.score_str})\n"
+                    f"🎯 Ticket : {s.selection} @ {s.odds:.2f} ❌\n"
+                    f"ℹ️ Note   : Optional Combo — Excluded from Official Singles W-L & P&L\n"
+                    f"📈 Official Singles Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
+                )
+
+        # 3. Official Single Bet Result Card (Counts in Official Singles W-L & 1R P&L)
+        match_line = f"⚽ {s.team_home} vs {s.team_away} ➔ {s.score_str}"
         stats_line = f"\n📊 Match Details : {s.match_stats_summary}" if getattr(s, "match_stats_summary", "") else ""
 
         if "WON" in s.settlement:
@@ -3368,50 +3413,57 @@ class BetSlipCardFormatter:
             prof_dlr = prof_r * r_usd
             if getattr(s, "won_via_safe_alt", False) and getattr(s, "settled_note", ""):
                 bet_hit_line = f"🎯 {s.settled_note} ✅"
-                hdr_tag = f"✅ {label} WON (SAFE ALT HIT: +{prof_r:.2f}R / +${prof_dlr:.2f})"
+                hdr_tag = f"✅ SINGLE BET WON (SAFE ALT HIT: +{prof_r:.2f}R / +${prof_dlr:.2f})"
             else:
                 bet_hit_line = f"🎯 {s.selection} @ {s.odds:.2f} ✅"
-                hdr_tag = f"✅ {label} WON (+{prof_r:.2f}R / +${prof_dlr:.2f})"
+                hdr_tag = f"✅ SINGLE BET WON (+{prof_r:.2f}R / +${prof_dlr:.2f})"
             return (
                 f"{hdr_tag} — @Footybett\n"
                 "────────────────────────\n"
                 f"{match_line}\n"
                 f"{bet_hit_line}{stats_line}\n"
-                f"📈 Official Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
+                f"📈 Official Singles Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
             )
         else:
             autopsy_line = f"\n{s.loss_autopsy}" if s.loss_autopsy else ""
             return (
-                f"❌ {label} LOST (-1.00R / -${r_usd:.2f}) — @Footybett\n"
+                f"❌ SINGLE BET LOST (-1.00R / -${r_usd:.2f}) — @Footybett\n"
                 "────────────────────────\n"
                 f"{match_line}\n"
                 f"🎯 {s.selection} @ {s.odds:.2f} ❌{stats_line}{autopsy_line}\n"
-                f"📈 Official Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
+                f"📈 Official Singles Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
             )
 
     @classmethod
     def format_end_of_day_channel_recap(cls, target_date: str) -> str:
         r_usd = BankrollStakeSizer.get_unit_usd()
         all_items = list(DailyLedgerManager.load_all_history_items().values())
-        # Strictly exclude unrated $5 Lotto tickets from Official End-of-Day W-L & R-Multiple Recap!
-        day_items = [
-            i for i in all_items
-            if i.date_str == target_date and i.is_approved and not (i.is_lotto_combo or i.market_type == "lotto_parlay")
-        ]
-        day_items.sort(key=lambda x: (1 if x.is_combo else 0))
 
-        d_won = sum(1 for i in day_items if "WON" in i.settlement)
-        d_lost = sum(1 for i in day_items if "LOST" in i.settlement)
-        d_net_r = sum(BankrollStakeSizer.get_item_r_profit(i) for i in day_items)
+        day_singles = [
+            i for i in all_items
+            if i.date_str == target_date and i.is_approved and not BankrollStakeSizer.is_optional_combo_or_lotto(i)
+        ]
+        day_safe_combos = [
+            i for i in all_items
+            if i.date_str == target_date and i.is_approved and i.is_combo and not (i.is_lotto_combo or i.market_type == "lotto_parlay")
+        ]
+        day_lottos = [
+            i for i in all_items
+            if i.date_str == target_date and i.is_approved and (i.is_lotto_combo or i.market_type == "lotto_parlay")
+        ]
+
+        d_won = sum(1 for i in day_singles if "WON" in i.settlement)
+        d_lost = sum(1 for i in day_singles if "LOST" in i.settlement)
+        d_net_r = sum(BankrollStakeSizer.get_item_r_profit(i) for i in day_singles)
 
         won_all, lost_all, wr_all, net_all_r = cls.get_totals_summary_tuple()
 
         lines = [
-            f"📊 END OF DAY 1R RESULTS — @Footybett ({target_date})",
+            f"📊 END OF DAY SINGLES RESULTS — @Footybett ({target_date})",
             "────────────────────────"
         ]
-        for idx, s in enumerate(day_items, 1):
-            label = "🎟️ 2-LEG SAFE COMBO" if s.is_combo else f"⚽ {s.team_home} vs {s.team_away}"
+        for idx, s in enumerate(day_singles, 1):
+            label = f"⚽ {s.team_home} vs {s.team_away}"
             if "WON" in s.settlement:
                 p_r = BankrollStakeSizer.get_item_r_profit(s)
                 if getattr(s, "won_via_safe_alt", False) and getattr(s, "settled_note", ""):
@@ -3425,22 +3477,32 @@ class BetSlipCardFormatter:
             else:
                 lines.append(f"{idx}. ➖ {label} ➔ {s.selection} @ {s.odds:.2f} (0.00R / PUSH)")
 
-        # Mention Lotto ONLY if it actually WON as an unrated bonus celebration!
-        lotto_won = [
-            i for i in all_items
-            if i.date_str == target_date and (i.is_lotto_combo or i.market_type == "lotto_parlay") and "WON" in i.settlement
-        ]
-        if lotto_won:
-            lw = lotto_won[0]
-            lines.append(f"🎉 Bonus $5 Lotto HIT: {lw.odds:.2f}x (+${5.0 * (lw.odds - 1.0):.2f} Bonus — Unrated)")
+        # Explicitly report W or L for Optional Combo & Optional Lotto WITHOUT counting them in Official W-L!
+        if day_safe_combos or day_lottos:
+            lines.append("────────────────────────")
+            lines.append("🎟️ Optional Combos & Lotto (Not Counted in Official Singles W-L):")
+            for sc in day_safe_combos:
+                if "WON" in sc.settlement:
+                    lines.append(f"• 2-Leg Safe Combo (@ {sc.odds:.2f}) : ✅ WON (W)")
+                elif "LOST" in sc.settlement:
+                    lines.append(f"• 2-Leg Safe Combo (@ {sc.odds:.2f}) : ❌ LOST (L — {sc.score_str})")
+                else:
+                    lines.append(f"• 2-Leg Safe Combo (@ {sc.odds:.2f}) : ⏳ PENDING")
+            for lc in day_lottos:
+                if "WON" in lc.settlement:
+                    lines.append(f"• $5 Mega Lotto ({lc.odds:.2f}x)    : 🎉 WON (W — +${5.0 * (lc.odds - 1.0):.2f} Bonus!)")
+                elif "LOST" in lc.settlement:
+                    lines.append(f"• $5 Mega Lotto ({lc.odds:.2f}x)    : ❌ LOST (L — $5 Fun Ticket)")
+                else:
+                    lines.append(f"• $5 Mega Lotto ({lc.odds:.2f}x)    : ⏳ PENDING")
 
         lines.extend([
             "────────────────────────",
-            f"📅 Day R-Result : {d_won} Won ✅ | {d_lost} Lost ❌ ({d_net_r:+.2f}R / ${d_net_r * r_usd:+.2f})",
-            f"📈 Official W-L : {won_all}W - {lost_all}L ({wr_all:.1f}% Win Rate) [Lotto Excluded]",
-            f"💰 Total R-P&L  : {net_all_r:+.2f}R (1R = ${r_usd:.0f} Risk ➔ ${net_all_r * r_usd:+.2f} Net Profit)",
+            f"📅 Singles Day Result   : {d_won} Won ✅ | {d_lost} Lost ❌ ({d_net_r:+.2f}R / ${d_net_r * r_usd:+.2f})",
+            f"📈 Official Singles W-L : {won_all}W - {lost_all}L ({wr_all:.1f}% Win Rate) [Singles Only]",
+            f"💰 Official Singles P&L : {net_all_r:+.2f}R (1R = ${r_usd:.0f} Risk ➔ ${net_all_r * r_usd:+.2f} Net Profit)",
             "────────────────────────",
-            "🔔 7-Model Weights Updated • Next Slate Tomorrow"
+            "🔔 Gemini Chaos-Reasoner & Self-Learning Updated • Next Slate Tomorrow"
         ])
         return "\n".join(lines)
 
@@ -3449,20 +3511,19 @@ class BetSlipCardFormatter:
         r_usd = BankrollStakeSizer.get_unit_usd()
         active_date = DailyLedgerManager.get_active_date_str()
         items = DailyLedgerManager.load_active_date_items()
-        rated_items = [i for i in items if not (i.is_lotto_combo or i.market_type == "lotto_parlay")]
-        singles = [i for i in rated_items if not i.is_combo]
-        safe_combos = [i for i in rated_items if i.is_combo]
+        singles = [i for i in items if not BankrollStakeSizer.is_optional_combo_or_lotto(i)]
+        safe_combos = [i for i in items if i.is_combo and not (i.is_lotto_combo or i.market_type == "lotto_parlay")]
         lotto_combos = [i for i in items if i.is_lotto_combo or i.market_type == "lotto_parlay"]
         won_all, lost_all, wr_all, net_all_r = cls.get_totals_summary_tuple()
 
-        d_won = sum(1 for i in rated_items if "WON" in i.settlement)
-        d_lost = sum(1 for i in rated_items if "LOST" in i.settlement)
-        d_open = len(rated_items) - d_won - d_lost
-        d_net_r = sum(BankrollStakeSizer.get_item_r_profit(i) for i in rated_items)
+        d_won = sum(1 for i in singles if "WON" in i.settlement)
+        d_lost = sum(1 for i in singles if "LOST" in i.settlement)
+        d_open = len(singles) - d_won - d_lost
+        d_net_r = sum(BankrollStakeSizer.get_item_r_profit(i) for i in singles)
 
         lines = [
-            f"🎯 TODAY'S 1R BC.GAME SLATE ({active_date})",
-            f"💵 Risk Unit: 1.00R = ${r_usd:.0f} (Change via `/setunit 100`) | Active Risk: {len(rated_items)}.00R (${len(rated_items) * r_usd:.0f})",
+            f"🎯 TODAY'S OFFICIAL 1R SINGLES SLATE ({active_date})",
+            f"💵 Single Unit: 1.00R = ${r_usd:.0f} (Change via `/setunit 100`) | Official Risk: {len(singles)}.00R (${len(singles) * r_usd:.0f})",
             "────────────────────────"
         ]
 
@@ -3484,33 +3545,32 @@ class BetSlipCardFormatter:
 
         if safe_combos:
             c = safe_combos[0]
-            st_icon = "✅ WON" if "WON" in c.settlement else ("❌ LOST" if "LOST" in c.settlement else "🎟️ OPEN")
-            rew_r = c.odds - 1.0
+            st_icon = "✅ W" if "WON" in c.settlement else ("❌ L" if "LOST" in c.settlement else "🎟️ OPEN")
             lines.append("")
-            lines.append(f"🎟️ 2-LEG SAFE COMBO [{st_icon}] — Odds: {c.odds:.2f} | Risk 1.00R (${r_usd:.0f}) ➔ +{rew_r:.2f}R (+${rew_r * r_usd:.2f}):")
+            lines.append(f"🎟️ OPTIONAL 2-LEG SAFE COMBO [{st_icon} • Excluded from Singles W-L] — Odds: {c.odds:.2f}:")
             for lg in (c.combo_legs or []):
                 lines.append(f"   • {lg['home']} vs {lg['away']} ➔ {lg['selection']} (@ {lg['odds']:.2f})")
 
         if lotto_combos:
             lc = lotto_combos[0]
-            st_icon = "🎉 HIT" if "WON" in lc.settlement else ("⏳ ENDED" if "LOST" in lc.settlement else "🚀 OPEN")
+            st_icon = "🎉 W" if "WON" in lc.settlement else ("❌ L" if "LOST" in lc.settlement else "🚀 OPEN")
             lines.append("")
-            lines.append(f"🚀 BONUS $5 LOTTO [{st_icon} • Unrated] — {lc.odds:.2f}x ({len(lc.combo_legs or [])} Legs | Excluded from W-L)")
+            lines.append(f"🚀 OPTIONAL $5 LOTTO [{st_icon} • Excluded from Singles W-L] — {lc.odds:.2f}x ({len(lc.combo_legs or [])} Legs)")
 
         lines.extend([
             "",
-            f"📊 OFFICIAL 1R RECORD (Since {TRACKING_START_DATE} • Lotto Excluded)",
+            f"📊 OFFICIAL SINGLES RECORD (Since {TRACKING_START_DATE} • Combos & Lotto Excluded)",
             "────────────────────────",
-            f"• Today : {d_won}W - {d_lost}L ({d_open} Open) | {d_net_r:+.2f}R (${d_net_r * r_usd:+.2f})",
-            f"• Total : {won_all}W - {lost_all}L ({wr_all:.1f}%) | {net_all_r:+.2f}R (${net_all_r * r_usd:+.2f})",
-            "• Engine: v30.0 7-Model Real-GF/GA + Over 2.0 Cushion + Safe-Alt Credit"
+            f"• Today Singles : {d_won}W - {d_lost}L ({d_open} Open) | {d_net_r:+.2f}R (${d_net_r * r_usd:+.2f})",
+            f"• Total Singles : {won_all}W - {lost_all}L ({wr_all:.1f}%) | {net_all_r:+.2f}R (${net_all_r * r_usd:+.2f})",
+            "• Engine        : v30.1 Gemini Chaos-Reasoner + 65 Expert Sources + Singles-Only W-L"
         ])
         return "\n".join(lines)
 
 
 class InstantCustomBetAuditor:
     """
-    v30.0 Instant Custom Bet & Image Slip Auditor:
+    v30.1 Instant Custom Bet & Image Slip Auditor:
     When the user sends any match name, bet slip text, or screenshot image of a bet to the bot,
     this engine cross-checks the match across all 24+ Telegram tipster channels, 9 analytics portals
     (including betting.bc.game & API-Football /predictions), and our 5-Model Quantitative Engine
@@ -3671,7 +3731,7 @@ class InstantCustomBetAuditor:
 
 class BetSlipImageOCRAndVisionAnalyzer:
     """
-    v30.0 Multi-Engine Bet Slip Image Reader:
+    v30.1 Multi-Engine Bet Slip Image Reader:
     Extracts match names, bet markets, and odds from user-uploaded screenshot images using:
       1. Gemini Vision API (`GEMINI_API_KEY` / `GOOGLE_API_KEY` if set on server)
       2. Local `tesseract` OCR CLI (if installed on server)
@@ -3875,12 +3935,7 @@ class TelegramBotClient:
 
                 if item.settlement in ["WON ✅", "LOST ❌"]:
                     if not item.published_result_to_channel and not DailyLedgerManager.is_locked_in_channel(result_lock_key):
-                        # Never clutter channel or W-L feed when an unrated $5 Lotto misses; only celebrate if it HITS!
-                        if is_lotto and "LOST" in item.settlement:
-                            item.published_result_to_channel = True
-                            DailyLedgerManager.mark_locked_in_channel(result_lock_key)
-                            updated = True
-                            continue
+                        # Publish explicit W or L settlement card for Singles, Optional Combos, and Optional $5 Lotto!
                         close_card = BetSlipCardFormatter.format_closed_bet_card(item)
                         if self.send_message(
                             PUBLISH_CHANNEL_ID,
@@ -3901,13 +3956,13 @@ class TelegramBotClient:
             for check_d in sorted({yesterday_date, active_date}):
                 if check_d < TRACKING_START_DATE:
                     continue
-                # Only count Official Rated Picks (exclude unrated $5 Lotto) for End-of-Day Recap readiness!
+                # Trigger End-of-Day Recap as soon as all Official Singles for that date have settled!
                 day_picks = [
                     i for i in all_items.values()
                     if i.date_str == check_d
                     and i.is_approved
                     and i.published_to_channel
-                    and not (i.is_lotto_combo or i.market_type == "lotto_parlay")
+                    and not BankrollStakeSizer.is_optional_combo_or_lotto(i)
                 ]
                 if not day_picks:
                     continue
@@ -3938,7 +3993,7 @@ class TelegramBotClient:
             return []
 
     def background_worker_loop(self):
-        logger.info("Footybett v30.0 Deep Match-Autopsy Worker started...")
+        logger.info("Footybett v30.1 Deep Match-Autopsy Worker started...")
         time.sleep(3)
         while True:
             try:
@@ -3974,7 +4029,7 @@ class TelegramBotClient:
         watcher_thread = threading.Thread(target=self.background_worker_loop, daemon=True)
         watcher_thread.start()
 
-        logger.info("Bot listener running (v30.0 Self-Learning + Image/Text Bet Auditor + Channel Manager)...")
+        logger.info("Bot listener running (v30.1 Self-Learning + Image/Text Bet Auditor + Channel Manager)...")
         offset = None
 
         while True:
@@ -4067,10 +4122,10 @@ class TelegramBotClient:
                         val_u = BankrollStakeSizer.set_unit_usd(float(arg_u))
                         self.send_message(
                             chat_id,
-                            f"✅ Official 1.00R Risk Unit updated to `${val_u:.0f}`!\n"
-                            f"• Every Rated Single & Safe Combo = `1.00R (${val_u:.0f} Risk)`\n"
+                            f"✅ Official 1.00R Single Risk Unit updated to `${val_u:.0f}`!\n"
+                            f"• Every Official Single = `1.00R (${val_u:.0f} Risk)`\n"
                             f"• Reward = `(Odds - 1.0) × 1R` (e.g. @ 1.68 = `+0.68R / +${val_u * 0.68:.2f}`)\n"
-                            f"• Bonus $5 Lotto = Unrated & Excluded from Official W-L / R Record"
+                            f"• 2-Leg Safe Combo & $5 Lotto = Optional (W/L reported separately, excluded from Official Singles W-L)"
                         )
                     except Exception:
                         cur_u = BankrollStakeSizer.get_unit_usd()
