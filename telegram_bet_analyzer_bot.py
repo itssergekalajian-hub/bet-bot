@@ -1,9 +1,9 @@
 """
 Telegram Pro Football Betting Syndicate — Deep Match-Autopsy Self-Learning Engine
-& Automatic End-of-Day Channel Recap Publisher (v30.1 Final Production Release)
+& Automatic End-of-Day Channel Recap Publisher (v31.0 Final Production Release)
 (@betyyyybot -> @Footybett)
 
-What's New in v30.1 (True Match-Stats Autopsy & Root-Cause Learning):
+What's New in v31.0 (True Match-Stats Autopsy & Root-Cause Learning):
 1. Deep Post-Match Boxscore Autopsy (`LiveSportsbookAndStatsAPI.fetch_match_autopsy_stats`):
    - Whenever a bet settles as LOST ❌, the bot queries ESPN's full Match Summary API (`/summary?event=<id>`)
      to inspect WHAT ACTUALLY HAPPENED on the pitch:
@@ -34,6 +34,7 @@ import re
 import math
 import time
 import json
+import html
 import base64
 import subprocess
 import hashlib
@@ -59,6 +60,7 @@ DAILY_LEDGER_FILE = os.path.join(BASE_DIR, "daily_ledger.json")
 PUBLISHED_LOCKS_FILE = os.path.join(BASE_DIR, "published_channel_locks.json")
 LEARNING_WEIGHTS_FILE = os.path.join(BASE_DIR, "learning_weights.json")
 BANKROLL_CONFIG_FILE = os.path.join(BASE_DIR, "bankroll_config.json")
+EOD_MESSAGE_IDS_FILE = os.path.join(BASE_DIR, "eod_message_ids.json")
 DEFAULT_UNIT_USD = float(os.environ.get("UNIT_STAKE_USD", "100.0"))
 
 API_FOOTBALL_KEY = os.environ.get("API_FOOTBALL_KEY", "")
@@ -341,6 +343,7 @@ class LedgerBetItem:
     published_to_channel: bool = False
     published_result_to_channel: bool = False
     channel_message_id: Optional[int] = None
+    result_message_id: Optional[int] = None
     won_via_safe_alt: bool = False
     settled_odds: float = 0.0
     settled_note: str = ""
@@ -349,7 +352,7 @@ class LedgerBetItem:
 
 class BankrollStakeSizer:
     """
-    v30.1 Prop-Style R-Multiple Risk/Reward Bankroll Sizer:
+    v31.0 Prop-Style R-Multiple Risk/Reward Bankroll Sizer:
     1.00R = $100.00 Risk on every rated bet. Reward is expressed directly in R and $
     (e.g. @ 1.68 odds -> Risk: 1.00R ($100) | Reward: +0.68R (+$68.00)).
     Bonus $5 Lotto tickets are unrated fun plays and 100% excluded from Official W-L & R totals!
@@ -462,7 +465,7 @@ class DailyLedgerManager:
                     needs_save = True
                     continue
                 full_key = f"{item.date_str}:{item.bet_key}"
-                if cls.is_locked_in_channel(f"pick:{full_key}"):
+                if cls.is_locked_in_channel(f"pick:{full_key}") or cls.is_locked_in_channel(f"pick_v26:{full_key}"):
                     item.published_to_channel = True
                 if cls.is_locked_in_channel(f"result:{full_key}"):
                     item.published_result_to_channel = True
@@ -511,7 +514,7 @@ class DailyLedgerManager:
 
 class SelfLearningEngine:
     """
-    Deep Match-Autopsy & Root-Cause Self-Learning Engine (v30.1):
+    Deep Match-Autopsy & Root-Cause Self-Learning Engine (v31.0):
     1. Inspects actual post-match boxscore stats (Shots, Shots on Target, Possession %, Red Cards, Corners)
        fetched via `LiveSportsbookAndStatsAPI.fetch_match_autopsy_stats(event_id)` whenever a pick loses.
     2. Diagnoses WHY the prediction failed (`diagnose_loss_root_cause`) across 5 distinct root causes:
@@ -754,7 +757,7 @@ class SelfLearningEngine:
         lessons = st.get("lessons_learned", [])
 
         lines = [
-            "🧠 DEEP MATCH-AUTOPSY & SELF-LEARNING ENGINE (v30.1)",
+            "🧠 DEEP MATCH-AUTOPSY & SELF-LEARNING ENGINE (v31.0)",
             "────────────────────────"
         ]
         if strats:
@@ -779,7 +782,7 @@ class SelfLearningEngine:
 
 class ChannelBuzzRadar:
     """
-    v30.1 Priority Signal Extractor:
+    v31.0 Priority Signal Extractor:
     Specifically prioritises `@bomb_footballsignals` (9/10 hit-rate feed) + 23 sharp Telegram
     tipster channels. Parses both the exact match teams AND the exact market recommended!
     """
@@ -1144,7 +1147,7 @@ class LiveSportsbookAndStatsAPI:
         tot_corners: Optional[int] = None
     ) -> str:
         """
-        STRICT FULL-TIME (FT) VAR-SAFE GRADING (v30.1):
+        STRICT FULL-TIME (FT) VAR-SAFE GRADING (v31.0):
         1. NEVER settles any bet while `is_finished` is False (prevents false wins when VAR
            disallows a live goal like Greece's cancelled 25' goal vs Netherlands).
         2. Checks `X2` vs `1X` and exact Away vs Home target team so `Burgos to Win` or
@@ -1368,9 +1371,14 @@ class LiveSportsbookAndStatsAPI:
                     item.settled_odds = item.odds
                     item.settled_note = ""
 
-                # v30.1 SAFE ALT WIN CREDIT:
+                # v31.0 SAFE ALT WIN CREDIT:
                 # If Primary PUSHED or MISSED at Full Time, check if `🛡️ Safe Alt` (`item.alt_bcgame_line`) HIT!
                 # If the bot recommended it in Safe Alt and it hit (e.g. Metz vs Boulogne Under 3.5 @ 1.30), count it as WON ✅!
+                if not item.alt_bcgame_line and item.market_type == "goals_over_under" and item.line is not None:
+                    if item.line == 3.0 and "under" in item.selection.lower():
+                        item.alt_bcgame_line = "Main Tab ➔ Total ➔ Under 3.5 (@ 1.30)"
+                    elif item.line == 2.0 and "over" in item.selection.lower():
+                        item.alt_bcgame_line = "Main Tab ➔ Total ➔ Over 1.5 (@ 1.28)"
                 if is_finished and primary_res in ["PUSH ➖", "LOST ❌"] and item.alt_bcgame_line:
                     alt_raw = item.alt_bcgame_line.split("(or")[0].split("[")[0].strip()
                     m_alt_odd = re.search(r"@\s*(\d+\.\d+)", alt_raw)
@@ -1438,7 +1446,7 @@ class LiveSportsbookAndStatsAPI:
 
 class ExternalAnalyticsCollector:
     """
-    v30.1 Multi-Site Football Analytics Scraper & Aggregator:
+    v31.0 Multi-Site Football Analytics Scraper & Aggregator:
     Collects quantitative match projections, team goal averages, H2H goal history, Elo ratings,
     and mathematical Over/Under tips from public analytics portals & feeds:
       1. ESPN Pre-Match Summary API (`/summary?event={id}`): Extracts actual Goals Scored/Game (`GF/gm`),
@@ -1650,7 +1658,7 @@ class ExternalAnalyticsCollector:
         nb_c: Dict[str, float]
     ) -> Dict[str, float]:
         """
-        v30.1 BC.Game Accurate Odds Engine:
+        v31.0 BC.Game Accurate Odds Engine:
         1. Queries API-Football `/odds?fixture={id}` (using 1xBet / Bet365 / Pinnacle feeds which
            match BC.Game's Betby sportsbook feed within +-0.02) + ESPN live bookmaker odds.
         2. Derives any missing linked market (`Draw No Bet`, `Double Chance 1X/X2`, `Over 1.5`,
@@ -1998,7 +2006,7 @@ class ExternalAnalyticsCollector:
 
 class QuantitativeEnsembleModels:
     """
-    v30.1 4-Model Institutional Football Syndicate Ensemble:
+    v31.0 4-Model Institutional Football Syndicate Ensemble:
       1. Dixon-Coles (1997) Bivariate Poisson Scoreline Matrix (calculates exact 8x8 scoreline
          probabilities with low-score correlation tau adjustment rho = -0.11).
       2. Negative Binomial / Gamma-Poisson Wing-Pressure Corner Model (projects expected match
@@ -2117,7 +2125,7 @@ class QuantitativeEnsembleModels:
                 lam_h *= h2h_scale
                 lam_a *= h2h_scale
 
-        # v30.1 LEAKY-DEFENSE VS TRUE-DRAW SEPARATION:
+        # v31.0 LEAKY-DEFENSE VS TRUE-DRAW SEPARATION:
         # High draws + low losses = Genuine compact defensive teams (0-0 / 1-0 / 1-1).
         # High losses + few draws (e.g. Estonia vs Bulgaria, Kazakhstan vs Slovakia) = LEAKY DEFENSES -> Boost goals!
         combined_loss_rate = h_loss_rate + a_loss_rate
@@ -2234,7 +2242,7 @@ class QuantitativeEnsembleModels:
 
 class GeminiDeepReasoningEngine:
     """
-    v30.1 Multi-Expert Consensus & "Anything Can Happen in Football" Chaos Reasoning Engine:
+    v31.0 Multi-Expert Consensus & "Anything Can Happen in Football" Chaos Reasoning Engine:
     • Integrates Google Gemini 2.5 Pro / 2.5 Flash (`gemini-2.5-pro` / `gemini-2.5-flash`) via REST API
       when `GEMINI_API_KEY` or `GOOGLE_API_KEY` is configured on the server, paired with our built-in
       Autonomous Football Game-Script & Chaos Stress-Test Reasoner.
@@ -2533,7 +2541,7 @@ class GeminiDeepReasoningEngine:
 
 class SafeCushionBetCreator:
     """
-    Self-Learning & Chaos-Reasoned BC.Game Market Selector (v30.1):
+    Self-Learning & Chaos-Reasoned BC.Game Market Selector (v31.0):
     Combines 65+ Expert & Analytical Sources, 4 Quantitative Models, Post-Match Boxscore Self-Learning,
     and `GeminiDeepReasoningEngine` ("Anything Can Happen in Football" Chaos Stress-Tester).
     """
@@ -2665,7 +2673,7 @@ class SafeCushionBetCreator:
         )
         consensus_boost = min(11.0, expert_sources_count * 2.0)
 
-        # ── Run v30.1 Gemini Deep Reasoning & "Anything Can Happen" Chaos Stress-Test ──
+        # ── Run v31.0 Gemini Deep Reasoning & "Anything Can Happen" Chaos Stress-Test ──
         reasoned = GeminiDeepReasoningEngine.evaluate_match_game_script(
             home, away, league_label, slug, h_form, a_form,
             h_win_rate, a_win_rate, h_loss_rate, a_loss_rate,
@@ -2937,7 +2945,7 @@ class SafeCushionBetCreator:
     @classmethod
     def build_logical_mega_cushion_leg_for_match(cls, m: Dict[str, Any], date_str: str, buzz_teams: Set[str]) -> Optional[Tuple[float, Dict[str, Any]]]:
         """
-        v30.1 Logical Mega-Accumulator Cushion Selector (10 to 16+ Legs):
+        v31.0 Logical Mega-Accumulator Cushion Selector (10 to 16+ Legs):
         NO random high-odds guesses! Evaluates every upcoming fixture across our 32 verified Men's leagues
         (up to 48h ahead) and ONLY selects matches that have a genuine ~85%–94% logical safety cushion:
           • Dominant Home Side (`p_home_1x >= 83%`, `h_recent_l <= 1`) -> `Double Chance ➔ {Home} or Draw (1X)` (@ ~1.18–1.28)
@@ -3272,22 +3280,22 @@ class SafeCushionBetCreator:
 
 class BetSlipCardFormatter:
     """
-    v30.1 Singles-Only Official Record + Explicit Optional Combo/Lotto W/L Formatter:
+    v31.0 Singles-Only Official Record + Chronological History & Guide Formatter:
     • Official W-L, Win Rate %, and R-Multiple / $ Net Profit count ONLY Official Singles (`not is_combo`).
-    • Optional 2-Leg Safe Combos and Optional $5 Mega Lottos still report their explicit W or L status
-      on settlement reply cards and in a dedicated Optional Bonus section of the End-of-Day Recap,
-      without inflating or hurting the Official Singles calculation!
-    • Credits Safe Alt hits (`won_via_safe_alt`) on Singles as Official Wins (+R).
+    • Supports `up_to_date` chronological filtering so historical Result Cards and End-of-Day Recaps
+      edited on `@Footybett` show the exact cumulative Singles W-L & P&L as of that specific date!
+    • Optional 2-Leg Safe Combos and Optional $5 Mega Lottos report explicit W or L status separately.
     """
 
     @classmethod
-    def get_totals_summary_tuple(cls) -> Tuple[int, int, float, float]:
+    def get_totals_summary_tuple(cls, up_to_date: Optional[str] = None) -> Tuple[int, int, float, float]:
         all_items = list(DailyLedgerManager.load_all_history_items().values())
         settled_singles = [
             i for i in all_items
             if i.is_approved
             and not BankrollStakeSizer.is_optional_combo_or_lotto(i)
             and i.date_str >= TRACKING_START_DATE
+            and (up_to_date is None or i.date_str <= up_to_date)
             and i.settlement in ["WON ✅", "LOST ❌"]
         ]
         won = sum(1 for i in settled_singles if "WON" in i.settlement)
@@ -3295,6 +3303,26 @@ class BetSlipCardFormatter:
         wr = (won / (won + lost) * 100.0) if (won + lost) > 0 else 0.0
         net_r = sum(BankrollStakeSizer.get_item_r_profit(i) for i in settled_singles)
         return won, lost, wr, round(net_r, 2)
+
+    @classmethod
+    def format_channel_pinned_guide(cls) -> str:
+        r_usd = BankrollStakeSizer.get_unit_usd()
+        return (
+            "📌 OFFICIAL @FOOTYBETT GUIDE — HOW OUR DAILY BETS WORK\n"
+            "────────────────────────\n"
+            f"1️⃣ 🟢 OFFICIAL DAILY SINGLES (1.00R = ${r_usd:.0f} Risk)\n"
+            "• Deeply studied pre-match BC.Game plays audited across 65+ expert sources, live sharp odds & our Gemini Chaos-Reasoner.\n"
+            "• ONLY Official Singles count toward our Official Channel W-L Record & R-Multiple Profit.\n"
+            "• 🛡️ Safe Alt Protection: Every Single includes a safer cushion line — if the main line pushes at FT and Safe Alt hits, the Safe Alt win is credited.\n\n"
+            "2️⃣ 🎟️ OPTIONAL 2-LEG SAFE COMBO\n"
+            "• Built from today's Top 2 Singles stepped down to safer cushions (Over 1.5, 1X, etc.).\n"
+            "• Settled transparently as WON (W) or LOST (L), but excluded from Official Singles W-L.\n\n"
+            "3️⃣ 🚀 OPTIONAL $5 MEGA SAFE-LIST LOTTO\n"
+            "• Small $5 fun ticket stacking 10–16 logical ~90% cushions for 10x–25x+ upside.\n"
+            "• Settled transparently as WON (W) or LOST (L), and excluded from Official Singles W-L.\n"
+            "────────────────────────\n"
+            "📊 Full Match Boxscore Stats & Post-Match Autopsies posted after every game."
+        )
 
     @classmethod
     def format_open_bet_card(cls, s: LedgerBetItem, pick_number: Optional[int] = None) -> str:
@@ -3319,7 +3347,6 @@ class BetSlipCardFormatter:
 
         rew_r = s.odds - 1.0
         rew_dlr = rew_r * r_usd
-        tot_dlr = r_usd + rew_dlr
 
         if s.is_combo and s.combo_legs:
             leg_lines = []
@@ -3340,7 +3367,11 @@ class BetSlipCardFormatter:
             )
 
         num_tag = f" #{pick_number}" if pick_number else ""
-        kickoff_line = f"\n⏰ Kickoff       : {s.kickoff_str}" if s.kickoff_str else ""
+        ko_clean = s.kickoff_str or ""
+        if s.settlement != "PENDING" and ko_clean:
+            ko_clean = re.sub(r"\s*\(In\s+[^)]+\)", "", ko_clean)
+            ko_clean = ko_clean.replace(" — Starting Soon", "").strip()
+        kickoff_line = f"\n⏰ Kickoff       : {ko_clean}" if ko_clean else ""
         alt_line = f"\n🛡️ Safe Alt      : {s.alt_bcgame_line}" if s.alt_bcgame_line else ""
         conf_str = s.confidence_stars if "/" in s.confidence_stars else f"⭐️⭐️⭐️⭐️ ({min(9.5, max(8.2, round(s.model_prob / 8.5, 1))):.1f}/10)"
         stake_line = BankrollStakeSizer.format_stake_plan_line(1.0, s.odds, getattr(s, "stake_tier_label", "1R Play"))
@@ -3355,9 +3386,10 @@ class BetSlipCardFormatter:
         )
 
     @classmethod
-    def format_closed_bet_card(cls, s: LedgerBetItem) -> str:
+    def format_closed_bet_card(cls, s: LedgerBetItem, up_to_date: Optional[str] = None) -> str:
         r_usd = BankrollStakeSizer.get_unit_usd()
-        won, lost, wr, net_r = cls.get_totals_summary_tuple()
+        eff_date = up_to_date or s.date_str
+        won, lost, wr, net_r = cls.get_totals_summary_tuple(up_to_date=eff_date)
         is_lotto = s.is_lotto_combo or s.market_type == "lotto_parlay"
 
         # 1. Optional $5 Mega Lotto Result Card (Reports W or L clearly, Excluded from Official Singles W-L)
@@ -3424,6 +3456,14 @@ class BetSlipCardFormatter:
                 f"{bet_hit_line}{stats_line}\n"
                 f"📈 Official Singles Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
             )
+        elif "PUSH" in s.settlement:
+            return (
+                f"➖ SINGLE BET PUSH (0.00R / ${r_usd:.0f} Stake Refunded) — @Footybett\n"
+                "────────────────────────\n"
+                f"{match_line}\n"
+                f"🎯 {s.selection} @ {s.odds:.2f} ➖ (Full Refund){stats_line}\n"
+                f"📈 Official Singles Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
+            )
         else:
             autopsy_line = f"\n{s.loss_autopsy}" if s.loss_autopsy else ""
             return (
@@ -3456,7 +3496,7 @@ class BetSlipCardFormatter:
         d_lost = sum(1 for i in day_singles if "LOST" in i.settlement)
         d_net_r = sum(BankrollStakeSizer.get_item_r_profit(i) for i in day_singles)
 
-        won_all, lost_all, wr_all, net_all_r = cls.get_totals_summary_tuple()
+        won_all, lost_all, wr_all, net_all_r = cls.get_totals_summary_tuple(up_to_date=target_date)
 
         lines = [
             f"📊 END OF DAY SINGLES RESULTS — @Footybett ({target_date})",
@@ -3563,14 +3603,14 @@ class BetSlipCardFormatter:
             "────────────────────────",
             f"• Today Singles : {d_won}W - {d_lost}L ({d_open} Open) | {d_net_r:+.2f}R (${d_net_r * r_usd:+.2f})",
             f"• Total Singles : {won_all}W - {lost_all}L ({wr_all:.1f}%) | {net_all_r:+.2f}R (${net_all_r * r_usd:+.2f})",
-            "• Engine        : v30.1 Gemini Chaos-Reasoner + 65 Expert Sources + Singles-Only W-L"
+            "• Engine        : v31.0 Auto-Cleaner + Gemini Chaos-Reasoner + Singles-Only W-L"
         ])
         return "\n".join(lines)
 
 
 class InstantCustomBetAuditor:
     """
-    v30.1 Instant Custom Bet & Image Slip Auditor:
+    v31.0 Instant Custom Bet & Image Slip Auditor:
     When the user sends any match name, bet slip text, or screenshot image of a bet to the bot,
     this engine cross-checks the match across all 24+ Telegram tipster channels, 9 analytics portals
     (including betting.bc.game & API-Football /predictions), and our 5-Model Quantitative Engine
@@ -3731,7 +3771,7 @@ class InstantCustomBetAuditor:
 
 class BetSlipImageOCRAndVisionAnalyzer:
     """
-    v30.1 Multi-Engine Bet Slip Image Reader:
+    v31.0 Multi-Engine Bet Slip Image Reader:
     Extracts match names, bet markets, and odds from user-uploaded screenshot images using:
       1. Gemini Vision API (`GEMINI_API_KEY` / `GOOGLE_API_KEY` if set on server)
       2. Local `tesseract` OCR CLI (if installed on server)
@@ -3825,6 +3865,197 @@ class BetSlipImageOCRAndVisionAnalyzer:
         return ""
 
 
+class ChannelHistoryCleaner:
+    """
+    v31.0 Full Telegram Channel History Scanner, Deduplicator & In-Place Editor:
+    • Reads public `@Footybett` channel history via `https://t.me/s/Footybett` (including pagination
+      via `?before=<msg_id>`) so the bot discovers EVERY message ID ever posted on `@Footybett`.
+    • Deletes duplicate cards, obsolete update/correction spam, and pre-reset clutter (`deleteMessage`).
+    • Edits (`editMessageText`) all kept Open Bets, Settled Result Cards, and End-of-Day Recaps from
+      `2026-11-15` to today in-place into the unified v31.0 format (Singles-only Official W-L & 1R P&L,
+      Safe Alt win credits, explicit W/L status on Optional Combos & $5 Lotto, and chronological totals).
+    • Posts/updates a Pinned Channel Guide explaining how Singles, Optional Combos, and Lotto work.
+    """
+
+    @staticmethod
+    def extract_channel_handle(channel_id_str: str) -> str:
+        s = str(channel_id_str or "@Footybett").strip()
+        s = re.sub(r"^https?://t\.me/(?:s/)?", "", s, flags=re.IGNORECASE)
+        return s.lstrip("@").split("/")[0].split("?")[0].strip()
+
+    @classmethod
+    def parse_channel_preview_html(cls, raw_html: str, handle: str) -> List[Dict[str, Any]]:
+        posts: List[Dict[str, Any]] = []
+        pattern = re.compile(
+            r'data-post="' + re.escape(handle) + r'/(\d+)"(.*?)(?=data-post="' + re.escape(handle) + r'/\d+"|$)',
+            re.DOTALL | re.IGNORECASE
+        )
+        for m in pattern.finditer(raw_html):
+            msg_id = int(m.group(1))
+            block = m.group(2)
+            m_txt = re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', block, re.DOTALL)
+            raw_t = m_txt.group(1) if m_txt else ""
+            raw_t = re.sub(r"<br\s*/?>", "\n", raw_t, flags=re.IGNORECASE)
+            clean_t = html.unescape(re.sub(r"<[^>]+>", "", raw_t)).strip()
+
+            m_dt = re.search(r'<time[^>]*datetime="([^"]+)"', block)
+            dt_iso = m_dt.group(1) if m_dt else ""
+            date_str = dt_iso[:10] if len(dt_iso) >= 10 else ""
+            posts.append({
+                "msg_id": msg_id,
+                "date_str": date_str,
+                "dt_iso": dt_iso,
+                "text": clean_t
+            })
+        return posts
+
+    @classmethod
+    def fetch_all_channel_posts(cls, channel_id_str: str, max_pages: int = 12) -> List[Dict[str, Any]]:
+        handle = cls.extract_channel_handle(channel_id_str)
+        if not handle or handle.startswith("-100"):
+            return []
+
+        by_id: Dict[int, Dict[str, Any]] = {}
+        before_id: Optional[int] = None
+
+        for _ in range(max_pages):
+            url = f"https://t.me/s/{handle}"
+            if before_id is not None:
+                url += f"?before={before_id}"
+            else:
+                url += f"?_={int(time.time())}"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            try:
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    page_html = resp.read().decode("utf-8", errors="ignore")
+            except Exception:
+                break
+
+            batch = cls.parse_channel_preview_html(page_html, handle)
+            if not batch:
+                break
+            new_found = 0
+            for p in batch:
+                if p["msg_id"] not in by_id:
+                    by_id[p["msg_id"]] = p
+                    new_found += 1
+            min_id = min(p["msg_id"] for p in batch)
+            if new_found == 0 or min_id <= 1 or (before_id is not None and min_id >= before_id):
+                break
+            before_id = min_id
+            time.sleep(0.25)
+
+        return [by_id[k] for k in sorted(by_id.keys())]
+
+    @staticmethod
+    def _dates_close(d1: str, d2: str, max_days: int = 2) -> bool:
+        if not d1 or not d2:
+            return True
+        try:
+            dt1 = datetime.datetime.strptime(d1[:10], "%Y-%m-%d")
+            dt2 = datetime.datetime.strptime(d2[:10], "%Y-%m-%d")
+            return abs((dt1 - dt2).days) <= max_days
+        except Exception:
+            return True
+
+    @classmethod
+    def classify_post(cls, post: Dict[str, Any], all_items: Dict[str, LedgerBetItem]) -> Tuple[str, str, Optional[LedgerBetItem]]:
+        """
+        Returns `(category, group_key, matched_ledger_item)` where category is one of:
+          - `GUIDE`
+          - `EOD_RECAP`
+          - `LOTTO_OPEN` / `LOTTO_CLOSED`
+          - `COMBO_OPEN` / `COMBO_CLOSED`
+          - `SINGLE_OPEN` / `SINGLE_CLOSED`
+          - `PRE_RESET_OR_CLUTTER`
+          - `UNMATCHED_KEEP`
+        """
+        txt = post.get("text", "").strip()
+        up = txt.upper()
+        p_date = post.get("date_str", "")
+
+        if not txt:
+            return "PRE_RESET_OR_CLUTTER", f"empty_{post['msg_id']}", None
+
+        if "OFFICIAL @FOOTYBETT GUIDE" in up or "HOW OUR DAILY BETS WORK" in up:
+            return "GUIDE", "pinned_guide", None
+
+        # Pre-tracking clutter before 2026-11-15
+        m_explicit_date = re.search(r"(202\d-\d{2}-\d{2})", txt)
+        explicit_d = m_explicit_date.group(1) if m_explicit_date else ""
+        if (explicit_d and explicit_d < TRACKING_START_DATE) or (not explicit_d and p_date and p_date < TRACKING_START_DATE):
+            return "PRE_RESET_OR_CLUTTER", f"old_{post['msg_id']}", None
+
+        # End-of-Day Recap
+        if "END OF DAY" in up or "DAILY RECAP" in up or "END-OF-DAY" in up:
+            recap_d = explicit_d or p_date
+            return "EOD_RECAP", recap_d, None
+
+        first_line = up.splitlines()[0] if up.splitlines() else up
+        is_closed_header = any(
+            kw in first_line for kw in [
+                "WON", "LOST", "PUSH", "HIT", "SETTLED", "CORRECTION", "✅", "❌", "➖", "🎉"
+            ]
+        ) and not first_line.startswith("🟢") and not first_line.startswith("🎟️ DAILY") and not first_line.startswith("🎟️ OPTIONAL 2-LEG SAFE COMBO —") and not first_line.startswith("🚀 DAILY") and not first_line.startswith("🚀 BONUS $5 MEGA") and not first_line.startswith("🚀 OPTIONAL $5 MEGA")
+
+        # Lotto Cards
+        if "LOTTO" in up or "MEGA SAFE-LIST" in up or "MEGA COMBO" in up:
+            lottos = [
+                it for it in all_items.values()
+                if (it.is_lotto_combo or it.market_type == "lotto_parlay") and cls._dates_close(it.date_str, p_date, 2)
+            ]
+            lottos.sort(key=lambda x: abs((datetime.datetime.strptime(x.date_str, "%Y-%m-%d") - datetime.datetime.strptime(p_date or x.date_str, "%Y-%m-%d")).days) if p_date else 0)
+            matched_lotto = lottos[0] if lottos else None
+            g_key = f"{matched_lotto.date_str}:{matched_lotto.bet_key}" if matched_lotto else f"lotto_{p_date}"
+            return ("LOTTO_CLOSED" if is_closed_header else "LOTTO_OPEN"), g_key, matched_lotto
+
+        # Safe Combo Cards
+        if "SAFE COMBO" in up or "2-LEG" in up or "3-LEG" in up or "DAILY COMBO" in up:
+            combos = [
+                it for it in all_items.values()
+                if it.is_combo and not (it.is_lotto_combo or it.market_type == "lotto_parlay") and cls._dates_close(it.date_str, p_date, 2)
+            ]
+            best_c = None
+            best_hits = -1
+            for c_it in combos:
+                hits = sum(1 for lg in (c_it.combo_legs or []) if normalize_team_str(lg.get("home", "")) in normalize_team_str(txt))
+                if hits > best_hits:
+                    best_hits = hits
+                    best_c = c_it
+            g_key = f"{best_c.date_str}:{best_c.bet_key}" if best_c else f"combo_{p_date}"
+            return ("COMBO_CLOSED" if is_closed_header else "COMBO_OPEN"), g_key, best_c
+
+        # Single Bet Open or Closed Cards
+        norm_txt = normalize_team_str(txt)
+        best_single: Optional[LedgerBetItem] = None
+        for it in all_items.values():
+            if it.is_combo or it.is_lotto_combo:
+                continue
+            if not cls._dates_close(it.date_str, p_date, 3):
+                continue
+            nh = normalize_team_str(it.team_home)
+            na = normalize_team_str(it.team_away)
+            if nh and na and (nh in norm_txt and na in norm_txt):
+                best_single = it
+                break
+            for ln in txt.splitlines()[:4]:
+                if "vs" in ln.lower() or "➔" in ln:
+                    if teams_match(it.team_home, ln) and teams_match(it.team_away, ln):
+                        best_single = it
+                        break
+            if best_single:
+                break
+
+        if best_single:
+            g_key = f"{best_single.date_str}:{best_single.bet_key}"
+            return ("SINGLE_CLOSED" if is_closed_header else "SINGLE_OPEN"), g_key, best_single
+
+        if any(w in up for w in ["BOT STARTED", "SYSTEM UPDATE", "TEST MESSAGE", "TESTING", "CLEANING CHANNEL"]):
+            return "PRE_RESET_OR_CLUTTER", f"sys_{post['msg_id']}", None
+
+        return "UNMATCHED_KEEP", f"unmatched_{post['msg_id']}", None
+
+
 class TelegramBotClient:
     REMOVE_BOTTOM_KEYBOARD = {"remove_keyboard": True}
 
@@ -3835,6 +4066,32 @@ class TelegramBotClient:
         DailyLedgerManager.load_all_history_items()
         SelfLearningEngine.recalibrate_from_ledger()
 
+    def _call_telegram_json(self, endpoint: str, payload_data: Dict[str, Any], timeout: int = 12) -> Tuple[bool, Dict[str, Any], str]:
+        url = f"{self.base_url}/{endpoint}"
+        payload = json.dumps(payload_data).encode("utf-8")
+        for attempt in range(2):
+            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                    if body.get("ok"):
+                        return True, body, "ok"
+                    return False, body, str(body.get("description", "error"))
+            except urllib.error.HTTPError as he:
+                try:
+                    err_body = json.loads(he.read().decode("utf-8", errors="ignore"))
+                except Exception:
+                    err_body = {}
+                desc = str(err_body.get("description", str(he)))
+                if he.code == 429 and attempt == 0:
+                    retry_s = int(err_body.get("parameters", {}).get("retry_after", 3) or 3)
+                    time.sleep(min(retry_s + 1, 15))
+                    continue
+                return False, err_body, desc
+            except Exception as e:
+                return False, {}, str(e)
+        return False, {}, "retry_exhausted"
+
     def send_message(
         self,
         chat_id: Any,
@@ -3844,10 +4101,8 @@ class TelegramBotClient:
     ) -> Optional[int]:
         """
         Sends a Telegram message and returns the integer `message_id` on success (`None` on failure).
-        Supports native Telegram reply-tagging via `reply_parameters` so closed win/loss cards
-        directly tag & highlight the original Open Bet post in `@Footybett`!
+        Supports native Telegram reply-tagging via `reply_parameters`.
         """
-        url = f"{self.base_url}/sendMessage"
         payload_data: Dict[str, Any] = {
             "chat_id": chat_id,
             "text": text[:3900]
@@ -3859,24 +4114,209 @@ class TelegramBotClient:
                 "message_id": int(reply_to_message_id),
                 "allow_sending_without_reply": True
             }
+        ok, body, desc = self._call_telegram_json("sendMessage", payload_data, timeout=10)
+        if ok:
+            return int(body.get("result", {}).get("message_id") or 1)
+        logger.error("Failed to send Telegram message to %s: %s", chat_id, desc)
+        return None
 
-        payload = json.dumps(payload_data).encode("utf-8")
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status == 200:
-                    body = json.loads(resp.read().decode("utf-8"))
-                    return int(body.get("result", {}).get("message_id") or 1)
-                return None
-        except Exception as e:
-            logger.error("Failed to send Telegram message to %s: %s", chat_id, e)
-            return None
+    def edit_message(self, chat_id: Any, message_id: int, new_text: str) -> Tuple[bool, str]:
+        """Edits an existing channel/chat message in-place (works on bot messages of ANY age!)."""
+        if not message_id or int(message_id) <= 1:
+            return False, "invalid_id"
+        payload_data = {
+            "chat_id": chat_id,
+            "message_id": int(message_id),
+            "text": new_text[:3900]
+        }
+        ok, _, desc = self._call_telegram_json("editMessageText", payload_data, timeout=10)
+        if ok:
+            return True, "edited"
+        if "message is not modified" in desc.lower():
+            return True, "unchanged"
+        return False, desc
+
+    def delete_message(self, chat_id: Any, message_id: int) -> Tuple[bool, str]:
+        """Deletes a duplicate or obsolete message from `@Footybett`."""
+        if not message_id or int(message_id) <= 0:
+            return False, "invalid_id"
+        ok, _, desc = self._call_telegram_json("deleteMessage", {"chat_id": chat_id, "message_id": int(message_id)}, timeout=10)
+        if ok or "message to delete not found" in desc.lower():
+            return True, "deleted"
+        return False, desc
+
+    def pin_message(self, chat_id: Any, message_id: int) -> bool:
+        if not message_id or int(message_id) <= 1:
+            return False
+        ok, _, _ = self._call_telegram_json(
+            "pinChatMessage",
+            {"chat_id": chat_id, "message_id": int(message_id), "disable_notification": True},
+            timeout=10
+        )
+        return ok
+
+    def clean_and_upgrade_channel_history(self, auto_startup: bool = False) -> str:
+        """
+        Scans `@Footybett` from Day 1 (`2026-11-15`) through today:
+        1. Re-grades all historical ledger items first (crediting Safe Alt wins like Metz vs Boulogne 2-1
+           and attaching post-match boxscore stats & autopsies).
+        2. Deletes duplicate Open/Result/EOD posts and obsolete clutter.
+        3. Edits all kept Open Bets, Result Cards, and End-of-Day Recaps in-place to the unified v31.0
+           Singles-Only 1R format (with accurate chronological cumulative Singles W-L & P&L per date).
+        4. Posts or updates the Pinned Channel Guide at the top of `@Footybett`.
+        """
+        with self.channel_publish_lock:
+            LiveSportsbookAndStatsAPI.grade_ledger_items()
+            all_items = DailyLedgerManager.load_all_history_items()
+            eod_map = load_json_dict(EOD_MESSAGE_IDS_FILE)
+            handle = ChannelHistoryCleaner.extract_channel_handle(PUBLISH_CHANNEL_ID)
+            posts = ChannelHistoryCleaner.fetch_all_channel_posts(PUBLISH_CHANNEL_ID)
+
+            deleted_cnt = 0
+            edited_cnt = 0
+            unchanged_cnt = 0
+            older_48h_dups: List[int] = []
+
+            day_single_numbers: Dict[str, int] = {}
+            by_date_singles: Dict[str, List[LedgerBetItem]] = {}
+            for fk, it in sorted(all_items.items(), key=lambda kv: kv[0]):
+                if not it.is_combo and not it.is_lotto_combo:
+                    by_date_singles.setdefault(it.date_str, []).append(it)
+            for d_s, s_list in by_date_singles.items():
+                for idx_s, s_it in enumerate(s_list, 1):
+                    day_single_numbers[f"{s_it.date_str}:{s_it.bet_key}"] = idx_s
+
+            classified = []
+            for p in posts:
+                cat, g_key, m_item = ChannelHistoryCleaner.classify_post(p, all_items)
+                classified.append((p, cat, g_key, m_item))
+
+            grouped: Dict[Tuple[str, str], List[Tuple[Dict[str, Any], Optional[LedgerBetItem]]]] = {}
+            to_delete_ids: List[int] = []
+
+            for p, cat, g_key, m_item in classified:
+                if cat == "PRE_RESET_OR_CLUTTER":
+                    to_delete_ids.append(p["msg_id"])
+                elif cat == "UNMATCHED_KEEP":
+                    continue
+                else:
+                    grouped.setdefault((cat, g_key), []).append((p, m_item))
+
+            to_edit_jobs: List[Tuple[int, str]] = []
+            guide_msg_id: Optional[int] = int(eod_map.get("pinned_guide") or 0) or None
+
+            for (cat, g_key), entries in grouped.items():
+                entries.sort(key=lambda x: x[0]["msg_id"])
+
+                if cat == "GUIDE":
+                    keep_p, _ = entries[0]
+                    guide_msg_id = keep_p["msg_id"]
+                    eod_map["pinned_guide"] = guide_msg_id
+                    for dup_p, _ in entries[1:]:
+                        to_delete_ids.append(dup_p["msg_id"])
+                    to_edit_jobs.append((guide_msg_id, BetSlipCardFormatter.format_channel_pinned_guide()))
+
+                elif cat == "EOD_RECAP":
+                    keep_p, _ = entries[-1]
+                    for dup_p, _ in entries[:-1]:
+                        to_delete_ids.append(dup_p["msg_id"])
+                    recap_date = g_key
+                    if recap_date >= TRACKING_START_DATE:
+                        eod_map[recap_date] = keep_p["msg_id"]
+                        DailyLedgerManager.mark_locked_in_channel(f"eod_recap_v31:{recap_date}")
+                        new_recap_txt = BetSlipCardFormatter.format_end_of_day_channel_recap(recap_date)
+                        to_edit_jobs.append((keep_p["msg_id"], new_recap_txt))
+                    else:
+                        to_delete_ids.append(keep_p["msg_id"])
+
+                elif cat in ("SINGLE_OPEN", "COMBO_OPEN", "LOTTO_OPEN"):
+                    keep_p, m_item = entries[0]
+                    for dup_p, _ in entries[1:]:
+                        to_delete_ids.append(dup_p["msg_id"])
+                    if m_item is not None:
+                        m_item.published_to_channel = True
+                        m_item.channel_message_id = keep_p["msg_id"]
+                        DailyLedgerManager.mark_locked_in_channel(f"pick:{g_key}")
+                        DailyLedgerManager.mark_locked_in_channel(f"pick_v26:{g_key}")
+                        p_num = day_single_numbers.get(g_key) if cat == "SINGLE_OPEN" else None
+                        to_edit_jobs.append((keep_p["msg_id"], BetSlipCardFormatter.format_open_bet_card(m_item, pick_number=p_num)))
+
+                elif cat in ("SINGLE_CLOSED", "COMBO_CLOSED", "LOTTO_CLOSED"):
+                    keep_p, m_item = entries[-1]
+                    for dup_p, _ in entries[:-1]:
+                        to_delete_ids.append(dup_p["msg_id"])
+                    if m_item is not None:
+                        if m_item.settlement == "PENDING":
+                            to_delete_ids.append(keep_p["msg_id"])
+                        else:
+                            m_item.published_to_channel = True
+                            m_item.published_result_to_channel = True
+                            m_item.result_message_id = keep_p["msg_id"]
+                            DailyLedgerManager.mark_locked_in_channel(f"result:{g_key}")
+                            to_edit_jobs.append((keep_p["msg_id"], BetSlipCardFormatter.format_closed_bet_card(m_item, up_to_date=m_item.date_str)))
+
+            for mid in sorted(set(to_delete_ids)):
+                ok_del, _ = self.delete_message(PUBLISH_CHANNEL_ID, mid)
+                if ok_del:
+                    deleted_cnt += 1
+                else:
+                    older_48h_dups.append(mid)
+                time.sleep(0.35)
+
+            existing_text_by_id = {p["msg_id"]: p["text"] for p in posts}
+            for mid, target_txt in to_edit_jobs:
+                cur_txt = existing_text_by_id.get(mid, "")
+                if re.sub(r"\s+", " ", cur_txt).strip() == re.sub(r"\s+", " ", target_txt).strip():
+                    unchanged_cnt += 1
+                    continue
+                ok_ed, status_ed = self.edit_message(PUBLISH_CHANNEL_ID, mid, target_txt)
+                if ok_ed:
+                    if status_ed == "edited":
+                        edited_cnt += 1
+                        time.sleep(1.05)
+                    else:
+                        unchanged_cnt += 1
+
+            guide_txt = BetSlipCardFormatter.format_channel_pinned_guide()
+            if not guide_msg_id:
+                new_gid = self.send_message(PUBLISH_CHANNEL_ID, guide_txt, remove_kb=False)
+                if new_gid and new_gid > 1:
+                    eod_map["pinned_guide"] = new_gid
+                    self.pin_message(PUBLISH_CHANNEL_ID, new_gid)
+                    edited_cnt += 1
+
+            DailyLedgerManager.save_all_items(all_items)
+            save_json_dict(EOD_MESSAGE_IDS_FILE, eod_map)
+            DailyLedgerManager.mark_locked_in_channel("channel_clean_v31_auto_done")
+
+            won_all, lost_all, wr_all, net_all_r = BetSlipCardFormatter.get_totals_summary_tuple()
+            r_usd = BankrollStakeSizer.get_unit_usd()
+            dup_note = ""
+            if older_48h_dups and handle:
+                links = ", ".join(f"https://t.me/{handle}/{m_i}" for m_i in older_48h_dups[:8])
+                dup_note = f"\nℹ️ Older >48h duplicates (Telegram requires 1 manual tap by owner to delete): {links}"
+
+            report = (
+                "🧹 @Footybett CHANNEL CLEANUP & HISTORY UPGRADE COMPLETE (v31.0)\n"
+                "────────────────────────\n"
+                f"• Scanned Channel Posts : {len(posts)} messages\n"
+                f"• Deleted Duplicates    : {deleted_cnt} message(s)\n"
+                f"• Rewritten & Upgraded  : {edited_cnt} post(s) updated to v31.0 Singles-Only 1R format\n"
+                f"• Already Clean         : {unchanged_cnt} post(s)\n"
+                "• Pinned Channel Guide  : Active 📌\n"
+                "────────────────────────\n"
+                f"📈 Official Singles Record : {won_all}W - {lost_all}L ({wr_all:.1f}%) | {net_all_r:+.2f}R (${net_all_r * r_usd:+.2f})"
+                f"{dup_note}"
+            )
+            logger.info("Channel cleanup summary: scanned=%d deleted=%d edited=%d", len(posts), deleted_cnt, edited_cnt)
+            return report
 
     def sync_and_publish_to_footybett(self) -> int:
         with self.channel_publish_lock:
             LiveSportsbookAndStatsAPI.grade_ledger_items()
             SafeCushionBetCreator.generate_slate_and_combo_for_active_date()
             all_items = DailyLedgerManager.load_all_history_items()
+            eod_map = load_json_dict(EOD_MESSAGE_IDS_FILE)
             active_date = DailyLedgerManager.get_active_date_str()
             yesterday_date = DailyLedgerManager.get_yesterday_str()
             published_count = 0
@@ -3894,7 +4334,7 @@ class TelegramBotClient:
                 DailyLedgerManager.mark_locked_in_channel(batch_lock_key)
                 single_idx = 0
                 for fk, it in today_pending:
-                    pick_lock_key = f"pick_v26:{fk}"
+                    pick_lock_key = f"pick:{fk}"
                     if not it.is_combo:
                         single_idx += 1
                         open_card = BetSlipCardFormatter.format_open_bet_card(it, pick_number=single_idx)
@@ -3906,6 +4346,7 @@ class TelegramBotClient:
                         if msg_id > 1:
                             it.channel_message_id = msg_id
                         DailyLedgerManager.mark_locked_in_channel(pick_lock_key)
+                        DailyLedgerManager.mark_locked_in_channel(f"pick_v26:{fk}")
                         if it.is_lotto_combo or it.market_type == "lotto_parlay":
                             DailyLedgerManager.mark_locked_in_channel(lotto_lock_key)
                         published_count += 1
@@ -3920,6 +4361,7 @@ class TelegramBotClient:
                             it.published_to_channel = True
                             if msg_id > 1:
                                 it.channel_message_id = msg_id
+                            DailyLedgerManager.mark_locked_in_channel(f"pick:{fk}")
                             DailyLedgerManager.mark_locked_in_channel(f"pick_v26:{fk}")
                             DailyLedgerManager.mark_locked_in_channel(lotto_lock_key)
                             published_count += 1
@@ -3929,26 +4371,34 @@ class TelegramBotClient:
             for full_key, item in ordered_items:
                 if not item.is_approved or item.date_str < TRACKING_START_DATE:
                     continue
-                pick_lock_key = f"pick_v26:{full_key}"
+                pick_lock_key = f"pick:{full_key}"
                 result_lock_key = f"result:{full_key}"
-                is_lotto = item.is_lotto_combo or item.market_type == "lotto_parlay"
 
-                if item.settlement in ["WON ✅", "LOST ❌"]:
+                if item.settlement in ["WON ✅", "LOST ❌", "PUSH ➖"]:
+                    close_card = BetSlipCardFormatter.format_closed_bet_card(item, up_to_date=item.date_str)
                     if not item.published_result_to_channel and not DailyLedgerManager.is_locked_in_channel(result_lock_key):
-                        # Publish explicit W or L settlement card for Singles, Optional Combos, and Optional $5 Lotto!
-                        close_card = BetSlipCardFormatter.format_closed_bet_card(item)
-                        if self.send_message(
-                            PUBLISH_CHANNEL_ID,
-                            close_card,
-                            remove_kb=False,
-                            reply_to_message_id=getattr(item, "channel_message_id", None)
-                        ):
-                            item.published_to_channel = True
-                            item.published_result_to_channel = True
-                            DailyLedgerManager.mark_locked_in_channel(pick_lock_key)
-                            DailyLedgerManager.mark_locked_in_channel(result_lock_key)
-                            updated = True
-                            time.sleep(1.0)
+                        if getattr(item, "result_message_id", None):
+                            ok_ed, _ = self.edit_message(PUBLISH_CHANNEL_ID, int(item.result_message_id), close_card)
+                            if ok_ed:
+                                item.published_result_to_channel = True
+                                DailyLedgerManager.mark_locked_in_channel(result_lock_key)
+                                updated = True
+                        else:
+                            res_mid = self.send_message(
+                                PUBLISH_CHANNEL_ID,
+                                close_card,
+                                remove_kb=False,
+                                reply_to_message_id=getattr(item, "channel_message_id", None)
+                            )
+                            if res_mid:
+                                item.published_to_channel = True
+                                item.published_result_to_channel = True
+                                if res_mid > 1:
+                                    item.result_message_id = res_mid
+                                DailyLedgerManager.mark_locked_in_channel(pick_lock_key)
+                                DailyLedgerManager.mark_locked_in_channel(result_lock_key)
+                                updated = True
+                                time.sleep(1.0)
 
             if updated:
                 DailyLedgerManager.save_all_items(all_items)
@@ -3956,7 +4406,6 @@ class TelegramBotClient:
             for check_d in sorted({yesterday_date, active_date}):
                 if check_d < TRACKING_START_DATE:
                     continue
-                # Trigger End-of-Day Recap as soon as all Official Singles for that date have settled!
                 day_picks = [
                     i for i in all_items.values()
                     if i.date_str == check_d
@@ -3968,13 +4417,24 @@ class TelegramBotClient:
                     continue
                 settled_day = [i for i in day_picks if i.settlement in ["WON ✅", "LOST ❌", "PUSH ➖"]]
                 if len(settled_day) == len(day_picks) and len(settled_day) >= 2:
-                    w_cnt = sum(1 for i in settled_day if "WON" in i.settlement)
-                    l_cnt = sum(1 for i in settled_day if "LOST" in i.settlement)
-                    eod_lock_key = f"eod_recap_v29_1R:{check_d}:{w_cnt}W_{l_cnt}L"
-                    if not DailyLedgerManager.is_locked_in_channel(eod_lock_key):
-                        recap_card = BetSlipCardFormatter.format_end_of_day_channel_recap(check_d)
-                        if self.send_message(PUBLISH_CHANNEL_ID, recap_card, remove_kb=False):
+                    recap_card = BetSlipCardFormatter.format_end_of_day_channel_recap(check_d)
+                    eod_lock_key = f"eod_recap_v31:{check_d}"
+                    recap_hash = hashlib.md5(recap_card.encode("utf-8")).hexdigest()[:8]
+                    existing_eod_mid = int(eod_map.get(check_d) or 0)
+                    if existing_eod_mid > 1:
+                        if not DailyLedgerManager.is_locked_in_channel(f"{eod_lock_key}:{recap_hash}"):
+                            ok_ed, _ = self.edit_message(PUBLISH_CHANNEL_ID, existing_eod_mid, recap_card)
+                            if ok_ed:
+                                DailyLedgerManager.mark_locked_in_channel(eod_lock_key)
+                                DailyLedgerManager.mark_locked_in_channel(f"{eod_lock_key}:{recap_hash}")
+                    elif not DailyLedgerManager.is_locked_in_channel(eod_lock_key):
+                        new_eod_mid = self.send_message(PUBLISH_CHANNEL_ID, recap_card, remove_kb=False)
+                        if new_eod_mid:
+                            if new_eod_mid > 1:
+                                eod_map[check_d] = new_eod_mid
+                                save_json_dict(EOD_MESSAGE_IDS_FILE, eod_map)
                             DailyLedgerManager.mark_locked_in_channel(eod_lock_key)
+                            DailyLedgerManager.mark_locked_in_channel(f"{eod_lock_key}:{recap_hash}")
                             time.sleep(1.0)
 
             return published_count
@@ -3993,8 +4453,14 @@ class TelegramBotClient:
             return []
 
     def background_worker_loop(self):
-        logger.info("Footybett v30.1 Deep Match-Autopsy Worker started...")
+        logger.info("Footybett v31.0 Auto-Cleaner & Deep Match-Autopsy Worker started...")
         time.sleep(3)
+        if not DailyLedgerManager.is_locked_in_channel("channel_clean_v31_auto_done"):
+            try:
+                logger.info("Running automatic one-time v31.0 @Footybett channel cleanup & history upgrade...")
+                self.clean_and_upgrade_channel_history(auto_startup=True)
+            except Exception as ce:
+                logger.error("Auto channel cleanup error: %s", ce)
         while True:
             try:
                 self.sync_and_publish_to_footybett()
@@ -4004,13 +4470,14 @@ class TelegramBotClient:
 
     def set_official_menu_commands(self):
         commands = [
-            {"command": "scan", "description": "🎯 Today's Full BC.Game Slate & Combo"},
+            {"command": "scan", "description": "🎯 Today's Official 1R Singles & Optional Combos"},
+            {"command": "clean", "description": "🧹 Clean Duplicates & Upgrade @Footybett History"},
             {"command": "results", "description": "🏁 Refresh Live Scores & Outcomes"},
             {"command": "learn", "description": "🧠 View Self-Learning Autopsies & Rules"},
             {"command": "channels", "description": "📡 View or Add Tipster Channels (/addchannel)"},
-            {"command": "lotto", "description": "🚀 View Today's $5 High-Odds Lotto Jackpot"},
-            {"command": "setunit", "description": "💵 Set Base Dollar Unit (e.g. /setunit 50)"},
-            {"command": "poststats", "description": "📢 Post End-of-Day Recap to @Footybett"}
+            {"command": "lotto", "description": "🚀 View Today's Optional $5 Mega Lotto"},
+            {"command": "setunit", "description": "💵 Set 1R Single Stake (e.g. /setunit 100)"},
+            {"command": "poststats", "description": "📢 Post/Update End-of-Day Recap on @Footybett"}
         ]
         url = f"{self.base_url}/setMyCommands"
         req = urllib.request.Request(
@@ -4029,7 +4496,7 @@ class TelegramBotClient:
         watcher_thread = threading.Thread(target=self.background_worker_loop, daemon=True)
         watcher_thread.start()
 
-        logger.info("Bot listener running (v30.1 Self-Learning + Image/Text Bet Auditor + Channel Manager)...")
+        logger.info("Bot listener running (v31.0 Auto-Cleaner + Gemini Chaos-Reasoner + Singles-Only W-L)...")
         offset = None
 
         while True:
@@ -4053,7 +4520,7 @@ class TelegramBotClient:
                 if photos:
                     best_photo_id = photos[-1].get("file_id", "")
                     def handle_photo_audit(cid, fid, cap_txt):
-                        self.send_message(cid, "🔎 Reading bet slip image & running Expert + 5-Model safety audit...")
+                        self.send_message(cid, "🔎 Reading bet slip image & running Expert + Gemini Chaos audit...")
                         img_bytes = BetSlipImageOCRAndVisionAnalyzer.download_telegram_photo_bytes(self.bot_token, fid)
                         ocr_text = BetSlipImageOCRAndVisionAnalyzer.extract_text_from_image_bytes(img_bytes or b"")
                         combined_txt = f"{cap_txt}\n{ocr_text}".strip()
@@ -4065,8 +4532,18 @@ class TelegramBotClient:
                     threading.Thread(target=handle_photo_audit, args=[chat_id, best_photo_id, text], daemon=True).start()
                     continue
 
-                # 2. Handle Adding / Removing / Listing Tipster Channels
                 low_t = text.lower()
+
+                # 1b. Handle /clean (Full Channel Deduplication & History Upgrade)
+                if low_t in ["/clean", "/cleanchannel", "/fixhistory"]:
+                    def handle_clean_cmd(cid):
+                        self.send_message(cid, "🧹 Scanning `@Footybett` history, deleting duplicates, and upgrading all posts to v31.0...")
+                        rep = self.clean_and_upgrade_channel_history(auto_startup=False)
+                        self.send_message(cid, rep)
+                    threading.Thread(target=handle_clean_cmd, args=[chat_id], daemon=True).start()
+                    continue
+
+                # 2. Handle Adding / Removing / Listing Tipster Channels
                 if low_t.startswith("/addchannel") or low_t.startswith("add ") or (
                     re.match(r"^(?:@[A-Za-z0-9_]{4,}|https?://t\.me/[A-Za-z0-9_]+)$", text.strip())
                 ):
@@ -4129,7 +4606,7 @@ class TelegramBotClient:
                         )
                     except Exception:
                         cur_u = BankrollStakeSizer.get_unit_usd()
-                        self.send_message(chat_id, f"💵 Current 1.0u = `${cur_u:.0f}`.\nTo change it, send e.g. `/setunit 50` or `/setunit 100`.")
+                        self.send_message(chat_id, f"💵 Current 1.00R = `${cur_u:.0f}`.\nTo change it, send e.g. `/setunit 50` or `/setunit 100`.")
                     continue
 
                 # 3. Handle /learn
@@ -4140,7 +4617,7 @@ class TelegramBotClient:
                     threading.Thread(target=handle_learn, args=[chat_id], daemon=True).start()
                     continue
 
-                # 4. Handle /poststats
+                # 4. Handle /poststats (Edits existing EOD Recap in-place if already posted, never duplicates!)
                 if low_t == "/poststats":
                     def handle_post_stats(cid):
                         self.sync_and_publish_to_footybett()
@@ -4148,8 +4625,19 @@ class TelegramBotClient:
                         if not DailyLedgerManager.load_active_date_items():
                             target_d = DailyLedgerManager.get_yesterday_str()
                         recap = BetSlipCardFormatter.format_end_of_day_channel_recap(target_d)
-                        if self.send_message(PUBLISH_CHANNEL_ID, recap, remove_kb=False):
-                            self.send_message(cid, f"✅ Sent End-of-Day Recap to {PUBLISH_CHANNEL_ID}!\n\n{recap}")
+                        eod_map = load_json_dict(EOD_MESSAGE_IDS_FILE)
+                        existing_mid = int(eod_map.get(target_d) or 0)
+                        if existing_mid > 1:
+                            ok_ed, _ = self.edit_message(PUBLISH_CHANNEL_ID, existing_mid, recap)
+                            if ok_ed:
+                                self.send_message(cid, f"✏️ Updated existing End-of-Day Recap in-place on {PUBLISH_CHANNEL_ID}!\n\n{recap}")
+                                return
+                        new_mid = self.send_message(PUBLISH_CHANNEL_ID, recap, remove_kb=False)
+                        if new_mid:
+                            if new_mid > 1:
+                                eod_map[target_d] = new_mid
+                                save_json_dict(EOD_MESSAGE_IDS_FILE, eod_map)
+                            self.send_message(cid, f"✅ Posted End-of-Day Recap to {PUBLISH_CHANNEL_ID}!\n\n{recap}")
                         else:
                             self.send_message(cid, f"❌ Could not post to {PUBLISH_CHANNEL_ID}.")
                     threading.Thread(target=handle_post_stats, args=[chat_id], daemon=True).start()
