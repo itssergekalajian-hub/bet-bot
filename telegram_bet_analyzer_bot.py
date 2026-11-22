@@ -66,11 +66,44 @@ DEFAULT_UNIT_USD = float(os.environ.get("UNIT_STAKE_USD", "100.0"))
 
 API_FOOTBALL_KEY = os.environ.get("API_FOOTBALL_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
+GEMINI_MODEL_FALLBACKS = (
+    "gemini-3.8-flash",
+    "gemini-4-hydrogen",
+    "gemini-3.5-flash-lite",
+)
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", GEMINI_MODEL_FALLBACKS[0]).strip() or GEMINI_MODEL_FALLBACKS[0]
+GEMINI_MODEL_CANDIDATES = tuple(dict.fromkeys((GEMINI_MODEL, *GEMINI_MODEL_FALLBACKS)))
+GEMINI_MAX_OUTPUT_TOKENS = 8192
 PUBLISH_CHANNEL_ID = os.environ.get("PUBLISH_CHANNEL_ID", "@Footybett")
 BCGAME_PARTNER_URL = os.environ.get("BCGAME_PARTNER_URL", "https://bc.game/i-97sdx2t16q-n/")
 BCGAME_SOCCER_HUB_URL = "https://bc.game/sports/soccer-1"
 BCGAME_DIRECT_URLS_CACHE_FILE = os.path.join( os.path.dirname(os.path.abspath(__file__)), "bcgame_direct_urls_cache.json" )
+
+def _extract_gemini_candidate_text(response: Dict[str, Any]) -> str:
+    candidates = response.get("candidates")
+    if not isinstance(candidates, list):
+        return ""
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        content = candidate.get("content")
+        if not isinstance(content, dict):
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            continue
+        text = "".join(
+            part["text"]
+            for part in parts
+            if isinstance(part, dict)
+            and part.get("thought") is not True
+            and isinstance(part.get("text"), str)
+        ).strip()
+        if text:
+            return text
+    return ""
+
+
 
 BCGAME_LEAGUE_BOARD_URLS: Dict[str, str] = {
     "eng.1": "https://bc.game/sports/soccer/england/premier-league-1669818860469096448",
@@ -3916,8 +3949,8 @@ class QuantitativeEnsembleModels:
 class GeminiDeepReasoningEngine:
     """
     v35.0 Multi-Expert Consensus & "Anything Can Happen in Football" Chaos Reasoning Engine:
-    • Integrates Google Gemini 2.5 Pro / 2.5 Flash (`gemini-2.5-pro` / `gemini-2.5-flash`) via REST API
-      when `GEMINI_API_KEY` or `GOOGLE_API_KEY` is configured on the server, paired with our built-in
+    • Integrates the configured Gemini model and fallbacks via REST API when `GEMINI_API_KEY` or
+      `GOOGLE_API_KEY` is configured on the server, paired with our built-in
       Autonomous Football Game-Script & Chaos Stress-Test Reasoner.
     • Core Principle ("Anything Can Happen in Football"):
       1. In football, a random red card, penalty, deflection, or 10-minute goal burst can turn any match
@@ -4159,22 +4192,21 @@ class GeminiDeepReasoningEngine:
                     "dnb_home, 1x2_winner, under_30, under_25, corners_over_95), best_combo_cushion (one of: over_15, dc_1x, under_35), "
                     "avoid_unders (bool), and brief_reason (max 14 words)."
                 )
-                for model_name in [GEMINI_MODEL, "gemini-2.5-flash"]:
+                for model_name in GEMINI_MODEL_CANDIDATES:
                     try:
                         api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
                         req_body = json.dumps({
                             "contents": [{"parts": [{"text": f"{sys_instruction}\nMatch Dossier: {json.dumps(prompt_payload)}"}]}],
-                            "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"}
+                            "generationConfig": {
+                                "temperature": 0.1,
+                                "responseMimeType": "application/json",
+                                "maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS,
+                            }
                         }).encode("utf-8")
                         req = urllib.request.Request(api_url, data=req_body, headers={"Content-Type": "application/json"})
                         with urllib.request.urlopen(req, timeout=4) as resp:
                             r_json = json.loads(resp.read().decode("utf-8"))
-                            cand_txt = (
-                                r_json.get("candidates", [{}])[0]
-                                .get("content", {})
-                                .get("parts", [{}])[0]
-                                .get("text", "")
-                            )
+                            cand_txt = _extract_gemini_candidate_text(r_json)
                             if cand_txt:
                                 parsed_llm = json.loads(cand_txt)
                                 best_m = str(parsed_llm.get("best_market", "")).strip()
@@ -4192,7 +4224,17 @@ class GeminiDeepReasoningEngine:
                                 if parsed_llm.get("brief_reason"):
                                     llm_note = str(parsed_llm["brief_reason"]).strip()
                                 break
-                    except Exception:
+                    except urllib.error.HTTPError as http_error:
+                        if http_error.code == 404:
+                            logger.info(
+                                "Gemini model %s returned HTTP 404; immediately trying the next model",
+                                model_name,
+                            )
+                        else:
+                            logger.debug("Gemini request failed for %s: %s", model_name, http_error)
+                        continue
+                    except Exception as exc:
+                        logger.debug("Gemini request failed for %s: %s", model_name, exc)
                         continue
             except Exception:
                 pass
@@ -5649,26 +5691,38 @@ class BetSlipImageOCRAndVisionAnalyzer:
         # Layer 1: Gemini Vision API if GEMINI_API_KEY or GOOGLE_API_KEY is available
         gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
         if gemini_key:
-            try:
-                g_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}"
-                payload = {
-                    "contents": [{
-                        "parts": [
-                            {"text": "Extract all football match names (Home vs Away), bet markets (Over/Under, 1x2, BTTS, Corners, Double Chance), and odds from this betting slip image. Format each match as: Home Team vs Away Team - Market @ Odds."},
-                            {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}
-                        ]
-                    }]
-                }
-                req = urllib.request.Request(
-                    g_url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}
-                )
-                with urllib.request.urlopen(req, timeout=12) as resp:
-                    res_json = json.loads(resp.read().decode("utf-8"))
-                    txt = res_json["candidates"][0]["content"]["parts"][0]["text"]
-                    if txt and len(txt.strip()) >= 5:
-                        return txt.strip()
-            except Exception:
-                pass
+            for model_name in GEMINI_MODEL_CANDIDATES:
+                try:
+                    g_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
+                    payload = {
+                        "contents": [{
+                            "parts": [
+                                {"text": "Extract all football match names (Home vs Away), bet markets (Over/Under, 1x2, BTTS, Corners, Double Chance), and odds from this betting slip image. Format each match as: Home Team vs Away Team - Market @ Odds."},
+                                {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}
+                            ]
+                        }],
+                        "generationConfig": {"maxOutputTokens": GEMINI_MAX_OUTPUT_TOKENS},
+                    }
+                    req = urllib.request.Request(
+                        g_url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}
+                    )
+                    with urllib.request.urlopen(req, timeout=12) as resp:
+                        res_json = json.loads(resp.read().decode("utf-8"))
+                        txt = _extract_gemini_candidate_text(res_json)
+                        if txt and len(txt.strip()) >= 5:
+                            return txt.strip()
+                except urllib.error.HTTPError as http_error:
+                    if http_error.code == 404:
+                        logger.info(
+                            "Gemini model %s returned HTTP 404; immediately trying the next model",
+                            model_name,
+                        )
+                    else:
+                        logger.debug("Gemini vision request failed for %s: %s", model_name, http_error)
+                    continue
+                except Exception as exc:
+                    logger.debug("Gemini vision request failed for %s: %s", model_name, exc)
+                    continue
 
         # Layer 2: Local Tesseract OCR CLI if installed on Linux VPS
         try:
