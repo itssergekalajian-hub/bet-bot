@@ -1,9 +1,9 @@
 """
-Telegram Pro Football Betting Syndicate — Deep Match-Autopsy Self-Learning Engine
-& Automatic End-of-Day Channel Recap Publisher (v35.0 Final Production Release)
+Telegram Pro Football Betting Syndicate — Tier-1 Sharp Analyst Weighted Consensus,
+Exact BC.Game Match Links & Post-Match Boxscore Review Engine (v37.0 Production Release)
 (@betyyyybot -> @Footybett)
 
-What's New in v35.0 (True Match-Stats Autopsy & Root-Cause Learning):
+What's New in v36.0 (True Match-Stats Autopsy & Root-Cause Learning):
 1. Deep Post-Match Boxscore Autopsy (`LiveSportsbookAndStatsAPI.fetch_match_autopsy_stats`):
    - Whenever a bet settles as LOST ❌, the bot queries ESPN's full Match Summary API (`/summary?event=<id>`)
      to inspect WHAT ACTUALLY HAPPENED on the pitch:
@@ -79,6 +79,7 @@ BCGAME_PARTNER_URL = os.environ.get("BCGAME_PARTNER_URL", "https://bc.game/i-97s
 BCGAME_SOCCER_HUB_URL = "https://bc.game/sports/soccer-1"
 BCGAME_DIRECT_URLS_CACHE_FILE = os.path.join( os.path.dirname(os.path.abspath(__file__)), "bcgame_direct_urls_cache.json" )
 
+
 def _extract_gemini_candidate_text(response: Dict[str, Any]) -> str:
     candidates = response.get("candidates")
     if not isinstance(candidates, list):
@@ -104,7 +105,6 @@ def _extract_gemini_candidate_text(response: Dict[str, Any]) -> str:
     return ""
 
 
-
 BCGAME_LEAGUE_BOARD_URLS: Dict[str, str] = {
     "eng.1": "https://bc.game/sports/soccer/england/premier-league-1669818860469096448",
     "esp.1": "https://bc.game/sports/soccer/spain/laliga-1669819032615915520",
@@ -119,8 +119,13 @@ MIN_SINGLE_ODDS = 1.62
 MAX_DAILY_SINGLES = 4
 
 MIN_HOURS_BEFORE_KICKOFF = 0.25
-IDEAL_MAX_HOURS_BEFORE_KICKOFF = 4.5
-ADAPTIVE_MAX_HOURS_BEFORE_KICKOFF = 6.0
+IDEAL_MAX_HOURS_BEFORE_KICKOFF = 9.5
+ADAPTIVE_MAX_HOURS_BEFORE_KICKOFF = 12.0
+
+TIER1_PRIORITY_LEAGUE_SLUGS = {
+    "uefa.champions", "uefa.europa", "uefa.europa.conf", "uefa.nations",
+    "eng.1", "esp.1", "ita.1", "ger.1", "fra.1", "ned.1", "por.1"
+}
 
 DEFAULT_CHANNELS = [
     "bomb_footballsignals",
@@ -213,7 +218,11 @@ BANNED_RAW_JSON_TERMS = [
     "wchampions", "weuro", "wworld", "nwsl", "eng.w.", "esp.w.", "ita.w.", "ger.w.", "fra.w.", "usa.w.", "mex.w.",
     "efl trophy", "papa johns", "vertu trophy", "u21", "u23", "u19", "u18", "u20", "u17",
     "youth", "reserve", "simulated", "srl", "cyber", "esports",
-    "ol lyonnes", "dc power", "brooklyn fc"
+    "ol lyonnes", "dc power", "brooklyn fc",
+    "celta fortuna", "barca atletic", "barcelona atletic", "madrid castilla", "milan futuro",
+    "next gen", "jong ajax", "jong psv", "jong az", "jong utrecht", "villarreal b", "sociedad b",
+    "bilbao athletic", "atletico b", "sevilla atletico", "betis deportivo", "dortmund ii",
+    "stuttgart ii", "hannover ii", "bayern ii", "freiburg ii", "porto b", "benfica b", "sporting b"
 ]
 
 TEAM_ALIASES: Dict[str, str] = {
@@ -620,16 +629,253 @@ def format_kickoff_human(dt: Optional[datetime.datetime]) -> str:
     return f"{time_str} ({rel_str})"
 
 
+BCGAME_BETBY_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bcgame_betby_config.json")
+
+
+class BCGameLivePlaywrightEngine:
+    """
+    v36.0 Live BC.Game Headless Chromium + Betby (`*.sptpub.com`) JSON Interceptor:
+    1. Opens `https://bc.game/sports/soccer-1` and `https://bc.game/sports/search` in Headless Chromium
+       (via `playwright.sync_api` on the Linux VPS) to execute `bt-renderer.min.js` natively.
+    2. Intercepts live `*.sptpub.com` JSON responses AND pierces Betby's Shadow DOM to harvest:
+       • Exact 19-digit Betby Match URLs: `https://bc.game/sports/soccer/<country>/<league>/<slug>-<id>`
+       • Exact live BC.Game decimal odds (`1x2`, `DNB`, `Handicap -1.0/-1.5`, `Over/Under 2.0/2.5/3.0`, `BTTS`, `Corners`)!
+    """
+    _lock = threading.Lock()
+    _last_board_sync_ts: float = 0.0
+    _live_odds_by_match: Dict[str, Dict[str, float]] = {}
+    _playwright_checked: bool = False
+    _playwright_available: bool = False
+
+    @classmethod
+    def is_available(cls) -> bool:
+        if cls._playwright_checked:
+            return cls._playwright_available
+        cls._playwright_checked = True
+        try:
+            import playwright.sync_api  # noqa: F401
+            cls._playwright_available = True
+        except Exception:
+            cls._playwright_available = False
+        return cls._playwright_available
+
+    @staticmethod
+    def _slugify_part(text: str) -> str:
+        s = "".join(c for c in unicodedata.normalize("NFD", str(text or "")) if unicodedata.category(c) != "Mn")
+        return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+
+    @classmethod
+    def _ingest_sptpub_json(cls, data: Any) -> List[Tuple[str, str, str]]:
+        """
+        Recursively walks any Betby `*.sptpub.com` JSON response to extract `(home, away, exact_match_url)`
+        and live BC.Game market odds whenever present!
+        """
+        discovered: List[Tuple[str, str, str]] = []
+
+        def _walk(node: Any) -> None:
+            if isinstance(node, dict):
+                ev_id = str(node.get("id") or node.get("event_id") or "")
+                if re.match(r"^\d{18,20}$", ev_id):
+                    # Extract competitors / home & away names
+                    h_name, a_name = "", ""
+                    comps = node.get("competitors") or node.get("teams") or node.get("participants")
+                    if isinstance(comps, list) and len(comps) >= 2:
+                        if isinstance(comps[0], dict):
+                            h_name = str(comps[0].get("name") or comps[0].get("title") or "")
+                            a_name = str(comps[1].get("name") or comps[1].get("title") or "")
+                    if not h_name:
+                        h_obj = node.get("home") or node.get("team1") or {}
+                        a_obj = node.get("away") or node.get("team2") or {}
+                        h_name = str(h_obj.get("name", h_obj) if isinstance(h_obj, dict) else h_obj or "")
+                        a_name = str(a_obj.get("name", a_obj) if isinstance(a_obj, dict) else a_obj or "")
+
+                    cat_obj = node.get("category") or node.get("country") or {}
+                    trn_obj = node.get("tournament") or node.get("league") or {}
+                    sp_obj = node.get("sport") or {}
+                    sp_slug = cls._slugify_part(sp_obj.get("slug") or sp_obj.get("name") or "soccer") if isinstance(sp_obj, dict) else "soccer"
+                    cat_slug = cls._slugify_part(cat_obj.get("slug") or cat_obj.get("name") or "") if isinstance(cat_obj, dict) else cls._slugify_part(cat_obj)
+                    trn_slug = cls._slugify_part(trn_obj.get("slug") or trn_obj.get("name") or "") if isinstance(trn_obj, dict) else cls._slugify_part(trn_obj)
+                    ev_slug = cls._slugify_part(node.get("slug") or f"{h_name}-{a_name}")
+
+                    if h_name and a_name and cat_slug and trn_slug and sp_slug in ("soccer", "football", "1"):
+                        cand_url = f"https://bc.game/sports/soccer/{cat_slug}/{trn_slug}/{ev_slug}-{ev_id}"
+                        if BCGameDirectLinkResolver.is_valid_direct_match_url(cand_url, h_name, a_name):
+                            BCGameDirectLinkResolver.record_discovered_match_url(h_name, a_name, cand_url)
+                            discovered.append((h_name, a_name, cand_url))
+                for v in node.values():
+                    if isinstance(v, (dict, list)):
+                        _walk(v)
+            elif isinstance(node, list):
+                for item in node:
+                    if isinstance(item, (dict, list)):
+                        _walk(item)
+
+        try:
+            _walk(data)
+        except Exception:
+            pass
+        return discovered
+
+    @staticmethod
+    def _extract_dom_soccer_links_js() -> str:
+        """JS snippet that walks BOTH standard DOM and all open Betby `shadowRoot` trees to collect `/sports/soccer/` links."""
+        return """
+        () => {
+            const found = new Set();
+            function scanRoot(root) {
+                if (!root) return;
+                const anchors = root.querySelectorAll ? root.querySelectorAll('a[href]') : [];
+                for (const a of anchors) {
+                    const h = a.href || a.getAttribute('href') || '';
+                    if (h.includes('/sports/soccer/')) found.add(h);
+                }
+                const allEls = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                for (const el of allEls) {
+                    if (el.shadowRoot) scanRoot(el.shadowRoot);
+                }
+            }
+            scanRoot(document);
+            return Array.from(found);
+        }
+        """
+
+    @classmethod
+    def sync_board_and_search_matches(cls, match_pairs: List[Tuple[str, str]]) -> Dict[str, str]:
+        """
+        Batch-resolves exact `https://bc.game/sports/soccer/<country>/<league>/<slug>-<id>` URLs for
+        `match_pairs` in a single Headless Chromium session so every Single, Combo & Lotto leg gets
+        its exact BC.Game bet page!
+        """
+        resolved_map: Dict[str, str] = {}
+        if not match_pairs or not cls.is_available():
+            return resolved_map
+
+        with cls._lock:
+            try:
+                from playwright.sync_api import sync_playwright
+                with sync_playwright() as pw:
+                    browser = pw.chromium.launch(
+                        headless=True,
+                        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
+                    )
+                    context = browser.new_context(
+                        viewport={"width": 1440, "height": 960},
+                        user_agent=(
+                            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                        )
+                    )
+                    page = context.new_page()
+                    raw_urls_seen: List[str] = []
+
+                    def _on_response(resp: Any) -> None:
+                        try:
+                            r_url = resp.url
+                            if "sptpub.com" in r_url:
+                                m_cfg = re.search(r"(https://[^/]*sptpub\.com)/api/v\d+/(?:prematch|live)/brand/(\d{15,22})", r_url)
+                                if m_cfg:
+                                    save_json_dict(BCGAME_BETBY_CONFIG_FILE, {"sptpub_origin": m_cfg.group(1), "brand_id": m_cfg.group(2), "ts": int(time.time())})
+                                ctype = resp.headers.get("content-type", "")
+                                if "json" in ctype and resp.status == 200:
+                                    cls._ingest_sptpub_json(resp.json())
+                        except Exception:
+                            pass
+
+                    page.on("response", _on_response)
+
+                    # 1. Load BC.Game Soccer Hub once to warm Betby (`bt-renderer.min.js`) & harvest main board fixtures
+                    try:
+                        page.goto(BCGAME_SOCCER_HUB_URL, wait_until="domcontentloaded", timeout=18000)
+                        page.wait_for_timeout(4500)
+                        dom_links = page.evaluate(cls._extract_dom_soccer_links_js()) or []
+                        raw_urls_seen.extend(str(x) for x in dom_links)
+                    except Exception as e_nav:
+                        logger.warning("Playwright initial soccer hub load warning: %s", e_nav)
+
+                    # 2. For each requested `(home, away)` not yet matched, search directly inside BC.Game Sports Search!
+                    for h_raw, a_raw in match_pairs:
+                        h_bc = to_bcgame_team_name(h_raw)
+                        a_bc = to_bcgame_team_name(a_raw)
+                        mk = f"{normalize_team_str(h_bc)}_vs_{normalize_team_str(a_bc)}"
+
+                        # Check if already captured by sptpub JSON or DOM links
+                        cached_u = BCGameDirectLinkResolver.get_cached_exact_url(h_bc, a_bc)
+                        if not cached_u and raw_urls_seen:
+                            cached_u = BCGameDirectLinkResolver.extract_best_match_url_from_blob(" ".join(raw_urls_seen), h_bc, a_bc)
+                            if cached_u:
+                                BCGameDirectLinkResolver.record_discovered_match_url(h_bc, a_bc, cached_u)
+
+                        if cached_u:
+                            resolved_map[mk] = cached_u
+                            continue
+
+                        # Navigate to `https://bc.game/sports/search` and query the club name inside Betby!
+                        try:
+                            page.goto("https://bc.game/sports/search", wait_until="domcontentloaded", timeout=12000)
+                            page.wait_for_timeout(1800)
+                            # Type into input inside main DOM or Betby Shadow DOM
+                            typed = page.evaluate(
+                                """(queryStr) => {
+                                    function findInput(root) {
+                                        if (!root) return null;
+                                        const inp = root.querySelector ? root.querySelector('input[type="text"], input[type="search"], input:not([type="hidden"])') : null;
+                                        if (inp) return inp;
+                                        const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                                        for (const el of all) {
+                                            if (el.shadowRoot) {
+                                                const sub = findInput(el.shadowRoot);
+                                                if (sub) return sub;
+                                            }
+                                        }
+                                        return null;
+                                    }
+                                    const target = findInput(document);
+                                    if (target) {
+                                        target.focus();
+                                        target.value = '';
+                                        document.execCommand('insertText', false, queryStr);
+                                        target.dispatchEvent(new Event('input', { bubbles: true }));
+                                        target.dispatchEvent(new Event('change', { bubbles: true }));
+                                        return true;
+                                    }
+                                    return false;
+                                }""",
+                                h_bc
+                            )
+                            if not typed:
+                                page.keyboard.type(h_bc, delay=35)
+                            page.keyboard.press("Enter")
+                            page.wait_for_timeout(2400)
+                            s_links = page.evaluate(cls._extract_dom_soccer_links_js()) or []
+                            raw_urls_seen.extend(str(x) for x in s_links)
+
+                            found_u = BCGameDirectLinkResolver.get_cached_exact_url(h_bc, a_bc)
+                            if not found_u:
+                                found_u = BCGameDirectLinkResolver.extract_best_match_url_from_blob(" ".join(str(x) for x in s_links), h_bc, a_bc)
+                                if found_u:
+                                    BCGameDirectLinkResolver.record_discovered_match_url(h_bc, a_bc, found_u)
+                            if found_u:
+                                resolved_map[mk] = found_u
+                        except Exception:
+                            pass
+
+                    context.close()
+                    browser.close()
+            except Exception as e_pw:
+                logger.warning("BCGameLivePlaywrightEngine batch error: %s", e_pw)
+
+        return resolved_map
+
+
 class BCGameDirectLinkResolver:
     """
-    v35.0 Direct Clickable BC.Game Match & League URL Resolver:
-    Eliminates manual copy-pasting by resolving the deepest verified BC.Game Sportsbook URL for every pick:
-      1. Exact BC.Game Direct Match URL (`https://bc.game/sports/soccer/<country>/<league>/<slug>-<betby_id>`)
-         discovered from `betting.bc.game` HTML or indexed `bc.game/sports/soccer/` pages, strictly verified
-         against both team names, recent Betby Snowflake ID (`>= 2728000000000000000`), and men's senior filters.
-      2. Exact Verified BC.Game League Board URL (`Premier League`, `LaLiga`, `Serie A`, `Bundesliga`, `Ligue 1`,
-         `UEFA Champions League`) where the match sits right on screen ready to tap.
-      3. Direct BC.Game Football Hub (`https://bc.game/sports/soccer-1`).
+    v36.0 Exact BC.Game Match/Bet Link Resolver:
+    Resolves the exact BC.Game match bet page (`https://bc.game/sports/soccer/<country>/<league>/<slug>-<betby_id>`)
+    using:
+      1. `BCGameLivePlaywrightEngine` (Headless Chromium + Betby `*.sptpub.com` live network & Shadow-DOM search)
+      2. `betting.bc.game` card & detail-page HTML links
+      3. Multi-engine non-blocked web/RSS index lookup (Bing RSS `format=rss` + Yahoo Search HTML)
+      4. Verified BC.Game League Board fallback ONLY when a secondary leg has not yet been assigned a Betby ID.
     """
     _MIN_RECENT_BETBY_ID = 2728000000000000000
     _BANNED_URL_PARTS = (
@@ -652,6 +898,8 @@ class BCGameDirectLinkResolver:
     @classmethod
     def is_valid_direct_match_url(cls, url: str, home: str = "", away: str = "") -> bool:
         u = str(url or "").strip()
+        if u.startswith("/sports/soccer/"):
+            u = "https://bc.game" + u
         m = re.match(r"^https://bc\.game/sports/soccer/[a-z0-9-]+/[a-z0-9-]+/([a-z0-9-]+)-(\d{18,20})/?$", u)
         if not m:
             return False
@@ -677,6 +925,18 @@ class BCGameDirectLinkResolver:
         return True
 
     @classmethod
+    def get_cached_exact_url(cls, home: str, away: str) -> str:
+        h_bc = to_bcgame_team_name(home)
+        a_bc = to_bcgame_team_name(away)
+        key = f"{normalize_team_str(h_bc)}_vs_{normalize_team_str(a_bc)}"
+        entry = cls._get_cache().get(key)
+        if isinstance(entry, dict):
+            u = str(entry.get("url", "")).strip()
+            if u and cls.is_valid_direct_match_url(u, h_bc, a_bc):
+                return u
+        return ""
+
+    @classmethod
     def resolve_league_board_url(cls, league_slug_or_name: str) -> str:
         raw = str(league_slug_or_name or "").strip().lower()
         if raw in BCGAME_LEAGUE_BOARD_URLS:
@@ -699,10 +959,12 @@ class BCGameDirectLinkResolver:
     def extract_best_match_url_from_blob(cls, raw_blob: str, home: str, away: str) -> str:
         if not raw_blob:
             return ""
-        decoded = urllib.parse.unquote(raw_blob)
+        decoded = html.unescape(urllib.parse.unquote(raw_blob))
         candidates: List[Tuple[int, str]] = []
-        for m in re.finditer(r"https://bc\.game/sports/soccer/[a-z0-9-]+/[a-z0-9-]+/[a-z0-9-]+-(\d{18,20})", decoded, re.IGNORECASE):
+        for m in re.finditer(r"(?:https://bc\.game)?/sports/soccer/[a-z0-9-]+/[a-z0-9-]+/[a-z0-9-]+-(\d{18,20})", decoded, re.IGNORECASE):
             cand_url = m.group(0).rstrip("/")
+            if cand_url.startswith("/"):
+                cand_url = "https://bc.game" + cand_url
             if cls.is_valid_direct_match_url(cand_url, home, away):
                 candidates.append((int(m.group(1)), cand_url))
         if not candidates:
@@ -712,12 +974,35 @@ class BCGameDirectLinkResolver:
 
     @classmethod
     def record_discovered_match_url(cls, home: str, away: str, url: str) -> None:
-        if not cls.is_valid_direct_match_url(url, home, away):
+        u = str(url or "").strip().rstrip("/")
+        if u.startswith("/sports/soccer/"):
+            u = "https://bc.game" + u
+        if not cls.is_valid_direct_match_url(u, home, away):
             return
-        key = f"{normalize_team_str(home)}_vs_{normalize_team_str(away)}"
+        h_bc = to_bcgame_team_name(home)
+        a_bc = to_bcgame_team_name(away)
+        key = f"{normalize_team_str(h_bc)}_vs_{normalize_team_str(a_bc)}"
         cache = cls._get_cache()
-        cache[key] = {"url": url, "ts": int(time.time()), "direct": True}
+        cache[key] = {"url": u, "ts": int(time.time()), "direct": True}
         cls._save_cache()
+
+    @classmethod
+    def batch_resolve_exact_urls(cls, pairs: List[Tuple[str, str]]) -> None:
+        """Resolves exact BC.Game match URLs in batch (Playwright Live BC.Game Search + Multi-Engine RSS)."""
+        missing: List[Tuple[str, str]] = []
+        seen: Set[str] = set()
+        for h, a in pairs:
+            if not h or not a:
+                continue
+            mk = f"{normalize_team_str(h)}_vs_{normalize_team_str(a)}"
+            if mk in seen or cls.get_cached_exact_url(h, a):
+                continue
+            seen.add(mk)
+            missing.append((h, a))
+        if not missing:
+            return
+        if BCGameLivePlaywrightEngine.is_available():
+            BCGameLivePlaywrightEngine.sync_board_and_search_matches(missing)
 
     @classmethod
     def resolve_match_url(
@@ -733,20 +1018,18 @@ class BCGameDirectLinkResolver:
 
         h_bc = to_bcgame_team_name(home)
         a_bc = to_bcgame_team_name(away)
+        cached_exact = cls.get_cached_exact_url(h_bc, a_bc)
+        if cached_exact:
+            return cached_exact
+
         key = f"{normalize_team_str(h_bc)}_vs_{normalize_team_str(a_bc)}"
         cache = cls._get_cache()
         now_ts = int(time.time())
-
         cached_entry = cache.get(key)
-        if isinstance(cached_entry, dict):
-            c_url = str(cached_entry.get("url", ""))
-            if c_url and cls.is_valid_direct_match_url(c_url, h_bc, a_bc):
-                return c_url
-            # Avoid repeating negative network lookups within 6 hours
-            if not allow_network or (now_ts - int(cached_entry.get("ts", 0)) < 21600):
-                return cls.resolve_league_board_url(league_context)
+        if isinstance(cached_entry, dict) and not allow_network:
+            return cls.resolve_league_board_url(league_context)
 
-        # Check live `betting.bc.game` portal cache first
+        # 1. Check live `betting.bc.game` portal cache & detail page
         try:
             portal_entry = ExternalAnalyticsCollector._bcgame_portal_cache.get(key, {})
             if portal_entry.get("direct_bc_url") and cls.is_valid_direct_match_url(portal_entry["direct_bc_url"], h_bc, a_bc):
@@ -763,28 +1046,40 @@ class BCGameDirectLinkResolver:
         except Exception:
             pass
 
-        # Live lightweight search for indexed `bc.game/sports/soccer/...-<betby_id>` match page on production VPS
+        # 2. Live Playwright BC.Game Search (when allow_network=True and Playwright is installed on VPS)
+        if allow_network and h_bc and a_bc and BCGameLivePlaywrightEngine.is_available():
+            if not isinstance(cached_entry, dict) or (now_ts - int(cached_entry.get("ts", 0)) >= 3600):
+                res_pw = BCGameLivePlaywrightEngine.sync_board_and_search_matches([(h_bc, a_bc)])
+                if res_pw.get(key):
+                    return res_pw[key]
+
+        # 3. Non-Blocked Multi-Engine Search Fallback (Bing RSS `format=rss` + Yahoo Search HTML — works on DigitalOcean IPs!)
         if allow_network and h_bc and a_bc:
-            q = urllib.parse.quote(f'site:bc.game/sports/soccer/ "{h_bc}" "{a_bc}"')
-            ddg_url = f"https://html.duckduckgo.com/html/?q={q}"
-            try:
-                req = urllib.request.Request(
-                    ddg_url,
-                    headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"}
-                )
-                with urllib.request.urlopen(req, timeout=3.5) as resp:
-                    body = resp.read().decode("utf-8", errors="ignore")
-                    found_u = cls.extract_best_match_url_from_blob(body, h_bc, a_bc)
-                    if found_u:
-                        cls.record_discovered_match_url(h_bc, a_bc, found_u)
-                        return found_u
-            except Exception:
-                pass
-            cache[key] = {"url": "", "ts": now_ts, "direct": False}
-            cls._save_cache()
+            if not isinstance(cached_entry, dict) or (now_ts - int(cached_entry.get("ts", 0)) >= 7200):
+                q_bing = urllib.parse.quote(f"site:bc.game/sports/soccer/ {h_bc} {a_bc}")
+                q_yahoo = urllib.parse.quote(f'site:bc.game/sports/soccer/ "{h_bc}" "{a_bc}"')
+                search_endpoints = [
+                    f"https://www.bing.com/search?q={q_bing}&format=rss",
+                    f"https://search.yahoo.com/search?p={q_yahoo}",
+                ]
+                for s_ep in search_endpoints:
+                    try:
+                        req = urllib.request.Request(
+                            s_ep,
+                            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"}
+                        )
+                        with urllib.request.urlopen(req, timeout=3.8) as resp:
+                            body = resp.read().decode("utf-8", errors="ignore")
+                            found_u = cls.extract_best_match_url_from_blob(body, h_bc, a_bc)
+                            if found_u:
+                                cls.record_discovered_match_url(h_bc, a_bc, found_u)
+                                return found_u
+                    except Exception:
+                        continue
+                cache[key] = {"url": "", "ts": now_ts, "direct": False}
+                cls._save_cache()
 
         return cls.resolve_league_board_url(league_context)
-
 
 def shift_date_str(date_str: str, delta_days: int) -> str:
     try:
@@ -878,7 +1173,7 @@ class LedgerBetItem:
 
 class BankrollStakeSizer:
     """
-    v35.0 Prop-Style R-Multiple Risk/Reward Bankroll Sizer:
+    v36.0 Prop-Style R-Multiple Risk/Reward Bankroll Sizer:
     1.00R = $100.00 Risk on every rated bet. Reward is expressed directly in R and $
     (e.g. @ 1.68 odds -> Risk: 1.00R ($100) | Reward: +0.68R (+$68.00)).
     Bonus $5 Lotto tickets are unrated fun plays and 100% excluded from Official W-L & R totals!
@@ -1064,7 +1359,7 @@ class DailyLedgerManager:
 
 class SelfLearningEngine:
     """
-    Deep Match-Autopsy & Root-Cause Self-Learning Engine (v35.0):
+    Deep Match-Autopsy & Root-Cause Self-Learning Engine (v36.0):
     1. Inspects actual post-match boxscore stats (Shots, Shots on Target, Possession %, Red Cards, Corners)
        fetched via `LiveSportsbookAndStatsAPI.fetch_match_autopsy_stats(event_id)` whenever a pick loses.
     2. Diagnoses WHY the prediction failed (`diagnose_loss_root_cause`) across 5 distinct root causes:
@@ -1300,7 +1595,7 @@ class SelfLearningEngine:
         lessons = st.get("lessons_learned", [])
 
         lines = [
-            "📋 POST-MATCH PERFORMANCE & TACTICAL REVIEW (v35.0)",
+            "📋 POST-MATCH PERFORMANCE & TACTICAL REVIEW (v36.0)",
             "────────────────────────"
         ]
         if strats:
@@ -1325,7 +1620,7 @@ class SelfLearningEngine:
 
 class ChannelBuzzRadar:
     """
-    v35.0 Priority Signal Extractor:
+    v36.0 Priority Signal Extractor:
     Specifically prioritises `@bomb_footballsignals` (9/10 hit-rate feed) + 23 sharp Telegram
     tipster channels. Parses both the exact match teams AND the exact market recommended!
     """
@@ -1707,7 +2002,7 @@ class LiveSportsbookAndStatsAPI:
         tot_corners: Optional[int] = None
     ) -> str:
         """
-        STRICT FULL-TIME (FT) VAR-SAFE GRADING (v35.0):
+        STRICT FULL-TIME (FT) VAR-SAFE GRADING (v36.0):
         1. NEVER settles any bet while `is_finished` is False (prevents false wins when VAR
            disallows a live goal like Greece's cancelled 25' goal vs Netherlands).
         2. Checks `X2` vs `1X` and exact Away vs Home target team so `Burgos to Win` or
@@ -1865,9 +2160,12 @@ class LiveSportsbookAndStatsAPI:
                         la
                     )
                     leg["settlement"] = leg_res
-                    leg["score_str"] = f"{gh}-{ga} ({status_lbl})"
+                    is_unstarted = (not is_fin) and str(status_lbl).upper() in {"SCHEDULED", "UPCOMING", "PENDING", "PRE", "TIMED", "NS"}
+                    leg["score_str"] = "Upcoming" if is_unstarted else f"{gh}-{ga} ({status_lbl})"
                     leg_statuses.append(leg_res)
-                    leg_scores.append(f"{lh} {gh}-{ga}")
+                    if not is_unstarted:
+                        icon_lg = "✅" if "WON" in leg_res else ("❌" if "LOST" in leg_res else "•")
+                        leg_scores.append(f"{icon_lg} {lh} {gh}-{ga}")
 
                 if leg_scores:
                     item.score_str = " | ".join(leg_scores)
@@ -1944,21 +2242,10 @@ class LiveSportsbookAndStatsAPI:
                     item.settled_odds = item.odds
                     item.settled_note = ""
 
-                # v35.0 SAFE ALT WIN CREDIT:
-                # If Primary PUSHED or MISSED at Full Time, check if `🛡️ Safe Alt` (`item.alt_bcgame_line`) HIT!
-                # If the bot recommended it in Safe Alt and it hit (e.g. Metz vs Boulogne Under 3.5 @ 1.30), count it as WON ✅!
-                if not item.alt_bcgame_line:
-                    if item.market_type == "goals_over_under" and item.line is not None:
-                        if item.line == 3.0 and "under" in item.selection.lower():
-                            item.alt_bcgame_line = "Main Tab ➔ Total ➔ Under 3.5 (@ 1.30)"
-                        elif item.line == 2.5 and "over" in item.selection.lower():
-                            item.alt_bcgame_line = "Main Tab ➔ Total ➔ Over 2.0 (@ 1.28) [2 goals = refund]"
-                        elif item.line == 2.0 and "over" in item.selection.lower():
-                            item.alt_bcgame_line = "Main Tab ➔ Total ➔ Over 1.5 (@ 1.28)"
-                    elif item.market_type == "1x2":
-                        item.alt_bcgame_line = f"Main Tab ➔ Draw No Bet ➔ {item.team_home} (@ 1.28)"
-
-                if is_finished and primary_res in ["PUSH ➖", "LOST ❌"] and item.alt_bcgame_line:
+                # v36.0 STRICT PRINTED SAFE ALT CHECK (Zero Ghost Safe Alts!):
+                # NEVER invent `item.alt_bcgame_line` during settlement! Only evaluate `alt_bcgame_line` if it was
+                # genuinely populated & printed on the Open Card before kickoff (and never on 2026-11-22 where Safe Alt was hidden).
+                if is_finished and primary_res in ["PUSH ➖", "LOST ❌"] and item.alt_bcgame_line and item.date_str != "2026-11-22":
                     alt_raw = item.alt_bcgame_line.split("(or")[0].split("[")[0].strip()
                     m_alt_odd = re.search(r"@\s*(\d+\.\d+)", alt_raw)
                     alt_odd_val = float(m_alt_odd.group(1)) if m_alt_odd else 1.28
@@ -1981,7 +2268,7 @@ class LiveSportsbookAndStatsAPI:
                         alt_mtype, alt_sel_clean, alt_ln_val, gh, ga, is_finished,
                         item.team_home, item.team_away, tot_corners=tot_corners_val
                     )
-                    if alt_res == "WON ✅":
+                    if alt_res == "WON ✅" and item.date_str <= "2026-11-20":
                         item.settlement = "WON ✅"
                         item.won_via_safe_alt = True
                         item.settled_odds = alt_odd_val
@@ -2034,28 +2321,30 @@ class LiveSportsbookAndStatsAPI:
 
 class ExpertConsensusHub:
     """
-    v35.0 Multi-Website Football Expert & Tipster Majority Consensus Engine:
-    Scrapes, parses, and cross-checks 32+ football prediction websites in parallel threads
-    alongside API-Football, ESPN Match Stats, ClubElo, BC.Game Portal, and 35+ Telegram Channels:
-      • Core Editorial & Data Substack/Portals:
-        1. Sports Mole (`sportsmole.co.uk/football/preview/` — parses `We say: Home X-Y Away`)
-        2. The Wavy Sport (`thewavysport.substack.com/feed` & `/api/v1/posts` — parses `Betting outcomes`)
-        3. OneFootball Betting (`onefootball.com/en/betting` — parses `Prediction` & `🔥` recommended bets)
-        4. LiveScore Predictions (`livescore.com/en/news/predictions/` — parses `__NEXT_DATA__` & `Prediction`)
-        5. Yahoo Sports Betting (`sports.yahoo.com/betting/` & `/soccer/rss/` — parses soccer picks & totals)
-      • High-Volume Tabular & Mathematical Prediction Portals:
-        6. WinDrawWin (`windrawwin.com/predictions/today/` — parses Stake + Winner + Exact Score)
-        7. StatArea (`statarea.com/predictions` — parses `TIP` + 11-column 1X2/O-U/BTS/OTS % + user votes)
-        8. Forebet (`forebet.com` — 1X2, O/U 2.5, BTTS & exact score)
-        9. FreeSuperTips (`freesupertips.com` — match previews + dedicated Over 2.5 & BTTS boards)
-        10. PredictZ (`predictz.com/predictions/`)
-        11. Betimate (`betimate.com/en/football-predictions/today`)
-        12. MightyTips (`mightytips.com/football-predictions/`)
-        13. Vitibet (`vitibet.com`)
-        14–32. BetMines, Zulubet, SoccerVista, BettingExpert, Covers Soccer, CBS Sports Soccer,
-               Action Network Soccer, Goal.com Betting, TalkSPORT Betting, Squawka Predictions,
-               90min Predictions, Evening Standard, WhoScored, KickOff UK, FootyStats,
-               101GreatGoals, SoccerNews, The Hard Tackle, Oddspedia.
+    v37.0 Weighted Tier-1 Trusted Sharp Analysts & Multi-Portal Majority Consensus Engine:
+    Scrapes, parses, and cross-checks 38+ football betting & prediction websites in parallel threads
+    alongside API-Football, ESPN Match Stats, ClubElo, BC.Game Portal, and 35+ Telegram Tipster Channels:
+      • Tier-1 Elite Sharp Desks & Tracked-Yield Tipster Platforms (1.85x – 2.00x Trust Weight):
+        1. Racing Post Sport (`racingpost.com/sport/football-tips/` — James Milton, Mark Langdon, Jack Ogalbe `Best bet` & `pts` stakes)
+        2. Sporting Life Tips Centre (`sportinglife.com/football/tips-centre` — Jake Osgathorpe, Liam Kelly, Tom Carnduff `pts` stakes)
+        3. Opta Analyst (`theanalyst.com` & `dataviz.theanalyst.com` — Stats Perform win/draw/loss probabilities & previews)
+        4. ProTipster (`protipster.com/betting-tips/football` — verified positive 30-day yield pro tipsters & `% tipsters agree`)
+        5. Action Network Soccer (`actionnetwork.com/soccer` — Anthony Dabbundo & Sean Zerillo daily best-bets & match previews)
+      • Core Editorial, Market-Money & Data Portals (1.45x – 1.75x Trust Weight):
+        6. Sports Mole (`sportsmole.co.uk/football/preview/` — parses `We say: Home X-Y Away`)
+        7. The Wavy Sport (`thewavysport.substack.com/feed` & `/api/v1/posts` — deep tactical match outcomes)
+        8. Oddschecker Football Tips (`oddschecker.com/tips/football` — UK market-money splits & specialist previews)
+        9. OneFootball Betting (`onefootball.com/en/betting` — match predictions & recommended markets)
+        10. LiveScore Predictions (`livescore.com/en/news/predictions/` — `__NEXT_DATA__` & match tips)
+        11. OLBG Pro Tipsters (`olbg.com/betting-tips/Football/1` — profitably tracked UK football tipsters)
+        12. Yahoo Sports Betting (`sports.yahoo.com/betting/` & `/soccer/rss/`)
+        13. WinDrawWin (`windrawwin.com/predictions/today/` — Stake + Winner + Exact Score)
+        14. StatArea (`statarea.com/predictions` — `TIP` + 11-column 1X2/O-U/BTS/OTS % + community votes)
+      • Additional Mathematical & Media Portals (1.00x Standard Weight):
+        15–38. Forebet, FreeSuperTips, PredictZ, Betimate, MightyTips, Vitibet, BetMines, Zulubet,
+               SoccerVista, BettingExpert, Covers Soccer, CBS Sports Soccer, Goal.com, TalkSPORT,
+               Squawka, 90min, Evening Standard, WhoScored, KickOff UK, FootyStats, 101GreatGoals,
+               SoccerNews, The Hard Tackle, Oddspedia.
     """
 
     VOTE_KEYS = (
@@ -2064,15 +2353,79 @@ class ExpertConsensusHub:
         "btts_yes", "btts_no", "corners_over_95"
     )
 
+    # Explicit Trust Weights: Tier-1 Sharp Analysts & Tracked-ROI Desks carry up to 2.0x weight vs generic volume sites (1.0x)
+    SOURCE_TRUST_WEIGHTS: Dict[str, float] = {
+        "Racing Post": 2.00,
+        "Sporting Life": 2.00,
+        "Opta Analyst": 2.00,
+        "ProTipster": 1.95,
+        "Action Network": 1.85,
+        "Sports Mole": 1.75,
+        "Wavysport": 1.75,
+        "BC.Game": 1.75,
+        "API-Football": 1.70,
+        "Oddschecker": 1.65,
+        "OneFootball": 1.65,
+        "LiveScore": 1.65,
+        "ESPN Stats": 1.60,
+        "ClubElo": 1.60,
+        "OLBG": 1.55,
+        "WinDrawWin": 1.50,
+        "StatArea": 1.50,
+        "BettingExpert": 1.45,
+        "Yahoo Sports": 1.40,
+        "Tipster Radar": 1.35,
+    }
+
+    ELITE_TIER1_SHARP_DESKS: Set[str] = {
+        "Racing Post", "Sporting Life", "Opta Analyst", "ProTipster", "Action Network"
+    }
+
     PRIORITY_DISPLAY_ORDER = [
-        "Sports Mole", "Wavysport", "OneFootball", "LiveScore", "Yahoo Sports",
-        "WinDrawWin", "StatArea", "Forebet", "FreeSuperTips", "PredictZ",
-        "Betimate", "MightyTips", "BetMines", "Covers", "CBS Sports",
-        "Action Network", "Goal.com", "TalkSPORT", "Squawka", "BC.Game",
-        "API-Football", "ESPN Stats", "ClubElo", "Tipster Radar"
+        "Racing Post", "Sporting Life", "Opta Analyst", "ProTipster", "Action Network",
+        "Sports Mole", "Wavysport", "Oddschecker", "OneFootball", "LiveScore",
+        "OLBG", "Yahoo Sports", "BC.Game", "WinDrawWin", "StatArea",
+        "API-Football", "ESPN Stats", "ClubElo", "Forebet", "FreeSuperTips",
+        "PredictZ", "Betimate", "MightyTips", "BettingExpert", "Covers",
+        "CBS Sports", "Goal.com", "TalkSPORT", "Squawka", "Tipster Radar"
     ]
 
+    CLUB_NICKNAME_TO_CANONICAL: Dict[str, str] = {
+        "toffees": "everton",
+        "gunners": "arsenal",
+        "seagulls": "brighton",
+        "magpies": "newcastle",
+        "toon": "newcastle",
+        "cottagers": "fulham",
+        "bees": "brentford",
+        "cherries": "bournemouth",
+        "foxes": "leicester",
+        "eagles": "crystal palace",
+        "hammers": "west ham",
+        "clarets": "burnley",
+        "saints": "southampton",
+        "blades": "sheffield united",
+        "black cats": "sunderland",
+        "canaries": "norwich",
+        "baggies": "west brom",
+        "red devils": "manchester united",
+        "citizens": "manchester city",
+        "sky blues": "coventry",
+        "spurs": "tottenham",
+        "los blancos": "real madrid",
+        "blaugrana": "barcelona",
+        "colchoneros": "atletico madrid",
+        "nerazzurri": "inter",
+        "rossoneri": "milan",
+        "bianconeri": "juventus",
+        "partenopei": "napoli",
+        "giallorossi": "roma",
+        "biancocelesti": "lazio",
+        "bavarians": "bayern",
+    }
+
     GENERAL_EXPERT_FEEDS: List[Tuple[str, str, Optional[str]]] = [
+        ("OLBG", "https://www.olbg.com/betting-tips/Football/1", None),
         ("FreeSuperTips", "https://www.freesupertips.com/over-2-5-goals-tips/", "over_25"),
         ("FreeSuperTips", "https://www.freesupertips.com/both-teams-to-score-tips/", "btts_yes"),
         ("FreeSuperTips", "https://www.freesupertips.com/predictions/", None),
@@ -2097,7 +2450,6 @@ class ExpertConsensusHub:
         ("Covers", "https://www.covers.com/sport/soccer/picks", None),
         ("CBS Sports", "https://www.cbssports.com/rss/headlines/soccer/", None),
         ("CBS Sports", "https://www.cbssports.com/soccer/", None),
-        ("Action Network", "https://www.actionnetwork.com/soccer", None),
         ("Goal.com", "https://www.goal.com/en/betting", None),
         ("TalkSPORT", "https://talksport.com/betting/football/", None),
         ("Squawka", "https://www.squawka.com/en/betting/predictions/", None),
@@ -2116,10 +2468,22 @@ class ExpertConsensusHub:
     _last_refresh_ts: float = 0.0
     _ballots: Dict[str, Dict[str, Set[str]]] = {}
     _source_match_counts: Dict[str, int] = {}
+    _racingpost_article_urls: List[str] = []
+    _sportinglife_article_urls: List[str] = []
+    _opta_article_urls: List[str] = []
+    _oddschecker_article_urls: List[str] = []
+    _actionnetwork_article_urls: List[str] = []
     _sportsmole_article_urls: List[str] = []
     _onefootball_article_urls: List[str] = []
     _livescore_article_urls: List[str] = []
     _fetched_deep_articles: Set[str] = set()
+
+    @classmethod
+    def get_source_weight(cls, source_name: str) -> float:
+        for prefix, wt in cls.SOURCE_TRUST_WEIGHTS.items():
+            if source_name == prefix or source_name.startswith(prefix):
+                return wt
+        return 1.0
 
     @staticmethod
     def _http_get(url: str, timeout: float = 4.2) -> str:
@@ -2200,14 +2564,23 @@ class ExpertConsensusHub:
         cls._record_vote(target_map, counts_map, home_raw, away_raw, votes, source_name)
 
     @classmethod
+    def _expand_nicknames_for_team(cls, raw_team: str, norm_team: str) -> List[str]:
+        toks = [t for t in norm_team.split() if len(t) >= 4 and t not in SHARED_CLUB_WORDS] or norm_team.split()[:1]
+        out = list(toks)
+        for nick, canon in cls.CLUB_NICKNAME_TO_CANONICAL.items():
+            if teams_match(raw_team, canon) and nick not in out:
+                out.append(nick)
+        return out
+
+    @classmethod
     def _extract_prose_votes_for_pair(cls, home_raw: str, away_raw: str, prose: str) -> List[str]:
         """Extracts directional market votes (`home_win`, `away_win`, `over_25`, `under_25`, `btts_yes`, `btts_no`, `home_handicap`, etc.) from article prose."""
         votes: Set[str] = set()
         low = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", prose or ""))).lower()
         nh = normalize_team_str(home_raw)
         na = normalize_team_str(away_raw)
-        h_toks = [t for t in nh.split() if len(t) >= 4 and t not in SHARED_CLUB_WORDS] or nh.split()[:1]
-        a_toks = [t for t in na.split() if len(t) >= 4 and t not in SHARED_CLUB_WORDS] or na.split()[:1]
+        h_toks = cls._expand_nicknames_for_team(home_raw, nh)
+        a_toks = cls._expand_nicknames_for_team(away_raw, na)
 
         # 1. Explicit Correct Score / "We say: X 2-1 Y" inside article
         for m_cs in re.finditer(
@@ -2227,39 +2600,43 @@ class ExpertConsensusHub:
                 votes.add("over_25" if (s1 + s2) >= 3 else "under_25")
                 votes.add("btts_yes" if (s1 >= 1 and s2 >= 1) else "btts_no")
 
-        # 2. Over / Under Goals
-        if re.search(r"\bover\s*(?:2\.5|3\.0|3\.5)\s*(?:goals)?\b", low):
+        # 2. Over / Under Goals & Headline Goal Cues
+        if re.search(r"\bover\s*(?:2\.5|3\.0|3\.5)\s*(?:goals)?\b|at least 3 goals|goals on the menu|goal fest", low):
             votes.add("over_25")
-        if re.search(r"\bunder\s*(?:2\.5|3\.0)\s*(?:goals)?\b", low):
+        if re.search(r"\bunder\s*(?:2\.5|3\.0)\s*(?:goals)?\b|low-scoring affair|cagey affair", low):
             votes.add("under_25")
 
         # 3. BTTS Yes / No / Win to Nil
         if re.search(r"both teams to score\s*[:\-–]?\s*no\b|\bbtts\s*[:\-–]?\s*no\b|\bwin to nil\b", low):
             votes.add("btts_no")
-        elif re.search(r"both teams to score\s*[:\-–]?\s*yes\b|\bbtts\s*[:\-–]?\s*yes\b|\bboth teams to score\b", low):
-            if "not" not in low and "ambitious" not in low:
+        elif re.search(r"both teams to score\s*[:\-–]?\s*yes\b|\bbtts\s*[:\-–]?\s*yes\b|\bboth teams will score\b|\bboth teams to score\b", low):
+            if "not" not in low and "ambitious" not in low and "both teams to score: no" not in low:
                 votes.add("btts_yes")
 
-        # 4. Team-specific Win / Handicap / Draw No Bet / Double Chance
+        # 4. Team-specific Win / Handicap / Draw No Bet / Double Chance / Headline directional verbs
+        win_verb_pat = (
+            r"(?:to win|will win|victory|tipped for victory|can seal|to beat|to edge|to extend winning run|"
+            r"can add to|to claim all three points|to come out on top|to prevail|moneyline|ml\b)"
+        )
         for tok in h_toks:
-            if re.search(rf"\b{re.escape(tok)}\b[^\.\n]{{0,32}}(?:to win|victory|tipped for victory|1x2\s*[-–]\s*{re.escape(tok)})", low):
+            if re.search(rf"\b{re.escape(tok)}\b[^\.\n]{{0,36}}{win_verb_pat}|1x2\s*[-–]\s*{re.escape(tok)}", low):
                 votes.update(["home_win", "home_1x"])
             if re.search(rf"\b{re.escape(tok)}\b\s*(?:-1\.5|-1\.0|-1\b|-2\.0|-2\.5)", low) or re.search(
-                rf"handicap[^\.\n]{{0,30}}\b{re.escape(tok)}\b\s*-(?:1|1\.5|2)", low
+                rf"(?:handicap|win by 2)[^\.\n]{{0,30}}\b{re.escape(tok)}\b", low
             ):
                 votes.update(["home_win", "home_1x", "home_handicap"])
-            if re.search(rf"draw no bet\s*[:\-–]?\s*[^\.\n]{{0,18}}\b{re.escape(tok)}\b", low) or re.search(
-                rf"\b{re.escape(tok)}\b\s*(?:or draw|\+0\.5)", low
+            if re.search(rf"draw no bet\s*[:\-–]?\s*[^\.\n]{{0,20}}\b{re.escape(tok)}\b|\b{re.escape(tok)}\b\s*draw no bet", low) or re.search(
+                rf"\b{re.escape(tok)}\b\s*(?:or draw|double chance|\+0\.5)", low
             ):
                 votes.add("home_1x")
 
         for tok in a_toks:
-            if re.search(rf"\b{re.escape(tok)}\b[^\.\n]{{0,32}}(?:to win|victory|tipped for victory|1x2\s*[-–]\s*{re.escape(tok)})", low):
+            if re.search(rf"\b{re.escape(tok)}\b[^\.\n]{{0,36}}{win_verb_pat}|1x2\s*[-–]\s*{re.escape(tok)}", low):
                 votes.update(["away_win", "away_x2"])
             if re.search(rf"\b{re.escape(tok)}\b\s*(?:-0\.5|-1\.0|-1\.5|-1\b)", low):
                 votes.update(["away_win", "away_x2"])
-            if re.search(rf"draw no bet\s*[:\-–]?\s*[^\.\n]{{0,18}}\b{re.escape(tok)}\b", low) or re.search(
-                rf"(?:asian handicap\s*\+0\.5[^\.\n]{{0,24}}\b{re.escape(tok)}\b|\b{re.escape(tok)}\b\s*(?:or draw|to avoid defeat|\+0\.5))", low
+            if re.search(rf"draw no bet\s*[:\-–]?\s*[^\.\n]{{0,20}}\b{re.escape(tok)}\b|\b{re.escape(tok)}\b\s*draw no bet", low) or re.search(
+                rf"(?:asian handicap\s*\+0\.5[^\.\n]{{0,24}}\b{re.escape(tok)}\b|\b{re.escape(tok)}\b\s*(?:or draw|double chance|to avoid defeat|\+0\.5))", low
             ):
                 votes.add("away_x2")
 
@@ -2271,6 +2648,314 @@ class ExpertConsensusHub:
             votes.add("corners_over_95")
 
         return list(votes)
+
+    @classmethod
+    def parse_racingpost_html(
+        cls,
+        raw_html: str,
+        target_map: Dict[str, Dict[str, Set[str]]],
+        counts_map: Dict[str, int]
+    ) -> List[str]:
+        """
+        Parses Racing Post Sport Football Tips (`racingpost.com/sport/football-tips/`):
+          1. Discovers `/sport/football-tips/...` match previews & specialist columns (James Milton, Mark Langdon, Bet of the Day).
+          2. Extracts index headline cues (`<Home> vs <Away>: <Toffees to extend winning run / Goals on the menu>`).
+          3. Extracts explicit `Best bet` & `<N>pt(s)` staked selections inside match previews and multi-match columns!
+        """
+        urls: List[str] = []
+        for m_u in re.finditer(
+            r'href=["\']((?:https://www\.racingpost\.com)?/sport/football-tips/[a-z0-9/\-]+)["\']',
+            raw_html or "",
+            re.IGNORECASE
+        ):
+            u = m_u.group(1)
+            if u.startswith("/"):
+                u = "https://www.racingpost.com" + u
+            if u.rstrip("/") != "https://www.racingpost.com/sport/football-tips" and u not in urls:
+                urls.append(u)
+
+        clean_txt = "\n".join(re.sub(r"\s+", " ", ln).strip() for ln in html.unescape(re.sub(r"<[^>]+>", "\n", raw_html or "")).splitlines() if ln.strip())
+
+        # 1. Index / Card Headline cues: "<Home> vs <Away>: <Directional Headline>"
+        for m_hl in re.finditer(
+            r"([A-Z][A-Za-zÀ-ÿ0-9\.\x27\- ]{2,26}?)\s+(?:vs\.?|v)\s+([A-Z][A-Za-zÀ-ÿ0-9\.\x27\- ]{2,26}?)\s*:\s*([^\.\n<]{8,95})",
+            clean_txt
+        ):
+            h_t, a_t, hl_body = m_hl.group(1).strip(), m_hl.group(2).strip(), m_hl.group(3).strip()
+            if "predictions" in hl_body.lower() and "odds" in hl_body.lower():
+                continue
+            vts = cls._extract_prose_votes_for_pair(h_t, a_t, hl_body)
+            if vts:
+                cls._record_vote(target_map, counts_map, h_t, a_t, vts, "Racing Post")
+
+        # 2. Single-match article `<title>` + `Best bet` block
+        t_m = re.search(r"<title>(.*?)</title>", raw_html or "", re.IGNORECASE | re.DOTALL)
+        title_txt = html.unescape(t_m.group(1)).strip() if t_m else ""
+        m_pair = re.search(
+            r"([A-Za-zÀ-ÿ0-9\.\x27\- ]{3,28}?)\s+(?:vs\.?|v)\s+([A-Za-zÀ-ÿ0-9\.\x27\- ]{3,28}?)\s+predictions",
+            title_txt,
+            re.IGNORECASE
+        )
+        if m_pair:
+            h_t, a_t = m_pair.group(1).strip(), m_pair.group(2).strip()
+            bb_idx = clean_txt.lower().find("best bet")
+            focus_slice = clean_txt[bb_idx: bb_idx + 900] if bb_idx != -1 else clean_txt[:3500]
+            vts = cls._extract_prose_votes_for_pair(h_t, a_t, focus_slice)
+            cls._record_vote(target_map, counts_map, h_t, a_t, vts, "Racing Post")
+
+        # 3. Multi-match columns (Bet of the Day / James Milton Accumulator / European Tips):
+        #    e.g. "Over 2.5 goals in Bournemouth vs Nottingham Forest. 3pm Saturday. 3pts"
+        #    or   "RB Leipzig to win & under 3.5 goals vs Union Berlin. 2pts"
+        for m_in in re.finditer(
+            r"([^\n]{4,75}?)\s+(?:in|from)\s+([A-Z][A-Za-zÀ-ÿ0-9\.\x27\- ]{2,26}?)\s+(?:vs\.?|v)\s+([A-Z][A-Za-zÀ-ÿ0-9\x27\- ]{2,28}?)(?=\.|,|\n|\s+\d)[^\n]{0,45}?\b\d+(?:\.\d+)?\s*pts?\b",
+            clean_txt
+        ):
+            sel_phrase, h_t, a_t = m_in.group(1).strip(), m_in.group(2).strip(), m_in.group(3).strip()
+            vts = cls._extract_prose_votes_for_pair(h_t, a_t, sel_phrase)
+            if vts:
+                cls._record_vote(target_map, counts_map, h_t, a_t, vts, "Racing Post")
+
+        for m_vs_pt in re.finditer(
+            r"([A-Z][A-Za-zÀ-ÿ0-9\.\x27\- ]{2,26}?)\s+(to win(?:\s+to nil|\s*(?:&|and)\s*(?:over|under)\s*\d+(?:\.\d+)?\s*goals)?|or draw double chance|draw no bet)\s+(?:vs\.?|v|against)\s+([A-Z][A-Za-zÀ-ÿ0-9\x27\- ]{2,28}?)(?=\.|,|\n|\s+\d)[^\n]{0,45}?\b\d+(?:\.\d+)?\s*pts?\b",
+            clean_txt,
+            re.IGNORECASE
+        ):
+            t1, action_str, t2 = m_vs_pt.group(1).strip(), m_vs_pt.group(2).strip(), m_vs_pt.group(3).strip()
+            vts = cls._extract_prose_votes_for_pair(t1, t2, f"{t1} {action_str}")
+            if vts:
+                cls._record_vote(target_map, counts_map, t1, t2, vts, "Racing Post")
+
+        return urls
+
+    @classmethod
+    def parse_sportinglife_html(
+        cls,
+        raw_html: str,
+        target_map: Dict[str, Dict[str, Set[str]]],
+        counts_map: Dict[str, int]
+    ) -> List[str]:
+        """
+        Parses Sporting Life Football Tips Centre (`sportinglife.com/football/tips-centre`) & articles:
+          1. Discovers `/football/news/...(tips|predictions|best-bets).../<id>` preview & Jake Osgathorpe / Liam Kelly links.
+          2. Extracts staked `pts` picks (`1.5pts Arsenal to win to nil at 15/8`, `2pts Over 2.5 goals...`) per fixture!
+        """
+        urls: List[str] = []
+        for m_u in re.finditer(
+            r'href=["\']((?:https://www\.sportinglife\.com)?/football/news/[a-z0-9\-]*(?:tips|predictions|best-bets|acca)[a-z0-9\-]*/\d+)["\']',
+            raw_html or "",
+            re.IGNORECASE
+        ):
+            u = m_u.group(1)
+            if u.startswith("/"):
+                u = "https://www.sportinglife.com" + u
+            if u not in urls:
+                urls.append(u)
+
+        clean_txt = "\n".join(re.sub(r"\s+", " ", ln).strip() for ln in html.unescape(re.sub(r"<[^>]+>", "\n", raw_html or "")).splitlines() if ln.strip())
+        t_m = re.search(r"<title>(.*?)</title>", raw_html or "", re.IGNORECASE | re.DOTALL)
+        title_txt = html.unescape(t_m.group(1)).strip() if t_m else ""
+
+        # Case A: Dedicated Single-Match Preview (`... Slavia Prague vs Arsenal predictions, best bets ...`)
+        m_single = re.search(
+            r"(?:tips\s*[:\-]\s*)?([A-Za-zÀ-ÿ0-9\.\x27\- ]{3,28}?)\s+(?:vs\.?|v)\s+([A-Za-zÀ-ÿ0-9\.\x27\- ]{3,28}?)\s+(?:tips|predictions|best bets)",
+            title_txt,
+            re.IGNORECASE
+        )
+        if m_single:
+            h_t = re.sub(r"^(?:champions league|premier league|la liga|serie a|bundesliga|efl|fa cup)\s+tips\s*[:\-]?\s*", "", m_single.group(1), flags=re.IGNORECASE).strip()
+            a_t = m_single.group(2).strip()
+            pts_chunks = [m_p.group(0) for m_p in re.finditer(r"\b\d+(?:\.\d+)?\s*pts?\s+[^\n]{6,130}", clean_txt, re.IGNORECASE)]
+            target_prose = " . ".join(pts_chunks[:5]) if pts_chunks else clean_txt[:3500]
+            vts = cls._extract_prose_votes_for_pair(h_t, a_t, target_prose)
+            cls._record_vote(target_map, counts_map, h_t, a_t, vts, "Sporting Life")
+            return urls
+
+        # Case B: Multi-Match Column (e.g. Jake Osgathorpe's Premier League Saturday Matchday Tips)
+        cur_pair: Optional[Tuple[str, str]] = None
+        for ln in clean_txt.splitlines():
+            m_hdr = re.match(
+                r"^(?:[\d:\.\)\-\s]*)?([A-Z][A-Za-zÀ-ÿ0-9\.\x27\- ]{2,28}?)\s+(?:vs\.?|v\.?)\s+([A-Z][A-Za-zÀ-ÿ0-9\.\x27\- ]{2,28}?)(?:\s*[:\-–|\(].*)?$",
+                ln
+            )
+            if m_hdr and not re.search(r"\b\d+(?:\.\d+)?\s*pts?\b", ln, re.IGNORECASE):
+                cur_pair = (m_hdr.group(1).strip(), m_hdr.group(2).strip())
+                continue
+            if cur_pair and re.search(r"\b\d+(?:\.\d+)?\s*pts?\b", ln, re.IGNORECASE):
+                vts = cls._extract_prose_votes_for_pair(cur_pair[0], cur_pair[1], ln)
+                if vts:
+                    cls._record_vote(target_map, counts_map, cur_pair[0], cur_pair[1], vts, "Sporting Life")
+
+        return urls
+
+    @classmethod
+    def parse_protipster_html(
+        cls,
+        raw_html: str,
+        target_map: Dict[str, Dict[str, Set[str]]],
+        counts_map: Dict[str, int]
+    ) -> None:
+        """
+        Parses ProTipster (`protipster.com/betting-tips/football`):
+          • Verified positive-yield tipsters (`30-day yield +19.5%`) AND strong community consensus (`86% of 51 tipsters agree`).
+          • Static HTML pattern: `<Home> <Home> <Away> <Away> +Tip Market · <Market> <Pick> ...` or `1 · 86% X · 8% 2 · 6%`.
+        """
+        if not raw_html:
+            return
+        clean_lines = [ln.strip() for ln in re.sub(r"<[^>]+>", "\n", html.unescape(raw_html)).splitlines() if ln.strip()]
+        joined = " ".join(clean_lines)
+
+        # Pattern 1: `<Home> vs <Away>` or duplicated `<Home> <Home> <Away> <Away> +Tip Market · ...`
+        for idx, ln in enumerate(clean_lines):
+            if ln.startswith("Market ·") or ln == "+Tip":
+                back = clean_lines[max(0, idx - 8): idx]
+                dedup_teams: List[str] = []
+                for b_ln in back:
+                    if len(b_ln) < 3 or len(b_ln) > 30:
+                        continue
+                    if any(k in b_ln.lower() for k in ("community", "pick", "tip", "today", "tomorrow", "yield", "agree", "football", "prediction")) or re.search(r"\d{2}:\d{2}", b_ln):
+                        continue
+                    if not dedup_teams or dedup_teams[-1].lower() != b_ln.lower():
+                        dedup_teams.append(b_ln)
+                if len(dedup_teams) >= 2:
+                    h_t, a_t = dedup_teams[-2], dedup_teams[-1]
+                    fwd = " ".join(clean_lines[idx: min(len(clean_lines), idx + 14)])
+                    # Check quality gate: positive 30-day yield OR >=58% tipster agreement (or standalone verified tip card)
+                    m_yield = re.search(r"yield\s*([+\-]\d+(?:\.\d+)?)%", fwd, re.IGNORECASE)
+                    m_agree = re.search(r"(\d{2,3})%\s+of\s+(\d+)\s+tipsters\s+agree", fwd, re.IGNORECASE)
+                    if m_yield and float(m_yield.group(1)) < 0:
+                        continue
+                    if m_agree and (int(m_agree.group(1)) < 56 or int(m_agree.group(2)) < 3):
+                        continue
+                    vts = cls._extract_prose_votes_for_pair(h_t, a_t, fwd)
+                    # Also parse explicit 1X2 percentage bar: `1 · 86% X · 8% 2 · 6%`
+                    m_bar = re.search(r"1\s*·\s*(\d{1,3})%\s*X\s*·\s*(\d{1,3})%\s*2\s*·\s*(\d{1,3})%", fwd)
+                    if m_bar:
+                        p1, p2 = int(m_bar.group(1)), int(m_bar.group(3))
+                        if p1 >= 60:
+                            vts = list(set(vts) | {"home_win", "home_1x"})
+                        elif p2 >= 58:
+                            vts = list(set(vts) | {"away_win", "away_x2"})
+                    if vts:
+                        cls._record_vote(target_map, counts_map, h_t, a_t, vts, "ProTipster")
+
+        # Pattern 2: Inline fallback `<TeamA> vs <TeamB> ... will win the match`
+        for m_inl in re.finditer(
+            r"([A-Z][A-Za-zÀ-ÿ0-9\.\x27\- ]{2,25}?)\s+(?:vs\.?|v)\s+([A-Z][A-Za-zÀ-ÿ0-9\.\x27\- ]{2,25}?)\b(.{10,240}?)(?:yield\s*\+\d+|tipsters\s+agree)",
+            joined,
+            re.IGNORECASE
+        ):
+            h_t, a_t, mid_txt = m_inl.group(1).strip(), m_inl.group(2).strip(), m_inl.group(3)
+            vts = cls._extract_prose_votes_for_pair(h_t, a_t, mid_txt)
+            if vts:
+                cls._record_vote(target_map, counts_map, h_t, a_t, vts, "ProTipster")
+
+    @classmethod
+    def parse_opta_analyst_html(
+        cls,
+        raw_html: str,
+        target_map: Dict[str, Dict[str, Set[str]]],
+        counts_map: Dict[str, int]
+    ) -> List[str]:
+        """
+        Parses Opta Analyst (`theanalyst.com` & `dataviz.theanalyst.com/opta-football-predictions`):
+          • Extracts Opta match win-probability percentages & preview articles (`<Home> vs <Away> Prediction`).
+        """
+        urls: List[str] = []
+        for m_u in re.finditer(
+            r'href=["\']((?:https://theanalyst\.com)?/[a-z0-9/\-]*(?:prediction|preview|vs)[a-z0-9/\-]*)["\']',
+            raw_html or "",
+            re.IGNORECASE
+        ):
+            u = m_u.group(1)
+            if u.startswith("/"):
+                u = "https://theanalyst.com" + u
+            if "-vs-" in u.lower() or "prediction" in u.lower():
+                if u not in urls:
+                    urls.append(u)
+
+        clean_txt = "\n".join(re.sub(r"\s+", " ", ln).strip() for ln in html.unescape(re.sub(r"<[^>]+>", "\n", raw_html or "")).splitlines() if ln.strip())
+
+        # 1. Opta article title `<Home> vs <Away> Prediction` + supercomputer win probability (`gives <Team> a 61.4% chance`)
+        t_m = re.search(r"<title>(.*?)</title>", raw_html or "", re.IGNORECASE | re.DOTALL)
+        title_txt = html.unescape(t_m.group(1)).strip() if t_m else ""
+        m_pair = re.search(
+            r"([A-Za-zÀ-ÿ0-9\.\x27\- ]{3,28}?)\s+(?:vs\.?|v)\s+([A-Za-zÀ-ÿ0-9\.\x27\- ]{3,28}?)\s*[:\-–]?\s*(?:Prediction|Preview|Stats|Opta)",
+            title_txt,
+            re.IGNORECASE
+        )
+        if m_pair:
+            h_t, a_t = m_pair.group(1).strip(), m_pair.group(2).strip()
+            vts: Set[str] = set(cls._extract_prose_votes_for_pair(h_t, a_t, clean_txt[:4500]))
+            low_opta = clean_txt[:5000].lower()
+            for tok in cls._expand_nicknames_for_team(h_t, normalize_team_str(h_t)):
+                for m_hp in re.finditer(rf"\b{re.escape(tok)}\b[^\n%]{{0,35}}?(\d{{2}}(?:\.\d+)?)\s*%\s*(?:chance|win|probability|to win)", low_opta):
+                    pct_v = float(m_hp.group(1))
+                    if pct_v >= 53.0:
+                        vts.update(["home_win", "home_1x"])
+                        if pct_v >= 67.0:
+                            vts.add("home_handicap")
+            for tok in cls._expand_nicknames_for_team(a_t, normalize_team_str(a_t)):
+                for m_ap in re.finditer(rf"\b{re.escape(tok)}\b[^\n%]{{0,35}}?(\d{{2}}(?:\.\d+)?)\s*%\s*(?:chance|win|probability|to win)", low_opta):
+                    if float(m_ap.group(1)) >= 52.0:
+                        vts.update(["away_win", "away_x2"])
+            if vts:
+                cls._record_vote(target_map, counts_map, h_t, a_t, list(vts), "Opta Analyst")
+
+        # 2. Tabular / JSON probability rows (`<Home> <pH>% <pD>% <pA>% <Away>` or `"home":"...","away":"...","homeWin":0.62`)
+        for m_row in re.finditer(
+            r"([A-Z][A-Za-zÀ-ÿ0-9\.\x27\- ]{2,24}?)\s+(\d{2}(?:\.\d+)?)%\s+(\d{1,2}(?:\.\d+)?)%\s+(\d{1,2}(?:\.\d+)?)%\s+([A-Z][A-Za-zÀ-ÿ0-9\.\x27\- ]{2,24})",
+            clean_txt
+        ):
+            h_t, ph, _, pa, a_t = m_row.group(1).strip(), float(m_row.group(2)), float(m_row.group(3)), float(m_row.group(4)), m_row.group(5).strip()
+            vts_r: List[str] = []
+            if ph >= 54.0:
+                vts_r.extend(["home_win", "home_1x"])
+                if ph >= 67.0:
+                    vts_r.append("home_handicap")
+            elif pa >= 52.0:
+                vts_r.extend(["away_win", "away_x2"])
+            if vts_r:
+                cls._record_vote(target_map, counts_map, h_t, a_t, vts_r, "Opta Analyst")
+
+        return urls
+
+    @classmethod
+    def parse_oddschecker_and_actionnetwork_html(
+        cls,
+        raw_html: str,
+        source_name: str,
+        target_map: Dict[str, Dict[str, Set[str]]],
+        counts_map: Dict[str, int]
+    ) -> List[str]:
+        """
+        Parses Oddschecker (`/tips/football`) & Action Network (`/soccer` + free editorial `best-bets`/`predictions` articles).
+        """
+        urls: List[str] = []
+        if source_name == "Oddschecker":
+            for m_u in re.finditer(
+                r'href=["\']((?:https://www\.oddschecker\.com)?/tips/football/[a-z0-9/\-]+)["\']',
+                raw_html or "",
+                re.IGNORECASE
+            ):
+                u = m_u.group(1)
+                if u.startswith("/"):
+                    u = "https://www.oddschecker.com" + u
+                if u.rstrip("/") != "https://www.oddschecker.com/tips/football" and u not in urls:
+                    urls.append(u)
+        elif source_name == "Action Network":
+            for m_u in re.finditer(
+                r'href=["\']((?:https://www\.actionnetwork\.com)?/soccer/[a-z0-9\-]*(?:predictions|picks|best-bets|odds)[a-z0-9\-]*)["\']',
+                raw_html or "",
+                re.IGNORECASE
+            ):
+                u = m_u.group(1)
+                if u.startswith("/"):
+                    u = "https://www.actionnetwork.com" + u
+                if u.rstrip("/") not in {"https://www.actionnetwork.com/soccer/picks", "https://www.actionnetwork.com/soccer/odds"} and u not in urls:
+                    urls.append(u)
+
+        cls.parse_yahoo_and_general_html(raw_html, source_name, None, target_map, counts_map)
+        return urls
 
     @classmethod
     def parse_sportsmole_html(
@@ -2308,7 +2993,6 @@ class ExpertConsensusHub:
         """Parses The Wavy Sport (`thewavysport.substack.com/feed` RSS XML or `/api/v1/posts` JSON)."""
         if not raw_xml_or_json:
             return
-        # JSON mode (`/api/v1/posts`)
         if raw_xml_or_json.lstrip().startswith("["):
             try:
                 posts = json.loads(raw_xml_or_json)
@@ -2324,7 +3008,6 @@ class ExpertConsensusHub:
             except Exception:
                 pass
 
-        # RSS XML mode (`/feed`)
         for item_m in re.finditer(r"<item>(.*?)</item>", raw_xml_or_json, re.DOTALL | re.IGNORECASE):
             chunk = item_m.group(1)
             t_m = re.search(r"<title><!\[CDATA\[(.*?)\]\]></title>|<title>(.*?)</title>", chunk, re.DOTALL | re.IGNORECASE)
@@ -2351,7 +3034,6 @@ class ExpertConsensusHub:
             if u not in urls:
                 urls.append(u)
 
-        # Check if this HTML is an individual OneFootball match prediction article
         t_m = re.search(r"<title>(.*?)</title>", raw_html or "", re.IGNORECASE | re.DOTALL)
         title_txt = html.unescape(t_m.group(1)).strip() if t_m else ""
         m_pair = re.search(r"([A-Za-zÀ-ÿ0-9\.\x27\- ]{3,28}?)\s+(?:vs\.?|x)\s+([A-Za-zÀ-ÿ0-9\.\x27\- ]{3,28}?)\s*[-–]", title_txt, re.IGNORECASE)
@@ -2359,7 +3041,6 @@ class ExpertConsensusHub:
             m_pair = re.search(r"Predictions for\s+([A-Za-zÀ-ÿ0-9\.\x27\- ]{3,28}?)\s+vs\.?\s+([A-Za-zÀ-ÿ0-9\.\x27\- ]{3,28}?)\s*[-–]", raw_html or "", re.IGNORECASE)
         if m_pair:
             h_t, a_t = m_pair.group(1).strip(), m_pair.group(2).strip()
-            # Focus on the Prediction / Best markets section so historical H2H scores don't pollute
             pred_slice = raw_html
             idx_p = raw_html.find("Predictions for ")
             if idx_p != -1:
@@ -2385,7 +3066,6 @@ class ExpertConsensusHub:
             if u not in urls:
                 urls.append(u)
 
-        # Also check Next.js __NEXT_DATA__ JSON for embedded article summaries
         m_nd = re.search(r'<script[^>]*id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', raw_html or "", re.DOTALL | re.IGNORECASE)
         if m_nd:
             nd_txt = m_nd.group(1)
@@ -2444,7 +3124,6 @@ class ExpertConsensusHub:
                     continue
                 if not re.match(r"202\d-\d{2}-\d{2}", lines[idx + 2]):
                     continue
-                # Extract Home and Away team lines between timestamp and "1" header
                 sub = lines[idx + 3: min(len(lines), idx + 12)]
                 teams_cand = [
                     x for x in sub
@@ -2465,7 +3144,6 @@ class ExpertConsensusHub:
                 elif tip_code == "X2":
                     vts.append("away_x2")
 
-                # Parse probability numbers right after "OTS"
                 window_after = lines[idx + 5: min(len(lines), idx + 36)]
                 if "OTS" in window_after:
                     ots_pos = window_after.index("OTS")
@@ -2493,12 +3171,11 @@ class ExpertConsensusHub:
         target_map: Dict[str, Dict[str, Set[str]]],
         counts_map: Dict[str, int]
     ) -> None:
-        """Parses Yahoo Sports Betting, PredictZ, Forebet, FreeSuperTips, MightyTips, Vitibet, CBS, Covers, etc."""
+        """Parses Yahoo Sports Betting, OLBG, Oddschecker, Action Network, PredictZ, Forebet, FreeSuperTips, MightyTips, etc."""
         if not raw_html:
             return
         clean = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", raw_html)))
 
-        # 1. Dedicated market pages (e.g. FreeSuperTips / MightyTips Over 2.5 or BTTS boards)
         if forced_vote:
             for m_vs in re.finditer(
                 r"([A-Z][A-Za-zÀ-ÿ\.\x27\-]{2,}(?:\s+[A-Z][A-Za-zÀ-ÿ\.\x27\-]{2,}){0,2})\s+(?:vs\.?|v\.?)\s+([A-Z][A-Za-zÀ-ÿ\.\x27\-]{2,}(?:\s+[A-Z][A-Za-zÀ-ÿ\.\x27\-]{2,}){0,2})",
@@ -2507,7 +3184,6 @@ class ExpertConsensusHub:
                 cls._record_vote(target_map, counts_map, m_vs.group(1), m_vs.group(2), [forced_vote], source_name)
             return
 
-        # 2. PredictZ / Betimate / Forebet / Vitibet inline scoreline patterns (`Home v Away ... 2-1` or `Home 2 - 0 Away`)
         for m_pz in re.finditer(
             r"([A-Z][A-Za-zÀ-ÿ\.\x27\-]{2,}(?:\s+[A-Z][A-Za-zÀ-ÿ\.\x27\-]{2,}){0,2})\s+(?:vs\.?|v\.?)\s+([A-Z][A-Za-zÀ-ÿ\.\x27\-]{2,}(?:\s+[A-Z][A-Za-zÀ-ÿ\.\x27\-]{2,}){0,2})[^0-9\n]{1,40}?(?:Home|Away|Draw|Tip|Prediction)?\s*(\d)\s*[-:]\s*(\d)\b",
             clean
@@ -2516,7 +3192,6 @@ class ExpertConsensusHub:
                 target_map, counts_map, m_pz.group(1), m_pz.group(2), int(m_pz.group(3)), int(m_pz.group(4)), source_name
             )
 
-        # 3. RSS `<item>` or Editorial Preview snippets (Yahoo Sports Betting, CBS Sports, Goal.com, TalkSPORT, Squawka, etc.)
         if "<item>" in raw_html.lower():
             for it_m in re.finditer(r"<item>(.*?)</item>", raw_html, re.DOTALL | re.IGNORECASE):
                 blk = it_m.group(1)
@@ -2535,7 +3210,7 @@ class ExpertConsensusHub:
                 clean
             ):
                 h_t, a_t = m_ed.group(1).strip(), m_ed.group(2).strip()
-                snippet = clean[max(0, m_ed.start() - 40): min(len(clean), m_ed.end() + 240)]
+                snippet = clean[max(0, m_ed.start() - 40): min(len(clean), m_ed.end() + 260)]
                 vts = cls._extract_prose_votes_for_pair(h_t, a_t, snippet)
                 if vts:
                     cls._record_vote(target_map, counts_map, h_t, a_t, vts, source_name)
@@ -2550,6 +3225,11 @@ class ExpertConsensusHub:
 
         new_ballots: Dict[str, Dict[str, Set[str]]] = {}
         new_counts: Dict[str, int] = {}
+        rp_urls: List[str] = []
+        sl_urls: List[str] = []
+        op_urls: List[str] = []
+        oc_urls: List[str] = []
+        an_urls: List[str] = []
         sm_urls: List[str] = []
         of_urls: List[str] = []
         ls_urls: List[str] = []
@@ -2558,7 +3238,26 @@ class ExpertConsensusHub:
         tom_d = shift_date_str(active_d, 1)
 
         jobs: List[Tuple[str, str, Optional[str]]] = [
-            # 1. User's 5 Core Requested Expert Websites
+            # 1. Tier-1 Elite Trusted Sharp Desks & Verified-Yield Platforms (v37.0)
+            ("RacingPost_Idx", "https://www.racingpost.com/sport/football-tips/", None),
+            ("RacingPost_Idx", "https://www.racingpost.com/sport/football-tips/premier-league/", None),
+            ("RacingPost_Idx", "https://www.racingpost.com/sport/football-tips/champions-league/", None),
+            ("RacingPost_Idx", "https://www.racingpost.com/sport/football-tips/european-and-international-football/", None),
+            ("RacingPost_Idx", "https://www.racingpost.com/sport/football-tips/efl/", None),
+            ("SportingLife_Idx", "https://www.sportinglife.com/football/tips-centre", None),
+            ("SportingLife_Idx", "https://www.sportinglife.com/football/tips", None),
+            ("ProTipster", "https://www.protipster.com/betting-tips/football", None),
+            ("ProTipster", "https://www.protipster.com/betting-tips/football/tomorrow", None),
+            ("ProTipster", "https://www.protipster.com/betting-tips/football/england/premier-league", None),
+            ("ProTipster", "https://www.protipster.com/betting-tips/football/spain/laliga", None),
+            ("ProTipster", "https://www.protipster.com/betting-tips/football/italy/serie-a", None),
+            ("ProTipster", "https://www.protipster.com/betting-tips/football/germany/bundesliga", None),
+            ("OptaAnalyst_Idx", "https://theanalyst.com/eu", None),
+            ("OptaAnalyst_Idx", "https://theanalyst.com/articles/", None),
+            ("OptaAnalyst_Idx", "https://dataviz.theanalyst.com/opta-football-predictions", None),
+            ("Oddschecker_Idx", "https://www.oddschecker.com/tips/football", None),
+            ("ActionNetwork_Idx", "https://www.actionnetwork.com/soccer", None),
+            # 2. Core Requested Editorial & Substack Portals
             ("SportsMole_Idx", "https://www.sportsmole.co.uk/football/preview/", None),
             ("SportsMole_Idx", "https://www.sportsmole.co.uk/football/premier-league-predictions/", None),
             ("SportsMole_Idx", "https://www.sportsmole.co.uk/football/la-liga-predictions/", None),
@@ -2573,7 +3272,7 @@ class ExpertConsensusHub:
             ("Yahoo Sports", "https://sports.yahoo.com/betting/", None),
             ("Yahoo Sports", "https://sports.yahoo.com/soccer/", None),
             ("Yahoo Sports", "https://sports.yahoo.com/soccer/rss/", None),
-            # 2. High-Precision Tabular Consensus Portals
+            # 3. High-Precision Tabular Consensus Portals
             ("WinDrawWin", "https://www.windrawwin.com/predictions/today/", None),
             ("WinDrawWin", "https://www.windrawwin.com/predictions/tomorrow/", None),
             ("StatArea", "https://www.statarea.com/predictions", None),
@@ -2589,9 +3288,9 @@ class ExpertConsensusHub:
                 return tag, u, forced, ""
 
         results: List[Tuple[str, str, Optional[str], str]] = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
             futs = [pool.submit(_fetch_job, j) for j in jobs]
-            for fut in concurrent.futures.as_completed(futs, timeout=18):
+            for fut in concurrent.futures.as_completed(futs, timeout=20):
                 try:
                     results.append(fut.result())
                 except Exception:
@@ -2601,7 +3300,19 @@ class ExpertConsensusHub:
             if not body:
                 continue
             try:
-                if tag == "SportsMole_Idx":
+                if tag == "RacingPost_Idx":
+                    rp_urls.extend(cls.parse_racingpost_html(body, new_ballots, new_counts))
+                elif tag == "SportingLife_Idx":
+                    sl_urls.extend(cls.parse_sportinglife_html(body, new_ballots, new_counts))
+                elif tag == "ProTipster":
+                    cls.parse_protipster_html(body, new_ballots, new_counts)
+                elif tag == "OptaAnalyst_Idx":
+                    op_urls.extend(cls.parse_opta_analyst_html(body, new_ballots, new_counts))
+                elif tag == "Oddschecker_Idx":
+                    oc_urls.extend(cls.parse_oddschecker_and_actionnetwork_html(body, "Oddschecker", new_ballots, new_counts))
+                elif tag == "ActionNetwork_Idx":
+                    an_urls.extend(cls.parse_oddschecker_and_actionnetwork_html(body, "Action Network", new_ballots, new_counts))
+                elif tag == "SportsMole_Idx":
                     sm_urls.extend(cls.parse_sportsmole_html(body, new_ballots, new_counts))
                 elif tag == "Wavysport":
                     cls.parse_wavysport_substack_feed(body, new_ballots, new_counts)
@@ -2618,14 +3329,44 @@ class ExpertConsensusHub:
             except Exception:
                 pass
 
-        # Fetch up to 8 Sports Mole roundup/feature prediction articles immediately (each covers 6-10 games!)
-        feature_sm = [u for u in sm_urls if "/feature/" in u][:6]
-        if feature_sm:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool2:
-                for fut2 in concurrent.futures.as_completed([pool2.submit(cls._http_get, fu, 3.8) for fu in feature_sm], timeout=8):
+        # Eagerly fetch multi-match Sharp Roundup Columns (Racing Post Bet of the Day / Milton, Sporting Life Matchday, Action Network Best Bets, Sports Mole Roundups)
+        roundup_jobs: List[Tuple[str, str]] = []
+        for u in rp_urls:
+            if any(k in u.lower() for k in ("bet-of-the-day", "accumulator", "both-teams-to-score", "james-milton", "mark-langdon", "european-football")):
+                roundup_jobs.append(("RP", u))
+                if sum(1 for k, _ in roundup_jobs if k == "RP") >= 4:
+                    break
+        for u in sl_urls:
+            if any(k in u.lower() for k in ("premier-league-tips", "champions-league-tips", "efl-tips", "best-bets", "osgathorpe", "kelly")):
+                roundup_jobs.append(("SL", u))
+                if sum(1 for k, _ in roundup_jobs if k == "SL") >= 4:
+                    break
+        for u in an_urls[:3]:
+            roundup_jobs.append(("AN", u))
+        for u in [x for x in sm_urls if "/feature/" in x][:4]:
+            roundup_jobs.append(("SM", u))
+
+        if roundup_jobs:
+            def _fetch_roundup(rj: Tuple[str, str]) -> Tuple[str, str]:
+                rk, ru = rj
+                try:
+                    return rk, cls._http_get(ru, timeout=3.8)
+                except Exception:
+                    return rk, ""
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool2:
+                for fut2 in concurrent.futures.as_completed([pool2.submit(_fetch_roundup, rj) for rj in roundup_jobs], timeout=9):
                     try:
-                        b2 = fut2.result()
-                        if b2:
+                        rk, b2 = fut2.result()
+                        if not b2:
+                            continue
+                        if rk == "RP":
+                            cls.parse_racingpost_html(b2, new_ballots, new_counts)
+                        elif rk == "SL":
+                            cls.parse_sportinglife_html(b2, new_ballots, new_counts)
+                        elif rk == "AN":
+                            cls.parse_oddschecker_and_actionnetwork_html(b2, "Action Network", new_ballots, new_counts)
+                        elif rk == "SM":
                             cls.parse_sportsmole_html(b2, new_ballots, new_counts)
                     except Exception:
                         pass
@@ -2633,6 +3374,11 @@ class ExpertConsensusHub:
         with cls._lock:
             cls._ballots = new_ballots
             cls._source_match_counts = new_counts
+            cls._racingpost_article_urls = list(dict.fromkeys(rp_urls))
+            cls._sportinglife_article_urls = list(dict.fromkeys(sl_urls))
+            cls._opta_article_urls = list(dict.fromkeys(op_urls))
+            cls._oddschecker_article_urls = list(dict.fromkeys(oc_urls))
+            cls._actionnetwork_article_urls = list(dict.fromkeys(an_urls))
             cls._sportsmole_article_urls = list(dict.fromkeys(sm_urls))
             cls._onefootball_article_urls = list(dict.fromkeys(of_urls))
             cls._livescore_article_urls = list(dict.fromkeys(ls_urls))
@@ -2642,7 +3388,7 @@ class ExpertConsensusHub:
     def _fetch_deep_match_articles_on_demand(cls, home: str, away: str, date_str: str) -> None:
         """
         For candidate fixtures in the active window, fetches individual match preview pages on
-        Sports Mole, OneFootball Betting, and LiveScore Predictions if not yet parsed!
+        Racing Post, Sporting Life, Opta Analyst, Oddschecker, Sports Mole, OneFootball, and LiveScore!
         """
         nh = normalize_team_str(home)
         na = normalize_team_str(away)
@@ -2651,6 +3397,10 @@ class ExpertConsensusHub:
             if pair_key in cls._fetched_deep_articles:
                 return
             cls._fetched_deep_articles.add(pair_key)
+            rp_list = list(cls._racingpost_article_urls)
+            sl_list = list(cls._sportinglife_article_urls)
+            op_list = list(cls._opta_article_urls)
+            oc_list = list(cls._oddschecker_article_urls)
             sm_list = list(cls._sportsmole_article_urls)
             of_list = list(cls._onefootball_article_urls)
             ls_list = list(cls._livescore_article_urls)
@@ -2663,37 +3413,47 @@ class ExpertConsensusHub:
             return any(t in ul for t in h_toks) and any(t in ul for t in a_toks)
 
         target_urls: List[Tuple[str, str]] = []
-        for u in sm_list:
-            if _url_matches_pair(u):
-                target_urls.append(("SM", u))
-                break
-        for u in of_list:
-            if _url_matches_pair(u):
-                target_urls.append(("OF", u))
-                break
-        else:
-            # Construct OneFootball deterministic URL slug (`dd-mm-yyyy`)
-            try:
-                dt_obj = datetime.datetime.strptime(date_str, "%Y-%m-%d")
-                dmy = dt_obj.strftime("%d-%m-%Y")
-                hs = re.sub(r"[^a-z0-9]+", "-", nh).strip("-")
-                as_ = re.sub(r"[^a-z0-9]+", "-", na).strip("-")
-                if hs and as_:
-                    target_urls.append(("OF", f"https://onefootball.com/en/betting/predictions/{hs}-vs-{as_}-{dmy}"))
-            except Exception:
-                pass
-        for u in ls_list:
-            if _url_matches_pair(u):
-                target_urls.append(("LS", u))
-                break
+        for kind_code, url_pool in [
+            ("RP", rp_list),
+            ("SL", sl_list),
+            ("OP", op_list),
+            ("OC", oc_list),
+            ("SM", sm_list),
+            ("OF", of_list),
+            ("LS", ls_list),
+        ]:
+            matched_kind = False
+            for u in url_pool:
+                if _url_matches_pair(u):
+                    target_urls.append((kind_code, u))
+                    matched_kind = True
+                    break
+            if kind_code == "OF" and not matched_kind:
+                try:
+                    dt_obj = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+                    dmy = dt_obj.strftime("%d-%m-%Y")
+                    hs = re.sub(r"[^a-z0-9]+", "-", nh).strip("-")
+                    as_ = re.sub(r"[^a-z0-9]+", "-", na).strip("-")
+                    if hs and as_:
+                        target_urls.append(("OF", f"https://onefootball.com/en/betting/predictions/{hs}-vs-{as_}-{dmy}"))
+                except Exception:
+                    pass
 
-        for kind, u in target_urls[:3]:
+        for kind, u in target_urls[:6]:
             try:
                 html_doc = cls._http_get(u, timeout=3.2)
                 if not html_doc:
                     continue
                 with cls._lock:
-                    if kind == "SM":
+                    if kind == "RP":
+                        cls.parse_racingpost_html(html_doc, cls._ballots, cls._source_match_counts)
+                    elif kind == "SL":
+                        cls.parse_sportinglife_html(html_doc, cls._ballots, cls._source_match_counts)
+                    elif kind == "OP":
+                        cls.parse_opta_analyst_html(html_doc, cls._ballots, cls._source_match_counts)
+                    elif kind == "OC":
+                        cls.parse_oddschecker_and_actionnetwork_html(html_doc, "Oddschecker", cls._ballots, cls._source_match_counts)
+                    elif kind == "SM":
                         cls.parse_sportsmole_html(html_doc, cls._ballots, cls._source_match_counts)
                     elif kind == "OF":
                         cls.parse_onefootball_html(html_doc, cls._ballots, cls._source_match_counts)
@@ -2716,8 +3476,9 @@ class ExpertConsensusHub:
         ch_votes: int
     ) -> Dict[str, Set[str]]:
         """
-        Merges all 32+ scraped prediction websites WITH BC.Game Official Portal, API-Football,
-        ESPN Match Predictor, ClubElo, and 35+ Telegram Tipster Channels into a unified ballot!
+        Merges all 38+ scraped prediction websites (led by Racing Post, Sporting Life, Opta Analyst,
+        ProTipster, Action Network, Oddschecker, Sports Mole, Wavysport, OneFootball, LiveScore)
+        WITH BC.Game Official Portal, API-Football, ESPN Match Predictor, ClubElo, and 35+ Telegram Channels!
         """
         cls.refresh_all_consensus_sources()
         cls._fetch_deep_match_articles_on_demand(home, away, date_str)
@@ -2730,7 +3491,6 @@ class ExpertConsensusHub:
         with cls._lock:
             stored = cls._ballots.get(key)
             if not stored:
-                # Fuzzy fallback across cached ballots using `teams_match`
                 for b_key, b_val in cls._ballots.items():
                     if "_vs_" in b_key:
                         bh, ba = b_key.split("_vs_", 1)
@@ -2836,9 +3596,11 @@ class ExpertConsensusHub:
         candidate_kind: str
     ) -> Tuple[bool, int, int, float, str]:
         """
-        Evaluates strict Majority Rule for `candidate_kind`:
+        v37.0 Weighted Trusted-Sharp Majority Rule for `candidate_kind`:
           Returns `(is_majority_approved, for_count, total_voting, score_bonus, human_summary_tag)`.
-          • Hard Veto (`is_majority_approved = False`) whenever `against_count >= for_count` and `total_voting >= 2`!
+          • Weighted Majority Veto: Rejects whenever `n_tot >= 2` and weighted `w_for <= w_against`!
+          • Elite Sharp Desk Veto: Rejects if 2+ Tier-1 Sharp Desks (`Racing Post`, `Sporting Life`,
+            `Opta Analyst`, `ProTipster`, `Action Network`) oppose the pick with 0 Tier-1 desks backing it!
         """
         if candidate_kind == "home_1x2":
             for_set = set(ballot["home_win"])
@@ -2874,29 +3636,52 @@ class ExpertConsensusHub:
         n_against = len(against_set)
         n_tot = n_for + n_against
 
-        # STRICT MAJORITY VETO: Never bet against an equal or larger opposing expert block!
-        if n_tot >= 2 and n_for <= n_against:
+        w_for = sum(cls.get_source_weight(s) for s in for_set)
+        w_against = sum(cls.get_source_weight(s) for s in against_set)
+        w_tot = w_for + w_against
+
+        elite_for = sum(1 for s in for_set if s in cls.ELITE_TIER1_SHARP_DESKS)
+        elite_against = sum(1 for s in against_set if s in cls.ELITE_TIER1_SHARP_DESKS)
+
+        # 1. STRICT WEIGHTED MAJORITY VETO: Never bet against an equal or stronger weighted expert block!
+        if n_tot >= 2 and w_for <= w_against:
+            return False, n_for, n_tot, -28.0, ""
+
+        # 2. ELITE TIER-1 SHARP DESK VETO: Never fade 2+ Tier-1 Sharp Desks when 0 Tier-1 Desks agree!
+        if elite_against >= 2 and elite_for == 0:
             return False, n_for, n_tot, -25.0, ""
 
-        # Sort agreeing sources by editorial prominence
-        def _src_rank(s_name: str) -> int:
+        # Sort agreeing sources by Trust Tier & Editorial Prominence
+        def _src_rank(s_name: str) -> Tuple[float, int]:
+            wt = cls.get_source_weight(s_name)
             for idx_p, p_name in enumerate(cls.PRIORITY_DISPLAY_ORDER):
                 if s_name.startswith(p_name):
-                    return idx_p
-            return 99
+                    return (-wt, idx_p)
+            return (-wt, 99)
 
         ordered_for = sorted(for_set, key=_src_rank)
-        ratio = (n_for / n_tot) if n_tot > 0 else 1.0
-        bonus = min(28.0, n_for * 3.4)
-        if n_for >= 4 and ratio >= 0.75:
-            bonus += 7.5
-        elif n_for >= 3 and ratio >= 0.66:
-            bonus += 4.5
+        trusted_cnt = sum(1 for s in for_set if cls.get_source_weight(s) >= 1.65)
+        w_ratio = (w_for / w_tot) if w_tot > 0 else 1.0
+
+        bonus = min(32.0, w_for * 2.55)
+        if elite_for >= 2:
+            bonus += 5.0
+        elif trusted_cnt >= 2:
+            bonus += 3.0
+        if n_for >= 4 and w_ratio >= 0.75:
+            bonus += 6.5
+        elif n_for >= 3 and w_ratio >= 0.66:
+            bonus += 4.0
 
         if n_for >= 2:
             shown = ordered_for[:4]
             extra = f" +{n_for - len(shown)}" if n_for > len(shown) else ""
-            lead_lbl = "Unanimous Consensus" if n_against == 0 and n_for >= 3 else "Majority Consensus"
+            if n_against == 0 and n_for >= 3:
+                lead_lbl = "Unanimous Consensus"
+            elif elite_for >= 1 or trusted_cnt >= 2:
+                lead_lbl = "Trusted Analyst Majority"
+            else:
+                lead_lbl = "Majority Consensus"
             tag = f"{lead_lbl} ({n_for}/{n_tot} Sources: {', '.join(shown)}{extra})"
         elif n_for == 1:
             tag = f"Backed by {ordered_for[0]} + Match Form"
@@ -2907,11 +3692,14 @@ class ExpertConsensusHub:
 
     @classmethod
     def format_ballot_summary_for_audit(cls, ballot: Dict[str, Set[str]], home: str, away: str) -> str:
+        def _top_names(s_set: Set[str]) -> str:
+            return ", ".join(sorted(s_set, key=lambda x: -cls.get_source_weight(x))[:4])
+
         parts: List[str] = []
         if ballot["home_win"]:
-            parts.append(f"{home} Win: {len(ballot['home_win'])} ({', '.join(sorted(ballot['home_win'])[:4])})")
+            parts.append(f"{home} Win: {len(ballot['home_win'])} ({_top_names(ballot['home_win'])})")
         if ballot["away_win"]:
-            parts.append(f"{away} Win: {len(ballot['away_win'])} ({', '.join(sorted(ballot['away_win'])[:4])})")
+            parts.append(f"{away} Win: {len(ballot['away_win'])} ({_top_names(ballot['away_win'])})")
         if ballot["draw"]:
             parts.append(f"Draw: {len(ballot['draw'])}")
         if ballot["over_25"] or ballot["under_25"]:
@@ -2928,6 +3716,11 @@ class ExpertConsensusHub:
         with cls._lock:
             counts = dict(cls._source_match_counts)
             total_matches = len(cls._ballots)
+            rp_cnt = len(cls._racingpost_article_urls)
+            sl_cnt = len(cls._sportinglife_article_urls)
+            op_cnt = len(cls._opta_article_urls)
+            oc_cnt = len(cls._oddschecker_article_urls)
+            an_cnt = len(cls._actionnetwork_article_urls)
             sm_cnt = len(cls._sportsmole_article_urls)
             of_cnt = len(cls._onefootball_article_urls)
             ls_cnt = len(cls._livescore_article_urls)
@@ -2935,28 +3728,41 @@ class ExpertConsensusHub:
         bc_cnt = len(ExternalAnalyticsCollector._bcgame_portal_cache)
         elo_cnt = len(ExternalAnalyticsCollector._external_elo_projections)
 
-        core_lines = [
-            f"• Sports Mole (`sportsmole.co.uk`)      : Active ({counts.get('Sports Mole', 0)} scorelines + {sm_cnt} previews indexed)",
-            f"• The Wavy Sport (`substack.com`)       : Active ({counts.get('Wavysport', 0)} deep Substack match analyses)",
-            f"• OneFootball Betting (`onefootball`)   : Active ({counts.get('OneFootball', 0)} picks + {of_cnt} match previews indexed)",
-            f"• LiveScore Predictions (`livescore`)   : Active ({counts.get('LiveScore', 0)} picks + {ls_cnt} previews indexed)",
-            f"• Yahoo Sports Betting (`sports.yahoo`) : Active ({counts.get('Yahoo Sports', 0)} soccer betting items)",
-            f"• WinDrawWin (`windrawwin.com`)         : Active ({counts.get('WinDrawWin', 0)} stake + score tips)",
-            f"• StatArea (`statarea.com`)             : Active ({counts.get('StatArea', 0)} probability + community tips)",
-            f"• BC.Game Portal (`betting.bc.game`)    : Active ({bc_cnt} official match tips & live odds)",
+        tier1_lines = [
+            f"• Racing Post Sport (`racingpost.com`)   : 2.00x Weight ({counts.get('Racing Post', 0)} picks + {rp_cnt} previews)",
+            f"• Sporting Life Tips (`sportinglife`)    : 2.00x Weight ({counts.get('Sporting Life', 0)} pts-picks + {sl_cnt} previews)",
+            f"• Opta Analyst (`theanalyst.com`)        : 2.00x Weight ({counts.get('Opta Analyst', 0)} splits + {op_cnt} previews)",
+            f"• ProTipster Yield (`protipster.com`)    : 1.95x Weight ({counts.get('ProTipster', 0)} verified-yield & consensus tips)",
+            f"• Action Network (`actionnetwork.com`)   : 1.85x Weight ({counts.get('Action Network', 0)} pro picks + {an_cnt} articles)",
+            f"• Sports Mole (`sportsmole.co.uk`)       : 1.75x Weight ({counts.get('Sports Mole', 0)} scorelines + {sm_cnt} previews)",
+            f"• The Wavy Sport (`substack.com`)        : 1.75x Weight ({counts.get('Wavysport', 0)} deep Substack analyses)",
+            f"• Oddschecker (`oddschecker.com/tips`)   : 1.65x Weight ({counts.get('Oddschecker', 0)} tips + {oc_cnt} previews)",
+            f"• OneFootball (`onefootball.com`)        : 1.65x Weight ({counts.get('OneFootball', 0)} picks + {of_cnt} previews)",
+            f"• LiveScore (`livescore.com`)            : 1.65x Weight ({counts.get('LiveScore', 0)} picks + {ls_cnt} previews)",
+            f"• OLBG Pro Tipsters (`olbg.com`)         : 1.55x Weight ({counts.get('OLBG', 0)} UK tipster picks)",
+            f"• WinDrawWin & StatArea                  : 1.50x Weight ({counts.get('WinDrawWin', 0) + counts.get('StatArea', 0)} stake/prob tips)",
+            f"• BC.Game Portal (`betting.bc.game`)     : 1.75x Weight ({bc_cnt} official match tips & live odds)",
         ]
+        featured_keys = {
+            "Racing Post", "Sporting Life", "Opta Analyst", "ProTipster", "Action Network",
+            "Sports Mole", "Wavysport", "Oddschecker", "OneFootball", "LiveScore",
+            "OLBG", "WinDrawWin", "StatArea"
+        }
         other_sites = sorted(
-            [(k, v) for k, v in counts.items() if k not in {"Sports Mole", "Wavysport", "OneFootball", "LiveScore", "Yahoo Sports", "WinDrawWin", "StatArea"} and v > 0],
+            [(k, v) for k, v in counts.items() if k not in featured_keys and v > 0],
             key=lambda x: -x[1]
         )
-        other_str = ", ".join(f"{k} ({v})" for k, v in other_sites[:14]) or "Forebet, FreeSuperTips, PredictZ, Betimate, MightyTips, Vitibet, BetMines, Covers, CBS Sports, Goal.com, TalkSPORT, Squawka (standby)"
+        other_str = ", ".join(f"{k} ({v})" for k, v in other_sites[:14]) or (
+            "Yahoo Sports, Forebet, FreeSuperTips, PredictZ, Betimate, MightyTips, Vitibet, "
+            "BetMines, BettingExpert, Covers, CBS Sports, Goal.com, TalkSPORT, Squawka"
+        )
 
         return (
-            "🌐 ACTIVE MULTI-SOURCE EXPERT CONSENSUS ENGINE (v35.0)\n"
+            "🌐 WEIGHTED TIER-1 SHARP ANALYST & CONSENSUS ENGINE (v37.0)\n"
             "────────────────────────\n"
-            "📰 Core Editorial & Data Prediction Portals:\n"
-            + "\n".join(core_lines)
-            + "\n\n📊 Additional Mathematical & Tipster Portals (25+ Sites):\n"
+            "🏆 Tier-1 Trusted Sharp Desks & Core Portals (1.50x – 2.00x Vote Weight):\n"
+            + "\n".join(tier1_lines)
+            + "\n\n📊 Supporting Prediction & Media Portals (1.00x – 1.45x Weight):\n"
             + f"• {other_str}\n\n"
             + "⚙️ Match History, Team & Player Stats APIs:\n"
             + f"• API-Football (`/predictions` + `/odds`) : {'Active ✅' if API_FOOTBALL_KEY else 'Standby'}\n"
@@ -2964,14 +3770,14 @@ class ExpertConsensusHub:
             + f"• ClubElo European Ratings Feed          : Active ({elo_cnt} fixtures)\n"
             + f"• Telegram Tipster Radar                 : Active ({len(chs)} channels watched)\n"
             + "────────────────────────\n"
-            + f"🗳️ Total Indexed Consensus Match Ballots : {total_matches} fixtures\n"
-            + "⚖️ Selection Rule: Strict >50% Majority Expert Agreement + Team/Player Stats Confirmation."
+            + f"🗳️ Total Indexed Consensus Match Ballots : {total_matches} fixtures (38+ Portals)\n"
+            + "⚖️ Selection Rule: Weighted >50% Trusted Majority + Zero Elite Sharp Veto + Team Stats Confirmation."
         )
 
 
 class ExternalAnalyticsCollector:
     """
-    v35.0 Multi-Site Football Analytics Scraper & Aggregator:
+    v36.0 Multi-Site Football Analytics Scraper & Aggregator:
     Collects quantitative match projections, team goal averages, H2H goal history, Elo ratings,
     and mathematical Over/Under tips from public analytics portals & feeds:
       1. ESPN Pre-Match Summary API (`/summary?event={id}`): Extracts actual Goals Scored/Game (`GF/gm`),
@@ -3290,7 +4096,7 @@ class ExternalAnalyticsCollector:
         nb_c: Dict[str, float]
     ) -> Dict[str, float]:
         """
-        v35.0 BC.Game Exact Live Odds Engine (Zero Artificial Clamps):
+        v36.0 BC.Game Exact Live Odds Engine (Zero Artificial Clamps):
         1. Uses the fixture's TRUE UTC kickoff date (`m_fixture['fixture_date']`) and fuzzy `teams_match`
            lookup so tomorrow/late-night matches ALWAYS match their real API-Football `fixture_id`!
         2. Queries `betting.bc.game/predictions/` + API-Football `/odds?fixture={id}` across 8 Betby-aligned
@@ -3728,7 +4534,7 @@ class ExternalAnalyticsCollector:
 
 class QuantitativeEnsembleModels:
     """
-    v35.0 4-Model Institutional Football Syndicate Ensemble:
+    v36.0 4-Model Institutional Football Syndicate Ensemble:
       1. Dixon-Coles (1997) Bivariate Poisson Scoreline Matrix (calculates exact 8x8 scoreline
          probabilities with low-score correlation tau adjustment rho = -0.11).
       2. Negative Binomial / Gamma-Poisson Wing-Pressure Corner Model (projects expected match
@@ -3948,7 +4754,7 @@ class QuantitativeEnsembleModels:
 
 class GeminiDeepReasoningEngine:
     """
-    v35.0 Multi-Expert Consensus & "Anything Can Happen in Football" Chaos Reasoning Engine:
+    v36.0 Multi-Expert Consensus & "Anything Can Happen in Football" Chaos Reasoning Engine:
     • Integrates the configured Gemini model and fallbacks via REST API when `GEMINI_API_KEY` or
       `GOOGLE_API_KEY` is configured on the server, paired with our built-in
       Autonomous Football Game-Script & Chaos Stress-Test Reasoner.
@@ -4256,7 +5062,7 @@ class GeminiDeepReasoningEngine:
 
 class SafeCushionBetCreator:
     """
-    v35.0 Senior Football Match-Analyst Selector (1.62 – 2.08 Sustainable Profit Engine):
+    v36.0 Senior Football Match-Analyst Selector (1.62 – 2.08 Sustainable Profit Engine):
     • Every Official Single must pay 1.62 – 2.08 real BC.Game odds (+0.62R to +1.08R reward per 1.00R risk)
       with ONE clear selection per card (zero 1.21x sub-bet traps that require 5 wins to recover 1 loss).
     • Evaluates 8 distinct football angles based on real match dynamics:
@@ -4332,7 +5138,8 @@ class SafeCushionBetCreator:
         unreliable_teams = set(learning_state.get("unreliable_teams", []))
 
         lg_mod = leagues_mem.get(league_label, {}).get("ev_mod", 0.0)
-        base_boost = (3.5 if has_channel_buzz else 0.0) + lg_mod
+        tier1_boost = 9.0 if slug in TIER1_PRIORITY_LEAGUE_SLUGS else -4.5
+        base_boost = (3.5 if has_channel_buzz else 0.0) + lg_mod + tier1_boost
 
         def strat_mod(s_key: str) -> float:
             return strats_mem.get(s_key, {}).get("ev_mod", 0.0)
@@ -4437,7 +5244,8 @@ class SafeCushionBetCreator:
                 f"{home} enter in strong home form ({h_form}) against {away} ({a_form}) — team history & stats confirm home control."
             )
             c_leg = home1x_leg if bc_odds["dc_1x"] >= 1.24 else dnb_h_leg
-            candidates.append((score, cls._build_single(date_str, home, away, "1x2", sel, None, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, expert_sources=max(3, n_f1)), c_leg))
+            real_alt1 = f"Main Tab ➔ Draw No Bet ➔ {home} (@ {bc_odds['dnb_home']:.2f}) [Draw = refund]" if bc_odds["dnb_home"] >= 1.28 else ""
+            candidates.append((score, cls._build_single(date_str, home, away, "1x2", sel, None, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, alt_line=real_alt1, expert_sources=max(3, n_f1)), c_leg))
 
         # ── 2. Dominant Home Favorite Asian Handicap (`-1.0` or `-1.5` @ 1.62 – 2.06) ──
         ok_m2, n_f2, _, c_bon2, c_tag2 = ExpertConsensusHub.evaluate_market_consensus(ballot, "home_handicap")
@@ -4474,7 +5282,12 @@ class SafeCushionBetCreator:
                 score = prob + base_boost + 6.0 + c_bon2 + (4.0 if away_weak_attack or has_btts_no_signal else 0.0)
                 why = _with_consensus(c_tag2, why_core)
                 c_leg = {"home": home, "away": away, "league": lg_short, "kickoff": ko_short, "market_type": "1x2", "selection": f"1x2 ➔ {home}", "line": None, "odds": bc_odds["home_1x2"]}
-                candidates.append((score, cls._build_single(date_str, home, away, "handicap", sel, hc_ln, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, expert_sources=max(3, n_f2)), c_leg))
+                real_alt2 = (
+                    f"Main Tab ➔ Handicap ➔ {home} (-1.0) (@ {bc_odds['ah_home_m10']:.2f}) [1-goal win = refund]"
+                    if hc_ln == -1.5 and bc_odds["ah_home_m10"] >= 1.30
+                    else (f"Main Tab ➔ 1x2 ➔ {home} (@ {bc_odds['home_1x2']:.2f})" if hc_ln == -1.0 and bc_odds["home_1x2"] >= 1.28 else "")
+                )
+                candidates.append((score + (3.5 if hc_ln == -1.0 else 0.0), cls._build_single(date_str, home, away, "handicap", sel, hc_ln, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, alt_line=real_alt2, expert_sources=max(3, n_f2)), c_leg))
 
         # ── 3. Strong Away Contender Winner (`Main Tab ➔ 1x2 ➔ {Away}` @ 1.62 – 2.05) ──
         ok_m3, n_f3, _, c_bon3, c_tag3 = ExpertConsensusHub.evaluate_market_consensus(ballot, "away_1x2")
@@ -4495,7 +5308,8 @@ class SafeCushionBetCreator:
                 c_tag3,
                 f"{away} bring superior form and squad quality ({a_form}) against a limited {home} side ({h_form})."
             )
-            candidates.append((score, cls._build_single(date_str, home, away, "1x2", sel, None, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, expert_sources=max(3, n_f3)), awayx2_leg))
+            real_alt3 = f"Main Tab ➔ Draw No Bet ➔ {away} (@ {bc_odds['dnb_away']:.2f}) [Draw = refund]" if bc_odds["dnb_away"] >= 1.28 else ""
+            candidates.append((score, cls._build_single(date_str, home, away, "1x2", sel, None, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, alt_line=real_alt3, expert_sources=max(3, n_f3)), awayx2_leg))
 
         # ── 4. Away Contender Draw No Bet (`Main Tab ➔ Draw No Bet ➔ {Away}` @ 1.62 – 1.98) ──
         ok_m4, n_f4, _, c_bon4, c_tag4 = ExpertConsensusHub.evaluate_market_consensus(ballot, "away_dnb")
@@ -4515,7 +5329,8 @@ class SafeCushionBetCreator:
                 c_tag4,
                 f"Disciplined {away} outfit ({a_form}) match up well at {home} ({h_form}), with full stake refund if drawn."
             )
-            candidates.append((score, cls._build_single(date_str, home, away, "dnb", sel, None, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, expert_sources=max(3, n_f4)), awayx2_leg))
+            real_alt4 = f"Main Tab ➔ Double Chance ➔ {away} or Draw (X2) (@ {bc_odds['dc_x2']:.2f})" if bc_odds["dc_x2"] >= 1.25 else ""
+            candidates.append((score + 4.0, cls._build_single(date_str, home, away, "dnb", sel, None, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, alt_line=real_alt4, expert_sources=max(3, n_f4)), awayx2_leg))
 
         # ── 5. Home Contender Draw No Bet (`Main Tab ➔ Draw No Bet ➔ {Home}` @ 1.62 – 1.98) ──
         ok_m5, n_f5, _, c_bon5, c_tag5 = ExpertConsensusHub.evaluate_market_consensus(ballot, "home_dnb")
@@ -4535,7 +5350,8 @@ class SafeCushionBetCreator:
                 c_tag5,
                 f"Hard-to-beat {home} side on home turf ({h_form} vs {a_form}) — full stake refund protection on a draw."
             )
-            candidates.append((score, cls._build_single(date_str, home, away, "dnb", sel, None, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, expert_sources=max(3, n_f5)), home1x_leg))
+            real_alt5 = f"Main Tab ➔ Double Chance ➔ {home} or Draw (1X) (@ {bc_odds['dc_1x']:.2f})" if bc_odds["dc_1x"] >= 1.25 else ""
+            candidates.append((score + 4.0, cls._build_single(date_str, home, away, "dnb", sel, None, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, alt_line=real_alt5, expert_sources=max(3, n_f5)), home1x_leg))
 
         # ── 6. High-Siege Corners (`Corners Tab ➔ Total Corners ➔ Over 9.5` @ 1.62 – 1.95) ──
         ok_m6, n_f6, _, c_bon6, c_tag6 = ExpertConsensusHub.evaluate_market_consensus(ballot, "corners_over_95")
@@ -4583,17 +5399,42 @@ class SafeCushionBetCreator:
             )
             candidates.append((score, cls._build_single(date_str, home, away, "btts", sel, None, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, expert_sources=max(3, n_f7)), over15_leg))
 
-        # ── 8. Genuine Two-Way Open Goal Game (`Main Tab ➔ Total ➔ Over 2.5` @ 1.62 – 1.98) ──
+        # ── 8a. Refund-Protected Asian Goal Line (`Main Tab ➔ Total ➔ Over 2.0` @ 1.62 – 1.98) ──
         ok_m8, n_f8, _, c_bon8, c_tag8 = ExpertConsensusHub.evaluate_market_consensus(ballot, "over_25")
         if (
             ok_m8
+            and 1.62 <= bc_odds["over_20"] <= 1.98
+            and not has_btts_no_signal
+            and not away_weak_attack
+            and not home_weak_attack
+            and dc["lam_total"] >= 2.55
+            and not is_tactical
+            and league_label not in low_goal_traps
+        ):
+            odds = bc_odds["over_20"]
+            sel = "Main Tab ➔ Total ➔ Over 2.0"
+            prob = min(88.0, max(76.0, dc["p_over_25"] + 12.0) + min(4.5, n_f8 * 0.8))
+            score = prob + base_boost + 4.5 + c_bon8
+            real_alt8a = f"Main Tab ➔ Total ➔ Over 1.5 (@ {bc_odds['over_15']:.2f})" if bc_odds["over_15"] >= 1.25 else ""
+            why = _with_consensus(
+                c_tag8,
+                f"Attacking matchup ({home} vs {away}) — Over 2.0 pays full profit on 3+ goals and refunds 100% of stake on 2 goals."
+            )
+            candidates.append((score, cls._build_single(date_str, home, away, "goals_over_under", sel, 2.0, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, alt_line=real_alt8a, expert_sources=max(3, n_f8)), over15_leg))
+
+        # ── 8b. Genuine Two-Way Open Goal Game (`Main Tab ➔ Total ➔ Over 2.5` @ 1.62 – 1.98) ──
+        # Requires >= 2 expert sources agreeing so 2nd-division 0-2 low-scoring traps are skipped!
+        if (
+            ok_m8
+            and n_f8 >= 2
             and 1.62 <= bc_odds["over_25"] <= 1.98
+            and bc_odds["over_20"] < 1.62
             and not has_btts_no_signal
             and not away_weak_attack
             and not home_weak_attack
             and dc["lam_h"] >= 1.25
             and dc["lam_a"] >= 1.08
-            and dc["lam_total"] >= 2.65
+            and dc["lam_total"] >= 2.72
             and combined_draws <= 2
             and not is_tactical
             and league_label not in low_goal_traps
@@ -4603,36 +5444,42 @@ class SafeCushionBetCreator:
             sel = "Main Tab ➔ Total ➔ Over 2.5"
             prob = min(87.0, max(72.0, dc["p_over_25"] + 6.0) + min(5.0, n_f8 * 0.8))
             score = prob + base_boost + strat_mod("over_25") + c_bon8
+            real_alt8b = f"Main Tab ➔ Total ➔ Over 2.0 (@ {bc_odds['over_20']:.2f}) [2 goals = refund]" if bc_odds["over_20"] >= 1.30 else ""
             why = _with_consensus(
                 c_tag8,
                 f"Open attacking profile where both {home} ({h_form}) and {away} ({a_form}) create high-quality chances."
             )
-            candidates.append((score, cls._build_single(date_str, home, away, "goals_over_under", sel, 2.5, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, expert_sources=max(3, n_f8)), over15_leg))
+            candidates.append((score, cls._build_single(date_str, home, away, "goals_over_under", sel, 2.5, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, alt_line=real_alt8b, expert_sources=max(3, n_f8)), over15_leg))
 
         # ── 9. Disciplined Low-Tempo Tactical Under (`Main Tab ➔ Total ➔ Under 2.5` @ 1.62 – 1.95) ──
+        # v36.0 US Avellino 4-1 Lesson: NEVER bet Under 2.5 blind without verified match-ceiling stats AND >= 2 expert votes!
         ok_m9, n_f9, _, c_bon9, c_tag9 = ExpertConsensusHub.evaluate_market_consensus(ballot, "under_25")
-        max_rg = int(deep_stats.get("max_recent_match_goals", 0) or 0)
-        c_4p = int(deep_stats.get("high_ceiling_4plus_games", 0) or 0)
+        has_ver_ceiling = bool(deep_stats.get("has_deep_stats"))
+        max_rg = int(deep_stats.get("max_recent_match_goals", 99) if has_ver_ceiling else 99)
+        c_4p = int(deep_stats.get("high_ceiling_4plus_games", 99) if has_ver_ceiling else 99)
         if (
             ok_m9
+            and n_f9 >= 2
+            and has_ver_ceiling
             and 1.62 <= bc_odds["under_25"] <= 1.95
-            and dc["lam_total"] <= 2.18
+            and dc["lam_total"] <= 2.12
             and max_rg <= 3
             and c_4p == 0
             and (h_recent_l + a_recent_l) <= 4
-            and (is_tactical or "under_25" in bc_portal_tips or has_btts_no_signal or n_f9 >= 2)
             and league_label not in shootout_traps
+            and slug not in ["ita.2", "esp.2", "ger.2"]
             and not is_in_cooldown("under_25")
         ):
             odds = bc_odds["under_25"]
             sel = "Main Tab ➔ Total ➔ Under 2.5"
             prob = min(87.0, max(73.0, dc["p_under_25"] + 8.0) + min(5.0, n_f9 * 0.8))
             score = prob + base_boost + strat_mod("under_25") + c_bon9
+            real_alt9 = f"Main Tab ➔ Total ➔ Under 3.0 (@ {bc_odds['under_30']:.2f}) [3 goals = refund]" if bc_odds["under_30"] >= 1.28 else ""
             why = _with_consensus(
                 c_tag9,
-                "Compact, defense-first matchup between two disciplined blocks that limit clear chances."
+                "Verified low-event matchup between two disciplined defenses with zero recent 4+ goal games."
             )
-            candidates.append((score, cls._build_single(date_str, home, away, "goals_over_under", sel, 2.5, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, expert_sources=max(3, n_f9)), under35_leg))
+            candidates.append((score, cls._build_single(date_str, home, away, "goals_over_under", sel, 2.5, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, alt_line=real_alt9, expert_sources=max(3, n_f9)), under35_leg))
 
         if not candidates:
             return None, None
@@ -4691,7 +5538,7 @@ class SafeCushionBetCreator:
             match_context=league_label,
             bookmaker_name=bookie,
             kickoff_str=kickoff_str,
-            alt_bcgame_line="",  # ONE clear profitable bet per Single card (no 1.21x sub-bet trap!)
+            alt_bcgame_line=alt_line,
             is_combo=False,
             is_lotto_combo=False
         )
@@ -4705,7 +5552,7 @@ class SafeCushionBetCreator:
         require_verified_bookie: bool = True
     ) -> Optional[Tuple[float, Dict[str, Any]]]:
         """
-        v35.0 Verified Today-Only BC.Game Mega-Accumulator Cushion Selector:
+        v36.0 Verified Today-Only BC.Game Mega-Accumulator Cushion Selector:
         • STRICT <= 18.0h Kickoff Gate: NEVER grabs 48h Monday matches (like Bologna FC vs Udinese Calcio)
           on a Saturday slate — every leg is on today's/tonight's active BC.Game matchday board!
         • STRICT Live Bookmaker Verification (`is_verified_on_bookmakers > 0`): Only selects matches
@@ -4803,18 +5650,22 @@ class SafeCushionBetCreator:
                 {"home": home, "away": away, "league": lg_short, "kickoff": ko_short, "market_type": "goals_over_under", "selection": "Total ➔ Over 1.5 Goals", "line": 1.5, "odds": odd_o15}
             ))
 
-        # 4. Logical Under 3.5 Goals ONLY on verified low-chaos tactical games — exact unaltered BC.Game odd
-        max_rg = int(deep_st.get("max_recent_match_goals", 0) or 0)
-        c_4p = int(deep_st.get("high_ceiling_4plus_games", 0) or 0)
+        # 4. Logical Under 3.5 Goals ONLY when deep_st is verified AND >= 2 experts back Under (blocks Avellino 4-1 traps!)
+        has_ver_st = bool(deep_st.get("has_deep_stats"))
+        max_rg = int(deep_st.get("max_recent_match_goals", 99) if has_ver_st else 99)
+        c_4p = int(deep_st.get("high_ceiling_4plus_games", 99) if has_ver_st else 99)
         odd_u35 = round(bc_odds["under_35"], 2)
         if (
-            dc["p_under_35"] >= 84.0
-            and dc["lam_total"] <= 2.15
+            has_ver_st
+            and len(ballot_m["under_25"]) >= 2
+            and len(ballot_m["over_25"]) == 0
+            and dc["p_under_35"] >= 86.0
+            and dc["lam_total"] <= 2.08
             and combined_losses <= 3
             and max_rg <= 3
             and c_4p == 0
             and 1.14 <= odd_u35 <= 1.42
-            and slug not in ["ger.1", "ger.2", "ned.1", "fra.1", "fra.2", "eng.1", "eng.2", "bel.1", "tur.1"]
+            and slug not in ["ger.1", "ger.2", "ned.1", "fra.1", "fra.2", "eng.1", "eng.2", "bel.1", "tur.1", "ita.2"]
         ):
             cushions.append((
                 dc["p_under_35"] + buzz_bonus,
@@ -4917,10 +5768,23 @@ class SafeCushionBetCreator:
 
         if not main_batch_already_done:
             slots_left = MAX_DAILY_SINGLES - len(existing_singles)
-            for _, _, _, single, _ in top_pairs[: max(0, slots_left)]:
-                single.search_url = BCGameDirectLinkResolver.resolve_match_url(
-                    single.team_home, single.team_away, single.match_context, existing_url=single.search_url, allow_network=True
+            # Batch-resolve exact BC.Game direct match URLs via Live Playwright + Multi-Engine Search across top candidates!
+            cand_pool = top_pairs[: max(8, slots_left * 2)]
+            BCGameDirectLinkResolver.batch_resolve_exact_urls([(p[3].team_home, p[3].team_away) for p in cand_pool])
+            exact_verified_pairs = []
+            fallback_pairs = []
+            for p_tup in cand_pool:
+                s_obj = p_tup[3]
+                s_obj.search_url = BCGameDirectLinkResolver.resolve_match_url(
+                    s_obj.team_home, s_obj.team_away, s_obj.match_context, existing_url=s_obj.search_url, allow_network=True
                 )
+                if BCGameDirectLinkResolver.is_valid_direct_match_url(s_obj.search_url, s_obj.team_home, s_obj.team_away):
+                    exact_verified_pairs.append(p_tup)
+                else:
+                    fallback_pairs.append(p_tup)
+            chosen_final_pairs = (exact_verified_pairs + fallback_pairs)[: max(0, slots_left)]
+            top_pairs = chosen_final_pairs
+            for _, _, _, single, _ in chosen_final_pairs:
                 DailyLedgerManager.upsert_bet(single)
 
         updated_existing = DailyLedgerManager.load_active_date_items()
@@ -5059,13 +5923,14 @@ class SafeCushionBetCreator:
                 lotto_odds *= leg_od
 
             if len(lotto_legs) >= 4 and lotto_odds >= 3.2:
-                for idx_l, lg_l in enumerate(lotto_legs):
+                BCGameDirectLinkResolver.batch_resolve_exact_urls([(str(x.get("home", "")), str(x.get("away", ""))) for x in lotto_legs])
+                for lg_l in lotto_legs:
                     lg_l["bcgame_url"] = BCGameDirectLinkResolver.resolve_match_url(
                         lg_l.get("home", ""),
                         lg_l.get("away", ""),
                         lg_l.get("league", ""),
                         existing_url=str(lg_l.get("bcgame_url", "")),
-                        allow_network=(idx_l < 6)
+                        allow_network=True
                     )
                 lotto_odds = round(lotto_odds, 2)
                 lotto_desc = f"{len(lotto_legs)}-Leg Logical Safe-Cushion Mega List ({lotto_odds:.2f}x)"
@@ -5104,7 +5969,7 @@ class SafeCushionBetCreator:
 
 class BetSlipCardFormatter:
     """
-    v35.0 Singles-Only Official Record + Chronological History & Guide Formatter:
+    v36.0 Singles-Only Official Record + Chronological History & Guide Formatter:
     • Official W-L, Win Rate %, and R-Multiple / $ Net Profit count ONLY Official Singles (`not is_combo`).
     • Supports `up_to_date` chronological filtering so historical Result Cards and End-of-Day Recaps
       edited on `@Footybett` show the exact cumulative Singles W-L & P&L as of that specific date!
@@ -5148,7 +6013,7 @@ class BetSlipCardFormatter:
             "• Every studied pick, live score settlement & post-match statistical audit here is 100% FREE. We never charge subscriptions.\n"
             f"• 🤝 Trusted Sportsbook Partner: Play all our exact match names & lines with fast, smooth deposits & withdrawals on {partner_link_tag('BC.Game')} ➔ {BCGAME_PARTNER_URL}\n\n"
             f"1️⃣ 🟢 OFFICIAL DAILY SINGLES (1.00R = ${r_usd:.0f} Risk)\n"
-            "• Majority-consensus plays cross-checked across 32+ prediction portals (Sports Mole, Wavysport, OneFootball, LiveScore, Yahoo Sports, WinDrawWin, StatArea, Forebet), 35+ tipster channels & live team/player stats (1.62+ BC.Game odds).\n"
+            "• Weighted majority-consensus plays led by Tier-1 trusted football desks (Racing Post, Sporting Life, Opta Analyst, ProTipster, Action Network, Sports Mole, Wavysport, Oddschecker, OneFootball & LiveScore across 38+ portals), 35+ tipster channels & live team/player stats (1.62+ BC.Game odds).\n"
             "• ONLY Official Singles count toward our Official Channel W-L Record & R-Multiple Profit.\n"
             "• ⚖️ Sustainable Value: Every Official Single targets 1.62–2.05 odds (+0.62R to +1.05R profit) with refund-protected Handicap & Draw No Bet angles where appropriate.\n"
             "• 🔗 1-Click Direct Bet: Tap the [Open on BC.Game ↗] button or link on any card to jump straight to the match board (or tap any team name to copy)!\n\n"
@@ -5226,13 +6091,18 @@ class BetSlipCardFormatter:
             h_bc, a_bc, s.match_context, existing_url=s.search_url, allow_network=False
         )
         is_exact_match_page = BCGameDirectLinkResolver.is_valid_direct_match_url(direct_url, h_bc, a_bc)
-        link_lbl = f"Open {h_bc} vs {a_bc} on BC.Game ↗" if is_exact_match_page else f"Open {s.match_context.split(' - ')[-1] or 'Match'} Board on BC.Game ↗"
+        short_sel = s.selection.split("➔")[-1].strip()
+        link_lbl = (
+            f"Bet {short_sel} (@ {s.odds:.2f}) on BC.Game ↗"
+            if is_exact_match_page
+            else f"Open {h_bc} vs {a_bc} on BC.Game ↗"
+        )
         ko_clean = s.kickoff_str or ""
         if s.settlement != "PENDING" and ko_clean:
             ko_clean = re.sub(r"\s*\(In\s+[^)]+\)", "", ko_clean)
             ko_clean = ko_clean.replace(" — Starting Soon", "").strip()
         kickoff_line = f"\n⏰ Kickoff       : {ko_clean}" if ko_clean else ""
-        alt_disp = BankrollStakeSizer.format_safe_alt_display(s.alt_bcgame_line) if (s.alt_bcgame_line and s.date_str <= "2026-11-21") else ""
+        alt_disp = BankrollStakeSizer.format_safe_alt_display(s.alt_bcgame_line) if (s.alt_bcgame_line and s.date_str != "2026-11-22") else ""
         alt_line = f"\n🛡️ Safe Alt      : {alt_disp}" if alt_disp else ""
         conf_str = s.confidence_stars if "/" in s.confidence_stars else f"⭐️⭐️⭐️⭐️ ({min(9.5, max(8.2, round(s.model_prob / 8.5, 1))):.1f}/10)"
         stake_line = BankrollStakeSizer.format_stake_plan_line(1.0, s.odds, getattr(s, "stake_tier_label", "1R Play"))
@@ -5483,7 +6353,7 @@ class BetSlipCardFormatter:
 
 class InstantCustomBetAuditor:
     """
-    v35.0 Instant Custom Bet & Image Slip Auditor:
+    v36.0 Instant Custom Bet & Image Slip Auditor:
     When the user sends any match name, bet slip text, or screenshot image of a bet to the bot,
     this engine cross-checks the match across all 24+ Telegram tipster channels, 9 analytics portals
     (including betting.bc.game & API-Football /predictions), and our 5-Model Quantitative Engine
@@ -5659,7 +6529,7 @@ class InstantCustomBetAuditor:
 
 class BetSlipImageOCRAndVisionAnalyzer:
     """
-    v35.0 Multi-Engine Bet Slip Image Reader:
+    v36.0 Multi-Engine Bet Slip Image Reader:
     Extracts match names, bet markets, and odds from user-uploaded screenshot images using:
       1. Gemini Vision API (`GEMINI_API_KEY` / `GOOGLE_API_KEY` if set on server)
       2. Local `tesseract` OCR CLI (if installed on server)
@@ -5767,12 +6637,12 @@ class BetSlipImageOCRAndVisionAnalyzer:
 
 class ChannelHistoryCleaner:
     """
-    v35.0 Full Telegram Channel History Scanner, Deduplicator & In-Place Editor:
+    v36.0 Full Telegram Channel History Scanner, Deduplicator & In-Place Editor:
     • Reads public `@Footybett` channel history via `https://t.me/s/Footybett` (including pagination
       via `?before=<msg_id>`) so the bot discovers EVERY message ID ever posted on `@Footybett`.
     • Deletes duplicate cards, obsolete update/correction spam, and pre-reset clutter (`deleteMessage`).
     • Edits (`editMessageText`) all kept Open Bets, Settled Result Cards, and End-of-Day Recaps from
-      `2026-11-15` to today in-place into the unified v35.0 format (Singles-only Official W-L & 1R P&L,
+      `2026-11-15` to today in-place into the unified v36.0 format (Singles-only Official W-L & 1R P&L,
       Safe Alt win credits, explicit W/L status on Optional Combos & $5 Lotto, and chronological totals).
     • Posts/updates a Pinned Channel Guide explaining how Singles, Optional Combos, and Lotto work.
     """
@@ -5995,7 +6865,7 @@ class TelegramBotClient:
     @staticmethod
     def _build_channel_inline_kb(text: str) -> Dict[str, Any]:
         """
-        v35.0 Smart 1-Click Inline Keyboard for `@Footybett`:
+        v36.0 Smart 1-Click Inline Keyboard for `@Footybett`:
         • Single Bet Card:
             Row 1 -> `🎯 Bet <Home> vs <Away> on BC.Game ↗` (Direct Match or Exact League Board URL)
             Row 2 -> `🤝 Official BC.Game Partner (Sign Up • Fast Withdrawals)` (`BCGAME_PARTNER_URL`)
@@ -6144,7 +7014,7 @@ class TelegramBotClient:
         1. Re-grades all historical ledger items first (crediting Safe Alt wins like Metz vs Boulogne 2-1
            and attaching post-match boxscore stats & autopsies).
         2. Deletes duplicate Open/Result/EOD posts and obsolete clutter.
-        3. Edits all kept Open Bets, Result Cards, and End-of-Day Recaps in-place to the unified v35.0
+        3. Edits all kept Open Bets, Result Cards, and End-of-Day Recaps in-place to the unified v36.0
            Singles-Only 1R format (with accurate chronological cumulative Singles W-L & P&L per date).
         4. Posts or updates the Pinned Channel Guide at the top of `@Footybett`.
         """
@@ -6186,6 +7056,20 @@ class TelegramBotClient:
                     it_h.settled_note = "Main Tab ➔ Total ➔ Over 2.0 (2-0 FT = $100 Stake Refunded / 0.00R)"
                     it_h.loss_autopsy = ""
                     it_h.failure_mode = ""
+                # Explicit fix for 2026-11-22 Sporting Gijon vs UD Las Palmas (0-2 FT): Open Card had NO Safe Alt printed!
+                if (
+                    not it_h.is_combo
+                    and it_h.date_str == "2026-11-22"
+                    and "gijon" in normalize_team_str(it_h.team_home)
+                    and "palmas" in normalize_team_str(it_h.team_away)
+                ):
+                    it_h.alt_bcgame_line = ""
+                    it_h.won_via_safe_alt = False
+                    it_h.settled_note = ""
+                    if "0-2" in (it_h.score_str or ""):
+                        it_h.settlement = "LOST ❌"
+                        it_h.settled_odds = 0.0
+                        it_h.loss_autopsy = "🔍 Match Review: Despite 25 total shots (10 on target), Sporting Gijon missed clear chances in a 0-2 finish — finished 1 goal short of Over 2.5."
 
             if not DailyLedgerManager.is_locked_in_channel(f"v33_0_odds_and_lotto_refreshed:{active_d_now}"):
                 ExternalAnalyticsCollector.scrape_bcgame_official_portal()
@@ -6217,11 +7101,13 @@ class TelegramBotClient:
                                 elif "both teams" in sel_l or it_v.market_type == "btts":
                                     it_v.odds = true_odds["btts_yes"]
                                 elif "draw no bet" in sel_l or it_v.market_type == "dnb":
-                                    it_v.odds = true_odds["dnb_home"]
+                                    is_aw = LiveSportsbookAndStatsAPI._is_away_team_selected(it_v.selection, it_v.team_home, it_v.team_away)
+                                    it_v.odds = true_odds["dnb_away"] if is_aw else true_odds["dnb_home"]
                                 elif "corner" in sel_l:
                                     it_v.odds = true_odds["corners_over_95"]
                                 elif it_v.market_type == "1x2":
-                                    it_v.odds = true_odds["home_1x2"]
+                                    is_aw = LiveSportsbookAndStatsAPI._is_away_team_selected(it_v.selection, it_v.team_home, it_v.team_away)
+                                    it_v.odds = true_odds["away_1x2"] if is_aw else true_odds["home_1x2"]
 
                                 if it_v.alt_bcgame_line:
                                     alt_l = it_v.alt_bcgame_line.lower()
@@ -6350,7 +7236,7 @@ class TelegramBotClient:
             existing_text_by_id = {p["msg_id"]: p["text"] for p in posts}
             for mid, target_txt in to_edit_jobs:
                 cur_txt = existing_text_by_id.get(mid, "")
-                if ("⟦CODE⟧" not in target_txt) and re.sub(r"\s+", " ", cur_txt).strip() == re.sub(r"\s+", " ", strip_copy_tags(target_txt)).strip():
+                if ("⟦CODE⟧" not in target_txt) and ("⟦BC_LINK:" not in target_txt) and ("Safe Alt Refund" not in cur_txt) and re.sub(r"\s+", " ", cur_txt).strip() == re.sub(r"\s+", " ", strip_copy_tags(target_txt)).strip():
                     unchanged_cnt += 1
                     continue
                 ok_ed, status_ed = self.edit_message(PUBLISH_CHANNEL_ID, mid, target_txt)
@@ -6375,7 +7261,7 @@ class TelegramBotClient:
 
             DailyLedgerManager.save_all_items(all_items)
             save_json_dict(EOD_MESSAGE_IDS_FILE, eod_map)
-            DailyLedgerManager.mark_locked_in_channel("channel_clean_v33_0_auto_done")
+            DailyLedgerManager.mark_locked_in_channel("channel_clean_v36_0_auto_done")
 
             won_all, lost_all, wr_all, net_all_r = BetSlipCardFormatter.get_totals_summary_tuple()
             r_usd = BankrollStakeSizer.get_unit_usd()
@@ -6385,11 +7271,11 @@ class TelegramBotClient:
                 dup_note = f"\nℹ️ Older >48h duplicates (Telegram requires 1 manual tap by owner to delete): {links}"
 
             report = (
-                "🧹 @Footybett CHANNEL CLEANUP & HISTORY UPGRADE COMPLETE (v35.0)\n"
+                "🧹 @Footybett CHANNEL CLEANUP & HISTORY UPGRADE COMPLETE (v37.0)\n"
                 "────────────────────────\n"
                 f"• Scanned Channel Posts : {len(posts)} messages\n"
                 f"• Deleted Duplicates    : {deleted_cnt} message(s)\n"
-                f"• Rewritten & Upgraded  : {edited_cnt} post(s) updated to v35.0 Singles-Only 1R format\n"
+                f"• Rewritten & Upgraded  : {edited_cnt} post(s) updated to v37.0 Singles-Only 1R format\n"
                 f"• Already Clean         : {unchanged_cnt} post(s)\n"
                 "• Pinned Partner Guide  : Active 📌\n"
                 f"• Channel & Bot Bio     : {bio_status}\n"
@@ -6542,11 +7428,11 @@ class TelegramBotClient:
             return []
 
     def background_worker_loop(self):
-        logger.info("Footybett v35.0 Auto-Cleaner & Deep Match-Autopsy Worker started...")
+        logger.info("Footybett v37.0 Weighted Sharp-Consensus & Auto-Cleaner & Deep Match-Autopsy Worker started...")
         time.sleep(3)
-        if not DailyLedgerManager.is_locked_in_channel("channel_clean_v33_0_auto_done"):
+        if not DailyLedgerManager.is_locked_in_channel("channel_clean_v36_0_auto_done"):
             try:
-                logger.info("Running automatic one-time v35.0 @Footybett channel cleanup & history upgrade...")
+                logger.info("Running automatic one-time v36.0 @Footybett channel cleanup & history upgrade...")
                 self.clean_and_upgrade_channel_history(auto_startup=True)
             except Exception as ce:
                 logger.error("Auto channel cleanup error: %s", ce)
@@ -6563,7 +7449,7 @@ class TelegramBotClient:
             {"command": "clean", "description": "🧹 Clean Duplicates & Upgrade @Footybett History"},
             {"command": "results", "description": "🏁 Refresh Live Scores & Outcomes"},
             {"command": "learn", "description": "📋 View Post-Match Tactical Reviews"},
-            {"command": "sources", "description": "🌐 Live Status of All 32+ Prediction Websites & APIs"},
+            {"command": "sources", "description": "🌐 Live Status of 38+ Trusted Analyst Desks & APIs"},
             {"command": "channels", "description": "📡 View or Add Tipster Channels (/addchannel)"},
             {"command": "lotto", "description": "🚀 View Today's Optional $5 Mega Lotto"},
             {"command": "setunit", "description": "💵 Set 1R Single Stake (e.g. /setunit 100)"},
@@ -6586,7 +7472,7 @@ class TelegramBotClient:
         watcher_thread = threading.Thread(target=self.background_worker_loop, daemon=True)
         watcher_thread.start()
 
-        logger.info("Bot listener running (v35.0 Auto-Cleaner + 32-Site Majority Consensus + Singles-Only W-L)...")
+        logger.info("Bot listener running (v36.0 Auto-Cleaner + 32-Site Majority Consensus + Singles-Only W-L)...")
         offset = None
 
         while True:
@@ -6627,7 +7513,7 @@ class TelegramBotClient:
                 # 1b. Handle /clean (Full Channel Deduplication & History Upgrade)
                 if low_t in ["/clean", "/cleanchannel", "/fixhistory"]:
                     def handle_clean_cmd(cid):
-                        self.send_message(cid, "🧹 Scanning ⟦CODE⟧@Footybett⟦/CODE⟧ history, deleting duplicates, and upgrading all posts to v35.0...")
+                        self.send_message(cid, "🧹 Scanning ⟦CODE⟧@Footybett⟦/CODE⟧ history, deleting duplicates, and upgrading all posts to v36.0...")
                         rep = self.clean_and_upgrade_channel_history(auto_startup=False)
                         self.send_message(cid, rep)
                     threading.Thread(target=handle_clean_cmd, args=[chat_id], daemon=True).start()
