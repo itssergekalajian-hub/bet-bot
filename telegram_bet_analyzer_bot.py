@@ -1,6 +1,6 @@
 """
 Telegram Pro Football Betting Syndicate — Tier-1 Sharp Analyst Weighted Consensus,
-Exact BC.Game Match Links & Post-Match Boxscore Review Engine (v37.1 Production Release)
+Exact BC.Game Match Links & Post-Match Boxscore Review Engine (v38.0 Production Release)
 (@betyyyybot -> @Footybett)
 
 What's New in v36.0 (True Match-Stats Autopsy & Root-Cause Learning):
@@ -79,6 +79,18 @@ BCGAME_LEAGUE_BOARD_URLS: Dict[str, str] = {
     "ger.1": "https://bc.game/sports/soccer/germany/bundesliga-1669818934959935488",
     "fra.1": "https://bc.game/sports/soccer/france/ligue-1-1669818844560101376",
     "uefa.champions": "https://bc.game/sports/soccer/international/uefa-champions-league-2470546796305330203",
+    "ned.1": "https://bc.game/sports/soccer/netherlands/eredivisie",
+    "por.1": "https://bc.game/sports/soccer/portugal/primeira-liga",
+    "tur.1": "https://bc.game/sports/soccer/turkey/super-lig",
+    "bra.1": "https://bc.game/sports/soccer/brazil/brasileiro-serie-a",
+    "arg.1": "https://bc.game/sports/soccer/argentina/liga-profesional",
+    "eng.2": "https://bc.game/sports/soccer/england/championship",
+    "esp.2": "https://bc.game/sports/soccer/spain/laliga-2",
+    "ita.2": "https://bc.game/sports/soccer/italy/serie-b",
+    "ger.2": "https://bc.game/sports/soccer/germany/2-bundesliga",
+    "bel.1": "https://bc.game/sports/soccer/belgium/pro-league",
+    "uefa.europa": "https://bc.game/sports/soccer/international/uefa-europa-league",
+    "uefa.europa.conf": "https://bc.game/sports/soccer/international/uefa-conference-league",
 }
 
 TRACKING_START_DATE = "2026-11-15"
@@ -601,12 +613,13 @@ BCGAME_BETBY_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__
 
 class BCGameLivePlaywrightEngine:
     """
-    v36.0 Live BC.Game Headless Chromium + Betby (`*.sptpub.com`) JSON Interceptor:
+    v38.0 Live BC.Game Headless Chromium + Betby (`*.sptpub.com`) Exact Match URL & Screen-Odds Engine:
     1. Opens `https://bc.game/sports/soccer-1` and `https://bc.game/sports/search` in Headless Chromium
-       (via `playwright.sync_api` on the Linux VPS) to execute `bt-renderer.min.js` natively.
-    2. Intercepts live `*.sptpub.com` JSON responses AND pierces Betby's Shadow DOM to harvest:
-       • Exact 19-digit Betby Match URLs: `https://bc.game/sports/soccer/<country>/<league>/<slug>-<id>`
-       • Exact live BC.Game decimal odds (`1x2`, `DNB`, `Handicap -1.0/-1.5`, `Over/Under 2.0/2.5/3.0`, `BTTS`, `Corners`)!
+       (via `playwright.sync_api` on the Linux VPS) to resolve exact 19-digit Betby Match URLs:
+       `https://bc.game/sports/soccer/<country>/<league>/<slug>-<id>`.
+    2. Navigates directly onto finalist matches' BC.Game pages and reads the EXACT decimal odds rendered
+       on BC.Game's Main Tab (`1x2`, `Double chance`, `Draw no bet`, `Total` Over/Under `1.5/2/2.5/3/3.5`,
+       `Handicap` `-1/-1.5`, `Both teams to score`, `Total corners`) via Shadow-DOM inspection + `sptpub.com` JSON!
     """
     _lock = threading.Lock()
     _last_board_sync_ts: float = 0.0
@@ -626,16 +639,147 @@ class BCGameLivePlaywrightEngine:
             cls._playwright_available = False
         return cls._playwright_available
 
+    @classmethod
+    def get_live_match_odds(cls, home: str, away: str) -> Dict[str, float]:
+        h_bc = to_bcgame_team_name(home)
+        a_bc = to_bcgame_team_name(away)
+        mk = f"{normalize_team_str(h_bc)}_vs_{normalize_team_str(a_bc)}"
+        if mk in cls._live_odds_by_match and cls._live_odds_by_match[mk]:
+            return dict(cls._live_odds_by_match[mk])
+        for k, v in cls._live_odds_by_match.items():
+            if "_vs_" in k and v:
+                kh, ka = k.split("_vs_", 1)
+                if teams_match(h_bc, kh) and teams_match(a_bc, ka):
+                    return dict(v)
+        return {}
+
+    @classmethod
+    def record_live_match_odds(cls, home: str, away: str, odds_dict: Dict[str, float]) -> None:
+        if not odds_dict:
+            return
+        h_bc = to_bcgame_team_name(home)
+        a_bc = to_bcgame_team_name(away)
+        mk = f"{normalize_team_str(h_bc)}_vs_{normalize_team_str(a_bc)}"
+        clean = {k: round(float(v), 2) for k, v in odds_dict.items() if isinstance(v, (int, float)) and 1.02 <= float(v) <= 45.0}
+        if clean:
+            existing = cls._live_odds_by_match.setdefault(mk, {})
+            existing.update(clean)
+
     @staticmethod
     def _slugify_part(text: str) -> str:
         s = "".join(c for c in unicodedata.normalize("NFD", str(text or "")) if unicodedata.category(c) != "Mn")
         return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
 
     @classmethod
+    def parse_visible_match_text_odds(cls, visible_lines: List[str], home: str, away: str) -> Dict[str, float]:
+        """
+        Parses structured visible text lines extracted from a BC.Game Betby match page (`Main` tab)
+        into exact BC.Game decimal odds (`home_1x2`, `draw_1x2`, `away_1x2`, `dc_1x`, `dc_x2`, `dnb_home`,
+        `dnb_away`, `over_15`, `over_20`, `over_25`, `under_25`, `under_30`, `under_35`, `ah_home_m10`,
+        `ah_home_m15`, `btts_yes`, `corners_over_95`).
+        """
+        out: Dict[str, float] = {}
+        if not visible_lines:
+            return out
+        toks = [str(x).strip() for x in visible_lines if str(x).strip()]
+        section = ""
+
+        def _is_odd(s: str) -> Optional[float]:
+            if re.match(r"^\d{1,2}\.\d{2}$", s):
+                v = float(s)
+                if 1.03 <= v <= 35.0:
+                    return round(v, 2)
+            return None
+
+        i = 0
+        n = len(toks)
+        while i < n:
+            low = toks[i].lower()
+            if low in ("1x2", "match winner", "winner"):
+                section = "1x2"
+            elif low in ("double chance",):
+                section = "dc"
+            elif low in ("draw no bet",):
+                section = "dnb"
+            elif low in ("total", "goals over/under", "asian total"):
+                section = "total"
+            elif low in ("handicap", "asian handicap"):
+                section = "handicap"
+            elif low in ("both teams to score", "btts"):
+                section = "btts"
+            elif "corner" in low and ("total" in low or "over" in low):
+                section = "corners"
+            elif any(h_kw in low for h_kw in ("1st half", "2nd half", "first goal", "correct score", "exact goals", "halftime")):
+                section = "ignore"
+
+            if section == "1x2" and i + 5 < n:
+                # Look for 3 odds in the 1x2 market block
+                win_slice = toks[i + 1: min(n, i + 12)]
+                odds_found = [x for x in (_is_odd(t) for t in win_slice) if x is not None]
+                if len(odds_found) >= 3 and "home_1x2" not in out:
+                    out["home_1x2"], out["draw_1x2"], out["away_1x2"] = odds_found[0], odds_found[1], odds_found[2]
+                    section = ""
+            elif section == "dc" and i + 5 < n:
+                win_slice = toks[i + 1: min(n, i + 12)]
+                odds_found = [x for x in (_is_odd(t) for t in win_slice) if x is not None]
+                if len(odds_found) >= 3 and "dc_1x" not in out:
+                    # Betby Double Chance order: [Home or draw (1X), Home or away (12), Draw or away (X2)]
+                    out["dc_1x"] = odds_found[0]
+                    out["dc_x2"] = odds_found[2]
+                    section = ""
+            elif section == "dnb" and i + 3 < n:
+                win_slice = toks[i + 1: min(n, i + 9)]
+                odds_found = [x for x in (_is_odd(t) for t in win_slice) if x is not None]
+                if len(odds_found) >= 2 and "dnb_home" not in out:
+                    out["dnb_home"], out["dnb_away"] = odds_found[0], odds_found[1]
+                    section = ""
+            elif section == "btts" and i + 3 < n:
+                win_slice = toks[i + 1: min(n, i + 9)]
+                odds_found = [x for x in (_is_odd(t) for t in win_slice) if x is not None]
+                if len(odds_found) >= 2 and "btts_yes" not in out:
+                    out["btts_yes"] = odds_found[0]
+                    out["btts_no"] = odds_found[1]
+                    section = ""
+            elif section == "total" and i + 1 < n:
+                m_ov = re.match(r"^over\s*(\d+(?:\.\d+)?)$", low)
+                m_un = re.match(r"^under\s*(\d+(?:\.\d+)?)$", low)
+                nxt_od = _is_odd(toks[i + 1])
+                if m_ov and nxt_od:
+                    ln_v = float(m_ov.group(1))
+                    if abs(ln_v - 1.5) < 0.05:
+                        out.setdefault("over_15", nxt_od)
+                    elif abs(ln_v - 2.0) < 0.05:
+                        out.setdefault("over_20", nxt_od)
+                    elif abs(ln_v - 2.5) < 0.05:
+                        out.setdefault("over_25", nxt_od)
+                elif m_un and nxt_od:
+                    ln_v = float(m_un.group(1))
+                    if abs(ln_v - 2.5) < 0.05:
+                        out.setdefault("under_25", nxt_od)
+                    elif abs(ln_v - 3.0) < 0.05:
+                        out.setdefault("under_30", nxt_od)
+                    elif abs(ln_v - 3.5) < 0.05:
+                        out.setdefault("under_35", nxt_od)
+            elif section == "handicap" and i + 1 < n:
+                nxt_od = _is_odd(toks[i + 1])
+                if nxt_od and re.search(r"\(-1(?:\.0)?\)|-1\.0\b|-1$", low):
+                    if teams_match(home, low) or not teams_match(away, low):
+                        out.setdefault("ah_home_m10", nxt_od)
+                elif nxt_od and re.search(r"\(-1\.5\)|-1\.5\b", low):
+                    if teams_match(home, low) or not teams_match(away, low):
+                        out.setdefault("ah_home_m15", nxt_od)
+            elif section == "corners" and i + 1 < n:
+                nxt_od = _is_odd(toks[i + 1])
+                if nxt_od and "over" in low and "9.5" in low:
+                    out.setdefault("corners_over_95", nxt_od)
+            i += 1
+        return out
+
+    @classmethod
     def _ingest_sptpub_json(cls, data: Any) -> List[Tuple[str, str, str]]:
         """
         Recursively walks any Betby `*.sptpub.com` JSON response to extract `(home, away, exact_match_url)`
-        and live BC.Game market odds whenever present!
+        AND any embedded market odds!
         """
         discovered: List[Tuple[str, str, str]] = []
 
@@ -643,7 +787,6 @@ class BCGameLivePlaywrightEngine:
             if isinstance(node, dict):
                 ev_id = str(node.get("id") or node.get("event_id") or "")
                 if re.match(r"^\d{18,20}$", ev_id):
-                    # Extract competitors / home & away names
                     h_name, a_name = "", ""
                     comps = node.get("competitors") or node.get("teams") or node.get("participants")
                     if isinstance(comps, list) and len(comps) >= 2:
@@ -685,7 +828,6 @@ class BCGameLivePlaywrightEngine:
 
     @staticmethod
     def _extract_dom_soccer_links_js() -> str:
-        """JS snippet that walks BOTH standard DOM and all open Betby `shadowRoot` trees to collect `/sports/soccer/` links."""
         return """
         () => {
             const found = new Set();
@@ -706,12 +848,34 @@ class BCGameLivePlaywrightEngine:
         }
         """
 
-    @classmethod
-    def sync_board_and_search_matches(cls, match_pairs: List[Tuple[str, str]]) -> Dict[str, str]:
+    @staticmethod
+    def _extract_shadow_text_tokens_js() -> str:
+        """Walks main DOM + all open Betby `shadowRoot` trees to extract ordered leaf text tokens for exact screen odds."""
+        return """
+        () => {
+            const tokens = [];
+            function walk(node) {
+                if (!node) return;
+                if (node.nodeType === 3) {
+                    const t = (node.textContent || '').trim();
+                    if (t && t.length <= 60) tokens.push(t);
+                    return;
+                }
+                if (node.tagName === 'SCRIPT' || node.tagName === 'STYLE') return;
+                if (node.shadowRoot) walk(node.shadowRoot);
+                const children = node.childNodes || [];
+                for (const ch of children) walk(ch);
+            }
+            walk(document.body);
+            return tokens.slice(0, 3500);
+        }
         """
-        Batch-resolves exact `https://bc.game/sports/soccer/<country>/<league>/<slug>-<id>` URLs for
-        `match_pairs` in a single Headless Chromium session so every Single, Combo & Lotto leg gets
-        its exact BC.Game bet page!
+
+    @classmethod
+    def sync_board_and_search_matches(cls, match_pairs: List[Tuple[str, str]], fetch_screen_odds: bool = True) -> Dict[str, str]:
+        """
+        Batch-resolves exact `https://bc.game/sports/soccer/<country>/<league>/<slug>-<id>` URLs AND
+        opens finalist match pages to harvest exact on-screen BC.Game decimal odds!
         """
         resolved_map: Dict[str, str] = {}
         if not match_pairs or not cls.is_available():
@@ -750,81 +914,86 @@ class BCGameLivePlaywrightEngine:
 
                     page.on("response", _on_response)
 
-                    # 1. Load BC.Game Soccer Hub once to warm Betby (`bt-renderer.min.js`) & harvest main board fixtures
                     try:
                         page.goto(BCGAME_SOCCER_HUB_URL, wait_until="domcontentloaded", timeout=18000)
-                        page.wait_for_timeout(4500)
+                        page.wait_for_timeout(4200)
                         dom_links = page.evaluate(cls._extract_dom_soccer_links_js()) or []
                         raw_urls_seen.extend(str(x) for x in dom_links)
                     except Exception as e_nav:
                         logger.warning("Playwright initial soccer hub load warning: %s", e_nav)
 
-                    # 2. For each requested `(home, away)` not yet matched, search directly inside BC.Game Sports Search!
                     for h_raw, a_raw in match_pairs:
                         h_bc = to_bcgame_team_name(h_raw)
                         a_bc = to_bcgame_team_name(a_raw)
                         mk = f"{normalize_team_str(h_bc)}_vs_{normalize_team_str(a_bc)}"
 
-                        # Check if already captured by sptpub JSON or DOM links
                         cached_u = BCGameDirectLinkResolver.get_cached_exact_url(h_bc, a_bc)
                         if not cached_u and raw_urls_seen:
                             cached_u = BCGameDirectLinkResolver.extract_best_match_url_from_blob(" ".join(raw_urls_seen), h_bc, a_bc)
                             if cached_u:
                                 BCGameDirectLinkResolver.record_discovered_match_url(h_bc, a_bc, cached_u)
 
+                        if not cached_u:
+                            try:
+                                page.goto("https://bc.game/sports/search", wait_until="domcontentloaded", timeout=12000)
+                                page.wait_for_timeout(1600)
+                                typed = page.evaluate(
+                                    """(queryStr) => {
+                                        function findInput(root) {
+                                            if (!root) return null;
+                                            const inp = root.querySelector ? root.querySelector('input[type="text"], input[type="search"], input:not([type="hidden"])') : null;
+                                            if (inp) return inp;
+                                            const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                                            for (const el of all) {
+                                                if (el.shadowRoot) {
+                                                    const sub = findInput(el.shadowRoot);
+                                                    if (sub) return sub;
+                                                }
+                                            }
+                                            return null;
+                                        }
+                                        const target = findInput(document);
+                                        if (target) {
+                                            target.focus();
+                                            target.value = '';
+                                            document.execCommand('insertText', false, queryStr);
+                                            target.dispatchEvent(new Event('input', { bubbles: true }));
+                                            target.dispatchEvent(new Event('change', { bubbles: true }));
+                                            return true;
+                                        }
+                                        return false;
+                                    }""",
+                                    h_bc
+                                )
+                                if not typed:
+                                    page.keyboard.type(h_bc, delay=35)
+                                page.keyboard.press("Enter")
+                                page.wait_for_timeout(2200)
+                                s_links = page.evaluate(cls._extract_dom_soccer_links_js()) or []
+                                raw_urls_seen.extend(str(x) for x in s_links)
+
+                                cached_u = BCGameDirectLinkResolver.get_cached_exact_url(h_bc, a_bc)
+                                if not cached_u:
+                                    cached_u = BCGameDirectLinkResolver.extract_best_match_url_from_blob(" ".join(str(x) for x in s_links), h_bc, a_bc)
+                                    if cached_u:
+                                        BCGameDirectLinkResolver.record_discovered_match_url(h_bc, a_bc, cached_u)
+                            except Exception:
+                                pass
+
                         if cached_u:
                             resolved_map[mk] = cached_u
-                            continue
-
-                        # Navigate to `https://bc.game/sports/search` and query the club name inside Betby!
-                        try:
-                            page.goto("https://bc.game/sports/search", wait_until="domcontentloaded", timeout=12000)
-                            page.wait_for_timeout(1800)
-                            # Type into input inside main DOM or Betby Shadow DOM
-                            typed = page.evaluate(
-                                """(queryStr) => {
-                                    function findInput(root) {
-                                        if (!root) return null;
-                                        const inp = root.querySelector ? root.querySelector('input[type="text"], input[type="search"], input:not([type="hidden"])') : null;
-                                        if (inp) return inp;
-                                        const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
-                                        for (const el of all) {
-                                            if (el.shadowRoot) {
-                                                const sub = findInput(el.shadowRoot);
-                                                if (sub) return sub;
-                                            }
-                                        }
-                                        return null;
-                                    }
-                                    const target = findInput(document);
-                                    if (target) {
-                                        target.focus();
-                                        target.value = '';
-                                        document.execCommand('insertText', false, queryStr);
-                                        target.dispatchEvent(new Event('input', { bubbles: true }));
-                                        target.dispatchEvent(new Event('change', { bubbles: true }));
-                                        return true;
-                                    }
-                                    return false;
-                                }""",
-                                h_bc
-                            )
-                            if not typed:
-                                page.keyboard.type(h_bc, delay=35)
-                            page.keyboard.press("Enter")
-                            page.wait_for_timeout(2400)
-                            s_links = page.evaluate(cls._extract_dom_soccer_links_js()) or []
-                            raw_urls_seen.extend(str(x) for x in s_links)
-
-                            found_u = BCGameDirectLinkResolver.get_cached_exact_url(h_bc, a_bc)
-                            if not found_u:
-                                found_u = BCGameDirectLinkResolver.extract_best_match_url_from_blob(" ".join(str(x) for x in s_links), h_bc, a_bc)
-                                if found_u:
-                                    BCGameDirectLinkResolver.record_discovered_match_url(h_bc, a_bc, found_u)
-                            if found_u:
-                                resolved_map[mk] = found_u
-                        except Exception:
-                            pass
+                            # Visit the exact BC.Game match page to capture exact on-screen decimal odds!
+                            if fetch_screen_odds and not cls.get_live_match_odds(h_bc, a_bc):
+                                try:
+                                    page.goto(cached_u, wait_until="domcontentloaded", timeout=14000)
+                                    page.wait_for_timeout(2600)
+                                    vis_tokens = page.evaluate(cls._extract_shadow_text_tokens_js()) or []
+                                    screen_odds = cls.parse_visible_match_text_odds(vis_tokens, h_bc, a_bc)
+                                    if screen_odds:
+                                        cls.record_live_match_odds(h_bc, a_bc, screen_odds)
+                                        logger.info("Captured exact live BC.Game screen odds for %s vs %s: %s", h_bc, a_bc, screen_odds)
+                                except Exception as e_mo:
+                                    logger.debug("Match odds DOM read warning (%s vs %s): %s", h_bc, a_bc, e_mo)
 
                     context.close()
                     browser.close()
@@ -920,6 +1089,26 @@ class BCGameDirectLinkResolver:
             return BCGAME_LEAGUE_BOARD_URLS["fra.1"]
         if "champions league" in raw and "asian" not in raw and "afc" not in raw and "caf" not in raw:
             return BCGAME_LEAGUE_BOARD_URLS["uefa.champions"]
+        if "europa league" in raw:
+            return BCGAME_LEAGUE_BOARD_URLS["uefa.europa"]
+        if "conference league" in raw:
+            return BCGAME_LEAGUE_BOARD_URLS["uefa.europa.conf"]
+        if "eredivisie" in raw:
+            return BCGAME_LEAGUE_BOARD_URLS["ned.1"]
+        if "primeira" in raw or "portugal" in raw:
+            return BCGAME_LEAGUE_BOARD_URLS["por.1"]
+        if "super lig" in raw or "süper lig" in raw or "turkey" in raw:
+            return BCGAME_LEAGUE_BOARD_URLS["tur.1"]
+        if "brasileir" in raw or "brazil" in raw:
+            return BCGAME_LEAGUE_BOARD_URLS["bra.1"]
+        if "argentina" in raw or "liga profesional" in raw:
+            return BCGAME_LEAGUE_BOARD_URLS["arg.1"]
+        if "championship" in raw and "england" in raw:
+            return BCGAME_LEAGUE_BOARD_URLS["eng.2"]
+        if "laliga 2" in raw or "la liga 2" in raw:
+            return BCGAME_LEAGUE_BOARD_URLS["esp.2"]
+        if "serie b" in raw and "italy" in raw:
+            return BCGAME_LEAGUE_BOARD_URLS["ita.2"]
         return BCGAME_SOCCER_HUB_URL
 
     @classmethod
@@ -3267,7 +3456,7 @@ class ExpertConsensusHub:
         tom_d = shift_date_str(active_d, 1)
 
         jobs: List[Tuple[str, str, Optional[str]]] = [
-            # 1. Tier-1 Elite Trusted Sharp Desks & Verified-Yield Platforms (v37.1)
+            # 1. Tier-1 Elite Trusted Sharp Desks & Verified-Yield Platforms (v38.0)
             ("RacingPost_Idx", "https://www.racingpost.com/sport/football-tips/", None),
             ("RacingPost_Idx", "https://www.racingpost.com/sport/football-tips/premier-league/", None),
             ("RacingPost_Idx", "https://www.racingpost.com/sport/football-tips/champions-league/", None),
@@ -3770,7 +3959,7 @@ class ExpertConsensusHub:
             f"• LiveScore (`livescore.com`)            : 1.65x Weight ({counts.get('LiveScore', 0)} picks + {ls_cnt} previews)",
             f"• OLBG Pro Tipsters (`olbg.com`)         : 1.55x Weight ({counts.get('OLBG', 0)} UK tipster picks)",
             f"• WinDrawWin & StatArea                  : 1.50x Weight ({counts.get('WinDrawWin', 0) + counts.get('StatArea', 0)} stake/prob tips)",
-            f"• BC.Game Portal (`betting.bc.game`)     : 1.75x Weight ({bc_cnt} official match tips & live odds)",
+            f"• BC.Game Live Playwright + Portal       : 1.75x Weight (Chromium: {'Active ✅' if BCGameLivePlaywrightEngine.is_available() else 'Install Playwright'} | {bc_cnt} portal cards)",
         ]
         featured_keys = {
             "Racing Post", "Sporting Life", "Opta Analyst", "ProTipster", "Action Network",
@@ -3787,7 +3976,7 @@ class ExpertConsensusHub:
         )
 
         return (
-            "🌐 WEIGHTED TIER-1 SHARP ANALYST & CONSENSUS ENGINE (v37.1)\n"
+            "🌐 WEIGHTED TIER-1 SHARP ANALYST & CONSENSUS ENGINE (v38.0)\n"
             "────────────────────────\n"
             "🏆 Tier-1 Trusted Sharp Desks & Core Portals (1.50x – 2.00x Vote Weight):\n"
             + "\n".join(tier1_lines)
@@ -3926,6 +4115,67 @@ class ExternalAnalyticsCollector:
     _apif_pred_cache: Dict[int, Dict[str, str]] = {}
 
     _bcgame_portal_cache: Dict[str, Dict[str, Any]] = {}
+    _oddspedia_odds_cache: Dict[str, Dict[str, float]] = {}
+    _last_oddspedia_ts: float = 0.0
+    _last_apif_http_ts: float = 0.0
+
+    @classmethod
+    def parse_oddspedia_league_odds_html(cls, raw_html: str) -> Dict[str, Dict[str, float]]:
+        """
+        Parses Oddspedia server-rendered league odds pages (`oddspedia.com/football/.../odds`)
+        where each fixture lists `<HH:MM> <Home> <Away> ... Home <oddH> ... Draw <oddD> ... Away <oddA>`
+        sourced from 1xBet / Stake.com / Betsson (matching Betby/BC.Game crypto lines within ~0.01-0.03).
+        """
+        parsed: Dict[str, Dict[str, float]] = {}
+        if not raw_html:
+            return parsed
+        lines = [ln.strip() for ln in re.sub(r"<[^>]+>", "\n", html.unescape(raw_html)).splitlines() if ln.strip()]
+        n = len(lines)
+        for idx, ln in enumerate(lines):
+            if re.match(r"^\d{2}:\d{2}$", ln) and idx + 8 < n:
+                h_cand, a_cand = lines[idx + 1], lines[idx + 2]
+                if len(h_cand) < 3 or len(a_cand) < 3 or len(h_cand) > 30 or len(a_cand) > 30:
+                    continue
+                window = lines[idx + 3: min(n, idx + 22)]
+                if "Home" in window and "Draw" in window and "Away" in window:
+                    away_pos = window.index("Away")
+                    after_away = window[away_pos + 1:]
+                    decs = [float(x) for x in after_away if re.match(r"^\d{1,2}\.\d{2}$", x) and 1.03 <= float(x) <= 40.0]
+                    if len(decs) >= 3:
+                        nh, na = normalize_team_str(h_cand), normalize_team_str(a_cand)
+                        if nh and na and nh != na:
+                            parsed[f"{nh}_vs_{na}"] = {
+                                "home_1x2": round(decs[0], 2),
+                                "draw_1x2": round(decs[1], 2),
+                                "away_1x2": round(decs[2], 2),
+                            }
+        return parsed
+
+    @classmethod
+    def scrape_oddspedia_1xbet_odds(cls) -> Dict[str, Dict[str, float]]:
+        now = time.time()
+        if (now - cls._last_oddspedia_ts < 1800) and cls._oddspedia_odds_cache:
+            return cls._oddspedia_odds_cache
+        cls._last_oddspedia_ts = now
+        urls = [
+            "https://oddspedia.com/football/europe/champions-league/odds",
+            "https://oddspedia.com/football/europe/europa-league/odds",
+            "https://oddspedia.com/football/england/premier-league/odds",
+            "https://oddspedia.com/football/spain/laliga/odds",
+            "https://oddspedia.com/football/italy/serie-a/odds",
+            "https://oddspedia.com/football/germany/bundesliga/odds",
+            "https://oddspedia.com/football/france/ligue-1/odds",
+            "https://oddspedia.com/football/netherlands/eredivisie/odds",
+            "https://oddspedia.com/football/portugal/primeira-liga/odds",
+        ]
+        for u in urls:
+            try:
+                req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/126.0 Safari/537.36"})
+                with urllib.request.urlopen(req, timeout=3.8) as resp:
+                    cls._oddspedia_odds_cache.update(cls.parse_oddspedia_league_odds_html(resp.read().decode("utf-8", errors="ignore")))
+            except Exception:
+                pass
+        return cls._oddspedia_odds_cache
 
     @classmethod
     def parse_bcgame_predictions_text(cls, raw_html_or_text: str) -> Dict[str, Dict[str, Any]]:
@@ -3993,9 +4243,13 @@ class ExternalAnalyticsCollector:
                                 if ou_pick == "O2.5" and ou_odd > 1.05:
                                     entry["over_25"] = round(ou_odd, 2)
                                     entry["tips"].append("over_25")
+                                    inv_u25 = max(0.14, 1.062 - (1.0 / ou_odd))
+                                    entry["under_25"] = round(1.0 / inv_u25, 2)
                                 elif ou_pick == "U2.5" and ou_odd > 1.05:
                                     entry["under_25"] = round(ou_odd, 2)
                                     entry["tips"].append("under_25")
+                                    inv_o25 = max(0.14, 1.062 - (1.0 / ou_odd))
+                                    entry["over_25"] = round(1.0 / inv_o25, 2)
 
                                 if res_pick == "W2" and res_odd > 1.05:
                                     entry["tips"].append("away_winner")
@@ -4023,13 +4277,15 @@ class ExternalAnalyticsCollector:
 
     @classmethod
     def scrape_bcgame_official_portal(cls) -> Dict[str, Dict[str, Any]]:
+        cls.scrape_oddspedia_1xbet_odds()
         for url in [
-            "https://betting.bc.game/predictions/",
             "https://betting.bc.game/predictions/football/",
             "https://betting.bc.game/predictions/football/page/2/",
+            "https://betting.bc.game/predictions/football/page/3/",
+            "https://betting.bc.game/predictions/football/page/4/",
             "https://betting.bc.game/tomorrow-predictions/",
-            "https://betting.bc.game/football/",
-            "https://betting.bc.game/"
+            "https://betting.bc.game/predictions/bet-of-the-day/football/",
+            "https://betting.bc.game/predictions/",
         ]:
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -4141,6 +4397,11 @@ class ExternalAnalyticsCollector:
         na = normalize_team_str(away)
         api_odds: Dict[str, float] = {}
 
+        # Priority 0 (HIGHEST — Exact On-Spot BC.Game Screen Odds via Playwright + Betby):
+        live_bc_screen = BCGameLivePlaywrightEngine.get_live_match_odds(home, away)
+        for k_s, v_s in live_bc_screen.items():
+            api_odds[k_s] = v_s
+
         # Priority 1: Official https://betting.bc.game/predictions/ live odds
         bc_portal_entry = cls._bcgame_portal_cache.get(f"{nh}_vs_{na}", {})
         if not bc_portal_entry:
@@ -4151,116 +4412,157 @@ class ExternalAnalyticsCollector:
                     break
         for k_od in ["home_1x2", "draw_1x2", "away_1x2", "over_25", "under_25", "btts_yes"]:
             if k_od in bc_portal_entry:
-                api_odds[k_od] = bc_portal_entry[k_od]
+                api_odds.setdefault(k_od, bc_portal_entry[k_od])
 
-        # Priority 2: API-Football /odds across Betby-aligned bookmakers
+        # Priority 2: API-Football /odds across Betby-aligned bookmakers (1xBet, Marathonbet, Betano, Pinnacle)
+        # Polite pacing + zero empty-dict caching so API-Football's 10 req/min burst cap never poisons odds!
         if fid and API_FOOTBALL_KEY:
             if not cls._apif_odds_cache:
                 disk_c = load_json_dict(API_CACHE_FILE).get("apif_odds_by_fid", {})
                 for dk, dv in disk_c.items():
                     if isinstance(dv, dict) and time.time() - float(dv.get("_ts", 0)) < 21600:
-                        cls._apif_odds_cache[int(dk)] = {kk: float(vv) for kk, vv in dv.items() if kk != "_ts"}
-            if fid in cls._apif_odds_cache:
+                        clean_dv = {kk: float(vv) for kk, vv in dv.items() if kk != "_ts"}
+                        if clean_dv:
+                            cls._apif_odds_cache[int(dk)] = clean_dv
+            if fid in cls._apif_odds_cache and cls._apif_odds_cache[fid]:
                 cached_apif = cls._apif_odds_cache[fid]
                 for k_c, v_c in cached_apif.items():
                     api_odds.setdefault(k_c, v_c)
             else:
                 fetched_apif: Dict[str, float] = {}
                 o_url = f"{LiveSportsbookAndStatsAPI.BASE_URL}/odds?fixture={fid}"
-                req = urllib.request.Request(o_url, headers={"x-apisports-key": API_FOOTBALL_KEY, "User-Agent": "Mozilla/5.0"})
-                try:
-                    with urllib.request.urlopen(req, timeout=5) as resp:
-                        data = json.loads(resp.read().decode("utf-8"))
-                        resp_list = data.get("response", [])
-                        if resp_list:
-                            bookies = resp_list[0].get("bookmakers", [])
-                            pref_order = ["1xbet", "marathon", "betano", "bet365", "unibet", "bwin", "william", "pinnacle"]
-                            def bk_rank(b_obj: Dict[str, Any]) -> int:
-                                bn = (b_obj.get("name") or "").lower()
-                                for idx_p, kw in enumerate(pref_order):
-                                    if kw in bn:
-                                        return idx_p
-                                return 99
-                            bookies.sort(key=bk_rank)
-                            for bk in bookies[:8]:
-                                for bet_obj in bk.get("bets", []):
-                                    b_name = (bet_obj.get("name") or "").lower()
-                                    vals = bet_obj.get("values", [])
-                                    if b_name in ["match winner", "1x2"]:
-                                        for v in vals:
-                                            lbl = str(v.get("value", "")).lower().strip()
-                                            od_v = float(v.get("odd") or 0)
-                                            if od_v > 1.01:
-                                                if lbl == "home":
-                                                    fetched_apif.setdefault("home_1x2", round(od_v, 2))
-                                                elif lbl == "draw":
-                                                    fetched_apif.setdefault("draw_1x2", round(od_v, 2))
-                                                elif lbl == "away":
-                                                    fetched_apif.setdefault("away_1x2", round(od_v, 2))
-                                    elif "goals over/under" in b_name or b_name in ["over/under", "total - home", "asian goal line", "goal line"]:
-                                        if "home" in b_name or "away" in b_name or "first" in b_name or "second" in b_name:
-                                            continue
-                                        for v in vals:
-                                            lbl = str(v.get("value", "")).lower().strip()
-                                            od_v = float(v.get("odd") or 0)
-                                            if od_v > 1.01:
-                                                if lbl == "over 2.5":
-                                                    fetched_apif.setdefault("over_25", round(od_v, 2))
-                                                elif lbl == "under 2.5":
-                                                    fetched_apif.setdefault("under_25", round(od_v, 2))
-                                                elif lbl == "over 1.5":
-                                                    fetched_apif.setdefault("over_15", round(od_v, 2))
-                                                elif lbl == "under 3.5":
-                                                    fetched_apif.setdefault("under_35", round(od_v, 2))
-                                                elif lbl in ["over 2.0", "over 2"]:
-                                                    fetched_apif.setdefault("over_20", round(od_v, 2))
-                                                elif lbl in ["under 3.0", "under 3"]:
-                                                    fetched_apif.setdefault("under_30", round(od_v, 2))
-                                    elif "both teams score" in b_name or b_name == "btts":
-                                        if "first" in b_name or "second" in b_name:
-                                            continue
-                                        for v in vals:
-                                            lbl = str(v.get("value", "")).lower().strip()
-                                            od_v = float(v.get("odd") or 0)
-                                            if od_v > 1.01 and lbl == "yes":
-                                                fetched_apif.setdefault("btts_yes", round(od_v, 2))
-                                    elif b_name == "draw no bet":
-                                        for v in vals:
-                                            lbl = str(v.get("value", "")).lower().strip()
-                                            od_v = float(v.get("odd") or 0)
-                                            if od_v > 1.01:
-                                                if lbl == "home":
-                                                    fetched_apif.setdefault("dnb_home", round(od_v, 2))
-                                                elif lbl == "away":
-                                                    fetched_apif.setdefault("dnb_away", round(od_v, 2))
-                                    elif b_name == "double chance":
-                                        for v in vals:
-                                            lbl = str(v.get("value", "")).lower().strip()
-                                            od_v = float(v.get("odd") or 0)
-                                            if od_v > 1.01:
-                                                if lbl in ["home/draw", "1x"]:
-                                                    fetched_apif.setdefault("dc_1x", round(od_v, 2))
-                                                elif lbl in ["draw/away", "x2"]:
-                                                    fetched_apif.setdefault("dc_x2", round(od_v, 2))
-                                    elif "corner" in b_name and "over/under" in b_name:
-                                        for v in vals:
-                                            lbl = str(v.get("value", "")).lower().strip()
-                                            od_v = float(v.get("odd") or 0)
-                                            if od_v > 1.01 and "over 9.5" in lbl:
-                                                fetched_apif.setdefault("corners_over_95", round(od_v, 2))
-                except Exception:
-                    pass
-                cls._apif_odds_cache[fid] = fetched_apif
+                for attempt_od in range(2):
+                    elapsed_apif = time.time() - cls._last_apif_http_ts
+                    if elapsed_apif < 0.36:
+                        time.sleep(0.36 - elapsed_apif)
+                    cls._last_apif_http_ts = time.time()
+                    req = urllib.request.Request(o_url, headers={"x-apisports-key": API_FOOTBALL_KEY, "User-Agent": "Mozilla/5.0"})
+                    try:
+                        with urllib.request.urlopen(req, timeout=5) as resp:
+                            data = json.loads(resp.read().decode("utf-8"))
+                            errs = data.get("errors")
+                            if errs and "rateLimit" in str(errs) and attempt_od == 0:
+                                time.sleep(2.2)
+                                continue
+                            resp_list = data.get("response", [])
+                            if resp_list:
+                                bookies = resp_list[0].get("bookmakers", [])
+                                pref_order = ["1xbet", "marathon", "betano", "pinnacle", "bet365", "unibet", "bwin", "william"]
+                                def bk_rank(b_obj: Dict[str, Any]) -> int:
+                                    bn = (b_obj.get("name") or "").lower()
+                                    for idx_p, kw in enumerate(pref_order):
+                                        if kw in bn:
+                                            return idx_p
+                                    return 99
+                                bookies.sort(key=bk_rank)
+                                for bk in bookies[:8]:
+                                    for bet_obj in bk.get("bets", []):
+                                        b_name = (bet_obj.get("name") or "").lower()
+                                        vals = bet_obj.get("values", [])
+                                        if b_name in ["match winner", "1x2"]:
+                                            for v in vals:
+                                                lbl = str(v.get("value", "")).lower().strip()
+                                                od_v = float(v.get("odd") or 0)
+                                                if od_v > 1.01:
+                                                    if lbl == "home":
+                                                        fetched_apif.setdefault("home_1x2", round(od_v, 2))
+                                                    elif lbl == "draw":
+                                                        fetched_apif.setdefault("draw_1x2", round(od_v, 2))
+                                                    elif lbl == "away":
+                                                        fetched_apif.setdefault("away_1x2", round(od_v, 2))
+                                        elif "asian handicap" in b_name or b_name == "handicap result":
+                                            if "first" in b_name or "second" in b_name:
+                                                continue
+                                            for v in vals:
+                                                lbl = str(v.get("value", "")).lower().strip()
+                                                od_v = float(v.get("odd") or 0)
+                                                if od_v > 1.01:
+                                                    if lbl in ["home -1", "home -1.0", "home (-1)"]:
+                                                        fetched_apif.setdefault("ah_home_m10", round(od_v, 2))
+                                                    elif lbl in ["home -1.5", "home (-1.5)"]:
+                                                        fetched_apif.setdefault("ah_home_m15", round(od_v, 2))
+                                                    elif lbl in ["away -1", "away -1.0", "away (-1)"]:
+                                                        fetched_apif.setdefault("ah_away_m10", round(od_v, 2))
+                                        elif "goals over/under" in b_name or b_name in ["over/under", "asian goal line", "goal line"]:
+                                            if "home" in b_name or "away" in b_name or "first" in b_name or "second" in b_name:
+                                                continue
+                                            for v in vals:
+                                                lbl = str(v.get("value", "")).lower().strip()
+                                                od_v = float(v.get("odd") or 0)
+                                                if od_v > 1.01:
+                                                    if lbl == "over 2.5":
+                                                        fetched_apif.setdefault("over_25", round(od_v, 2))
+                                                    elif lbl == "under 2.5":
+                                                        fetched_apif.setdefault("under_25", round(od_v, 2))
+                                                    elif lbl == "over 1.5":
+                                                        fetched_apif.setdefault("over_15", round(od_v, 2))
+                                                    elif lbl == "under 3.5":
+                                                        fetched_apif.setdefault("under_35", round(od_v, 2))
+                                                    elif lbl in ["over 2.0", "over 2"]:
+                                                        fetched_apif.setdefault("over_20", round(od_v, 2))
+                                                    elif lbl in ["under 3.0", "under 3"]:
+                                                        fetched_apif.setdefault("under_30", round(od_v, 2))
+                                        elif "both teams score" in b_name or b_name == "btts":
+                                            if "first" in b_name or "second" in b_name:
+                                                continue
+                                            for v in vals:
+                                                lbl = str(v.get("value", "")).lower().strip()
+                                                od_v = float(v.get("odd") or 0)
+                                                if od_v > 1.01 and lbl == "yes":
+                                                    fetched_apif.setdefault("btts_yes", round(od_v, 2))
+                                        elif b_name == "draw no bet":
+                                            for v in vals:
+                                                lbl = str(v.get("value", "")).lower().strip()
+                                                od_v = float(v.get("odd") or 0)
+                                                if od_v > 1.01:
+                                                    if lbl == "home":
+                                                        fetched_apif.setdefault("dnb_home", round(od_v, 2))
+                                                    elif lbl == "away":
+                                                        fetched_apif.setdefault("dnb_away", round(od_v, 2))
+                                        elif b_name == "double chance":
+                                            for v in vals:
+                                                lbl = str(v.get("value", "")).lower().strip()
+                                                od_v = float(v.get("odd") or 0)
+                                                if od_v > 1.01:
+                                                    if lbl in ["home/draw", "1x"]:
+                                                        fetched_apif.setdefault("dc_1x", round(od_v, 2))
+                                                    elif lbl in ["draw/away", "x2"]:
+                                                        fetched_apif.setdefault("dc_x2", round(od_v, 2))
+                                        elif "corner" in b_name and "over/under" in b_name:
+                                            for v in vals:
+                                                lbl = str(v.get("value", "")).lower().strip()
+                                                od_v = float(v.get("odd") or 0)
+                                                if od_v > 1.01 and "over 9.5" in lbl:
+                                                    fetched_apif.setdefault("corners_over_95", round(od_v, 2))
+                            break
+                    except Exception:
+                        break
+                # CRITICAL FIX: NEVER cache empty `{}` when rate-limited or not yet posted!
                 if fetched_apif:
+                    cls._apif_odds_cache[fid] = fetched_apif
                     disk_all = load_json_dict(API_CACHE_FILE)
                     by_f = disk_all.setdefault("apif_odds_by_fid", {})
                     by_f[str(fid)] = dict(fetched_apif, _ts=time.time())
                     save_json_dict(API_CACHE_FILE, disk_all)
-                for k_c, v_c in fetched_apif.items():
-                    api_odds.setdefault(k_c, v_c)
+                    for k_c, v_c in fetched_apif.items():
+                        api_odds.setdefault(k_c, v_c)
+
+        # Priority 2.5: Oddspedia live 1xBet / Stake.com European odds feed
+        op_entry = cls._oddspedia_odds_cache.get(f"{nh}_vs_{na}", {})
+        if not op_entry:
+            for k_op, v_op in cls._oddspedia_odds_cache.items():
+                if "_vs_" in k_op:
+                    oh, oa = k_op.split("_vs_", 1)
+                    if teams_match(home, oh) and teams_match(away, oa):
+                        op_entry = v_op
+                        break
+        for k_op_f, v_op_f in op_entry.items():
+            api_odds.setdefault(k_op_f, v_op_f)
 
         has_espn_odds = bool(m_fixture.get("home_odds") or m_fixture.get("over_odds"))
-        is_verified_on_bookmakers = 1.0 if (api_odds or has_espn_odds or fid) else 0.0
+        # STRICT VERIFICATION: Only mark verified when REAL bookmaker odds exist (NEVER from bare `fid` alone!)
+        is_verified_on_bookmakers = 1.0 if (api_odds or has_espn_odds) else 0.0
+        has_real_corners_odds = 1.0 if ("corners_over_95" in api_odds) else 0.0
 
         # Priority 3: Merge with ESPN live sportsbook odds if API-Football missed a field
         h_1x2 = api_odds.get("home_1x2") or m_fixture.get("home_odds")
@@ -4384,7 +4686,7 @@ class ExternalAnalyticsCollector:
             "away_1x2": a_1x2,
             "ah_home_m10": ah_home_m10,
             "ah_home_m15": ah_home_m15,
-            "ah_away_m10": ah_away_m10,
+            "ah_away_m10": api_odds.get("ah_away_m10") or ah_away_m10,
             "dnb_home": dnb_home,
             "dnb_away": dnb_away,
             "dc_1x": dc_1x,
@@ -4399,6 +4701,8 @@ class ExternalAnalyticsCollector:
             "btts_yes": btts_yes,
             "corners_over_95": corners_over_95,
             "has_api_bookie_odds": 1.0 if api_odds else 0.0,
+            "has_real_corners_odds": has_real_corners_odds,
+            "has_exact_bc_screen_odds": 1.0 if live_bc_screen else 0.0,
             "is_verified_on_bookmakers": is_verified_on_bookmakers
         }
 
@@ -5238,6 +5542,10 @@ class SafeCushionBetCreator:
             "market_type": "dnb", "selection": f"Draw No Bet ➔ {home}", "line": None, "odds": bc_odds["dnb_home"]
         }
 
+        # v38.0 Strict Real-Odds Gate: Never publish singles priced purely from synthetic fallback math!
+        if bc_odds.get("is_verified_on_bookmakers", 0.0) <= 0.0:
+            return None, None
+
         candidates: List[Tuple[float, LedgerBetItem, Dict[str, Any]]] = []
 
         def _with_consensus(tag_str: str, base_why: str) -> str:
@@ -5370,9 +5678,11 @@ class SafeCushionBetCreator:
             candidates.append((score + 4.0, cls._build_single(date_str, home, away, "dnb", sel, None, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, alt_line=real_alt5, expert_sources=max(3, n_f5)), home1x_leg))
 
         # ── 6. High-Siege Corners (`Corners Tab ➔ Total Corners ➔ Over 9.5` @ 1.62 – 1.95) ──
+        # v38.0 Basaksehir Lesson: Strictly require REAL quoted bookmaker corner odds (`has_real_corners_odds > 0`)!
         ok_m6, n_f6, _, c_bon6, c_tag6 = ExpertConsensusHub.evaluate_market_consensus(ballot, "corners_over_95")
         if (
             ok_m6
+            and bc_odds.get("has_real_corners_odds", 0.0) > 0.0
             and 1.62 <= bc_odds["corners_over_95"] <= 1.95
             and (nb_c["mu_corners"] >= 11.2 or ch_tip == "corners_over_95")
             and ((h_recent_w >= 2 and a_recent_w >= 2 and (h_recent_w + a_recent_w) >= 5) or ch_tip == "corners_over_95")
@@ -5781,21 +6091,66 @@ class SafeCushionBetCreator:
                     continue
                 btts_count += 1
             top_pairs.append(cand)
-            if len(top_pairs) >= MAX_DAILY_SINGLES:
+            if len(top_pairs) >= 10:
                 break
 
         if not main_batch_already_done:
             slots_left = MAX_DAILY_SINGLES - len(existing_singles)
-            # Batch-resolve exact BC.Game direct match URLs via Live Playwright + Multi-Engine Search across top candidates!
-            cand_pool = top_pairs[: max(8, slots_left * 2)]
+            # Batch-resolve exact BC.Game direct match URLs AND exact on-screen BC.Game decimal odds across up to 10 finalists!
+            cand_pool = top_pairs[: max(8, slots_left * 2 + 2)]
             BCGameDirectLinkResolver.batch_resolve_exact_urls([(p[3].team_home, p[3].team_away) for p in cand_pool])
             exact_verified_pairs = []
             fallback_pairs = []
             for p_tup in cand_pool:
                 s_obj = p_tup[3]
+                c_leg_obj = p_tup[4]
                 s_obj.search_url = BCGameDirectLinkResolver.resolve_match_url(
                     s_obj.team_home, s_obj.team_away, s_obj.match_context, existing_url=s_obj.search_url, allow_network=True
                 )
+                # Overwrite `s_obj.odds`, `s_obj.alt_bcgame_line`, and `c_leg_obj['odds']` if exact BC.Game screen odds were captured!
+                live_sc = BCGameLivePlaywrightEngine.get_live_match_odds(s_obj.team_home, s_obj.team_away)
+                if live_sc:
+                    sel_low = s_obj.selection.lower()
+                    exact_primary = None
+                    if "over 2.5" in sel_low:
+                        exact_primary = live_sc.get("over_25")
+                    elif "over 2.0" in sel_low:
+                        exact_primary = live_sc.get("over_20")
+                    elif "under 2.5" in sel_low:
+                        exact_primary = live_sc.get("under_25")
+                    elif "both teams" in sel_low or s_obj.market_type == "btts":
+                        exact_primary = live_sc.get("btts_yes")
+                    elif "draw no bet" in sel_low or s_obj.market_type == "dnb":
+                        is_aw_s = LiveSportsbookAndStatsAPI._is_away_team_selected(s_obj.selection, s_obj.team_home, s_obj.team_away)
+                        exact_primary = live_sc.get("dnb_away" if is_aw_s else "dnb_home")
+                    elif "handicap" in sel_low or s_obj.market_type == "handicap":
+                        exact_primary = live_sc.get("ah_home_m15" if "-1.5" in sel_low else "ah_home_m10")
+                    elif "corner" in sel_low:
+                        exact_primary = live_sc.get("corners_over_95")
+                    elif s_obj.market_type == "1x2":
+                        is_aw_s = LiveSportsbookAndStatsAPI._is_away_team_selected(s_obj.selection, s_obj.team_home, s_obj.team_away)
+                        exact_primary = live_sc.get("away_1x2" if is_aw_s else "home_1x2")
+
+                    if exact_primary:
+                        if exact_primary < 1.54 or exact_primary > 2.18:
+                            continue
+                        s_obj.odds = round(exact_primary, 2)
+                    s_obj.alt_bcgame_line = BankrollStakeSizer.build_guaranteed_safe_alt_line(
+                        s_obj.selection, s_obj.market_type, s_obj.team_home, s_obj.team_away, live_sc, s_obj.odds
+                    )
+                    if isinstance(c_leg_obj, dict):
+                        cl_sel = str(c_leg_obj.get("selection", "")).lower()
+                        if "over 1.5" in cl_sel and live_sc.get("over_15"):
+                            c_leg_obj["odds"] = live_sc["over_15"]
+                        elif "under 3.5" in cl_sel and live_sc.get("under_35"):
+                            c_leg_obj["odds"] = live_sc["under_35"]
+                        elif "(1x)" in cl_sel and live_sc.get("dc_1x"):
+                            c_leg_obj["odds"] = live_sc["dc_1x"]
+                        elif "(x2)" in cl_sel and live_sc.get("dc_x2"):
+                            c_leg_obj["odds"] = live_sc["dc_x2"]
+                        elif "1x2" in cl_sel and live_sc.get("home_1x2"):
+                            c_leg_obj["odds"] = live_sc["home_1x2"]
+
                 if BCGameDirectLinkResolver.is_valid_direct_match_url(s_obj.search_url, s_obj.team_home, s_obj.team_away):
                     exact_verified_pairs.append(p_tup)
                 else:
@@ -6874,22 +7229,27 @@ class TelegramBotClient:
     @staticmethod
     def _build_channel_inline_kb(text: str) -> Dict[str, Any]:
         """
-        v36.0 Smart 1-Click Inline Keyboard for `@Footybett`:
+        v38.0 Clean Direct-Bet-Only Inline Keyboard for `@Footybett`:
         • Single Bet Card:
-            Row 1 -> `🎯 Bet <Home> vs <Away> on BC.Game ↗` (Direct Match or Exact League Board URL)
-            Row 2 -> `🤝 Official BC.Game Partner (Sign Up • Fast Withdrawals)` (`BCGAME_PARTNER_URL`)
+            ONLY 1 button -> `🎯 Bet <Selection> (@ <Odds>) on BC.Game ↗` (Direct BC.Game Match/Bet Link — ZERO partner spam!)
         • Optional 2-Leg Safe Combo:
-            Row 1 -> Side-by-side `[🎯 Open Leg 1 ↗]` & `[🎯 Open Leg 2 ↗]` buttons!
-            Row 2 -> `🤝 Official BC.Game Partner (Sign Up • Fast Withdrawals)`
-        • Optional $5 Mega Lotto / Pinned Guide:
-            Row 1 -> `⚽ Open BC.Game Football Board ↗` (`https://bc.game/sports/soccer-1`)
-            Row 2 -> `🤝 Official BC.Game Partner (Sign Up • Fast Withdrawals)`
+            ONLY 1 row -> Side-by-side `[🎯 Open Leg 1 on BC.Game ↗]` & `[🎯 Open Leg 2 on BC.Game ↗]` buttons!
+        • Optional $5 Mega Lotto:
+            ONLY 1 button -> `⚽ Open BC.Game Football Board ↗`!
+        • Pinned Channel Guide ONLY:
+            Includes `🤝 Official BC.Game Partner` sign-up link (alongside Channel Bio & Bot Bio).
         """
         up = (text or "").upper()
         bc_links = extract_bc_links_from_text(text)
         rows: List[List[Dict[str, str]]] = []
 
-        if "🟢 SINGLE BET" in up and bc_links:
+        if "OFFICIAL @FOOTYBETT GUIDE" in up:
+            rows.append([{"text": "⚽ Open BC.Game Football Board ↗", "url": BCGAME_SOCCER_HUB_URL}])
+            rows.append([{
+                "text": "🤝 Official BC.Game Partner (Sign Up • Fast Withdrawals)",
+                "url": BCGAME_PARTNER_URL
+            }])
+        elif "🟢 SINGLE BET" in up and bc_links:
             direct_u, lbl = bc_links[0]
             btn_txt = f"🎯 {lbl}"
             if len(btn_txt) > 60:
@@ -6901,13 +7261,10 @@ class TelegramBotClient:
                 leg_btns.append({"text": f"🎯 Open Leg {idx} on BC.Game ↗" if len(bc_links) <= 2 else f"🎯 Leg {idx} ↗", "url": u_leg})
             if leg_btns:
                 rows.append(leg_btns)
-        elif "🚀 OPTIONAL $5 MEGA SAFE-LIST LOTTO" in up or "OFFICIAL @FOOTYBETT GUIDE" in up:
-            rows.append([{"text": "⚽ Open BC.Game Football Board ↗", "url": BCGAME_SOCCER_HUB_URL}])
+        elif "🚀 OPTIONAL $5 MEGA SAFE-LIST LOTTO" in up:
+            first_u = bc_links[0][0] if bc_links else BCGAME_SOCCER_HUB_URL
+            rows.append([{"text": "⚽ Open BC.Game Football Board ↗", "url": first_u}])
 
-        rows.append([{
-            "text": "🤝 Official BC.Game Partner (Sign Up • Fast Withdrawals)",
-            "url": BCGAME_PARTNER_URL
-        }])
         return {"inline_keyboard": rows}
 
     @staticmethod
@@ -7286,7 +7643,7 @@ class TelegramBotClient:
 
             DailyLedgerManager.save_all_items(all_items)
             save_json_dict(EOD_MESSAGE_IDS_FILE, eod_map)
-            DailyLedgerManager.mark_locked_in_channel("channel_clean_v37_1_auto_done")
+            DailyLedgerManager.mark_locked_in_channel("channel_clean_v38_0_auto_done")
 
             won_all, lost_all, wr_all, net_all_r = BetSlipCardFormatter.get_totals_summary_tuple()
             r_usd = BankrollStakeSizer.get_unit_usd()
@@ -7296,11 +7653,11 @@ class TelegramBotClient:
                 dup_note = f"\nℹ️ Older >48h duplicates (Telegram requires 1 manual tap by owner to delete): {links}"
 
             report = (
-                "🧹 @Footybett CHANNEL CLEANUP & HISTORY UPGRADE COMPLETE (v37.1)\n"
+                "🧹 @Footybett CHANNEL CLEANUP & HISTORY UPGRADE COMPLETE (v38.0)\n"
                 "────────────────────────\n"
                 f"• Scanned Channel Posts : {len(posts)} messages\n"
                 f"• Deleted Duplicates    : {deleted_cnt} message(s)\n"
-                f"• Rewritten & Upgraded  : {edited_cnt} post(s) updated to v37.1 Singles-Only 1R + Guaranteed Safe Alt format\n"
+                f"• Rewritten & Upgraded  : {edited_cnt} post(s) updated to v38.0 Clean Direct-Bet + Exact BC.Game Odds format\n"
                 f"• Already Clean         : {unchanged_cnt} post(s)\n"
                 "• Pinned Partner Guide  : Active 📌\n"
                 f"• Channel & Bot Bio     : {bio_status}\n"
@@ -7455,9 +7812,9 @@ class TelegramBotClient:
     def background_worker_loop(self):
         logger.info("Footybett v37.0 Weighted Sharp-Consensus & Auto-Cleaner & Deep Match-Autopsy Worker started...")
         time.sleep(3)
-        if not DailyLedgerManager.is_locked_in_channel("channel_clean_v37_1_auto_done"):
+        if not DailyLedgerManager.is_locked_in_channel("channel_clean_v38_0_auto_done"):
             try:
-                logger.info("Running automatic one-time v37.1 @Footybett channel cleanup & Safe Alt backfill & history upgrade...")
+                logger.info("Running automatic one-time v38.0 @Footybett channel cleanup & Partner-Button Removal & Safe Alt backfill & history upgrade...")
                 self.clean_and_upgrade_channel_history(auto_startup=True)
             except Exception as ce:
                 logger.error("Auto channel cleanup error: %s", ce)
