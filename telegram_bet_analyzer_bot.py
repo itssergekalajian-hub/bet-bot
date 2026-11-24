@@ -1,6 +1,6 @@
 """
 Telegram Pro Football Betting Syndicate — Tier-1 Sharp Analyst Weighted Consensus,
-Exact BC.Game Match Links & Post-Match Boxscore Review Engine (v40.0 Production Release)
+Exact BC.Game Match Links & Post-Match Boxscore Review Engine (v40.1 Production Release)
 (@betyyyybot -> @Footybett)
 
 What's New in v36.0 (True Match-Stats Autopsy & Root-Cause Learning):
@@ -1360,6 +1360,8 @@ class BCGameLivePlaywrightEngine:
                     recent_clicked_event_ids: List[str] = []
 
                     def _set_board_slugs_from_url(b_u: str) -> None:
+                        active_board_slugs["cat"] = ""
+                        active_board_slugs["trn"] = ""
                         m_b = re.search(r"/sports/soccer/([a-z0-9\-]+)/([a-z0-9\-]+?)(?:-\d{15,21})?/?$", str(b_u or ""))
                         if m_b:
                             active_board_slugs["cat"] = m_b.group(1)
@@ -1438,28 +1440,35 @@ class BCGameLivePlaywrightEngine:
                         if not fetch_screen_odds:
                             return
                         try:
-                            for tgt in _all_targets():
-                                try:
-                                    tgt.evaluate(cls._expand_show_all_and_tabs_js(), "")
-                                except Exception:
-                                    pass
-                            page.wait_for_timeout(700)
-                            merged_odds = cls.parse_visible_match_text_odds(_eval_any_tokens(), h_bc, a_bc)
+                            # Reset scroll to top (0px) so Main tab (`1x2`, `Total`, `BTTS`) is 100% mounted, then scan 0px + 480px!
+                            merged_odds: Dict[str, float] = {}
+                            for sc_y in (0, 480):
+                                for tgt in _all_targets():
+                                    try:
+                                        tgt.evaluate(cls._scroll_board_step_js(), sc_y)
+                                        tgt.evaluate(cls._expand_show_all_and_tabs_js(), "")
+                                    except Exception:
+                                        pass
+                                page.wait_for_timeout(650)
+                                merged_odds.update(cls.parse_visible_match_text_odds(_eval_any_tokens(), h_bc, a_bc))
 
-                            # ALWAYS check `Handicaps` tab + `Show all` so `Handicap -1.5/-1`, `3-way handicap 0:1`, AND `Handicap (Asian) -1.25/-1.75` are all captured!
+                            # Switch to `Handicaps` tab (at scroll 0px + 480px) & expand `Show all` so `3-way handicap (0:1)` AND `Handicap (Asian) (-1.25)` are 100% captured!
                             for tgt in _all_targets():
                                 try:
+                                    tgt.evaluate(cls._scroll_board_step_js(), 0)
                                     tgt.evaluate(cls._expand_show_all_and_tabs_js(), "handicaps")
                                 except Exception:
                                     pass
-                            page.wait_for_timeout(900)
-                            for tgt in _all_targets():
-                                try:
-                                    tgt.evaluate(cls._expand_show_all_and_tabs_js(), "")
-                                except Exception:
-                                    pass
-                            page.wait_for_timeout(650)
-                            merged_odds.update(cls.parse_visible_match_text_odds(_eval_any_tokens(), h_bc, a_bc))
+                            page.wait_for_timeout(950)
+                            for sc_y in (0, 480):
+                                for tgt in _all_targets():
+                                    try:
+                                        tgt.evaluate(cls._scroll_board_step_js(), sc_y)
+                                        tgt.evaluate(cls._expand_show_all_and_tabs_js(), "")
+                                    except Exception:
+                                        pass
+                                page.wait_for_timeout(600)
+                                merged_odds.update(cls.parse_visible_match_text_odds(_eval_any_tokens(), h_bc, a_bc))
 
                             # Check `Stats` tab for `Total corners` if needed or if corners not yet found on a Tier-1 match
                             if (mk_key in corners_keys or len(norm_specs) <= 6) and "corners_over_95" not in merged_odds:
@@ -1672,9 +1681,9 @@ class BCGameLivePlaywrightEngine:
                             resolved_map[mk] = cached_u
                             logger.info("Resolved exact BC.Game match URL for %s vs %s: %s", h_bc, a_bc, cached_u)
 
-                        # ALWAYS harvest screen odds when `on_match_page` OR `cached_u` is available!
+                        # ALWAYS navigate cleanly to `cached_u` when available so match page starts at `scrollTop=0` on `Main` tab!
                         if fetch_screen_odds and not cls.get_live_match_odds(h_bc, a_bc):
-                            if not on_match_page and cached_u:
+                            if cached_u and cls.normalize_bcgame_page_url(page.url) != cached_u:
                                 try:
                                     page.goto(cached_u, wait_until="domcontentloaded", timeout=14000)
                                     _wait_betby_ready(7500)
@@ -1789,7 +1798,7 @@ class BCGameDirectLinkResolver:
             return BCGAME_LEAGUE_BOARD_URLS["bra.1"]
         if "argentina" in raw or "liga profesional" in raw:
             return BCGAME_LEAGUE_BOARD_URLS["arg.1"]
-        if "championship" in raw and "england" in raw:
+        if "championship" in raw and "scot" not in raw and "wom" not in raw:
             return BCGAME_LEAGUE_BOARD_URLS["eng.2"]
         if "laliga 2" in raw or "la liga 2" in raw:
             return BCGAME_LEAGUE_BOARD_URLS["esp.2"]
@@ -6813,7 +6822,8 @@ class SafeCushionBetCreator:
         cls,
         it_v: LedgerBetItem,
         odds_source: Dict[str, float],
-        is_raw_screen: bool = False
+        is_raw_screen: bool = False,
+        for_existing_post: bool = False
     ) -> bool:
         """
         v40.0 Iron Market-Existence Reconciler:
@@ -6966,6 +6976,30 @@ class SafeCushionBetCreator:
                 it_v.odds = round(float(odds_source["btts_yes"]), 2)
                 pref = _clean_rationale_prefix(it_v.rationale)
                 it_v.rationale = f"{pref}Two-way attacking matchup in {h_bc} vs {a_bc} — backing Both Teams to Score: Yes on Main Tab."
+                matched_real = True
+            elif for_existing_post and float(odds_source.get("btts_yes") or 0.0) >= 1.44 and float(odds_source.get("btts_yes") or 0.0) >= float(odds_source.get("over_25") or 0.0):
+                it_v.market_type = "btts"
+                it_v.selection = "Main Tab ➔ Both Teams to Score ➔ Yes"
+                it_v.line = None
+                it_v.odds = round(float(odds_source["btts_yes"]), 2)
+                pref = _clean_rationale_prefix(it_v.rationale)
+                it_v.rationale = f"{pref}Two-way attacking matchup in {h_bc} vs {a_bc} — backing Both Teams to Score: Yes on Main Tab."
+                matched_real = True
+            elif for_existing_post and float(odds_source.get("over_25") or 0.0) >= 1.40:
+                it_v.market_type = "goals_over_under"
+                it_v.selection = "Main Tab ➔ Total ➔ Over 2.5"
+                it_v.line = 2.5
+                it_v.odds = round(float(odds_source["over_25"]), 2)
+                pref = _clean_rationale_prefix(it_v.rationale)
+                it_v.rationale = f"{pref}Open attacking profile in {h_bc} vs {a_bc} — backing Over 2.5 total goals on Main Tab."
+                matched_real = True
+            elif for_existing_post and float(odds_source.get("home_1x2") or 0.0) >= 1.25:
+                it_v.market_type = "1x2"
+                it_v.selection = f"Main Tab ➔ 1x2 ➔ {h_bc}"
+                it_v.line = None
+                it_v.odds = round(float(odds_source["home_1x2"]), 2)
+                pref = _clean_rationale_prefix(it_v.rationale)
+                it_v.rationale = f"{pref}{h_bc} hold clear home control against {a_bc} — backing {h_bc} on Main Tab 1x2."
                 matched_real = True
         elif it_v.market_type == "1x2":
             is_aw = LiveSportsbookAndStatsAPI._is_away_team_selected(it_v.selection, h_bc, a_bc)
@@ -8160,7 +8194,7 @@ class TelegramBotClient:
     def _call_telegram_json(self, endpoint: str, payload_data: Dict[str, Any], timeout: int = 12) -> Tuple[bool, Dict[str, Any], str]:
         url = f"{self.base_url}/{endpoint}"
         payload = json.dumps(payload_data).encode("utf-8")
-        for attempt in range(2):
+        for attempt in range(4):
             req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -8174,12 +8208,16 @@ class TelegramBotClient:
                 except Exception:
                     err_body = {}
                 desc = str(err_body.get("description", str(he)))
-                if he.code == 429 and attempt == 0:
-                    retry_s = int(err_body.get("parameters", {}).get("retry_after", 3) or 3)
-                    time.sleep(min(retry_s + 1, 15))
+                if he.code == 429 and attempt < 3:
+                    retry_s = int(err_body.get("parameters", {}).get("retry_after", 5) or 5)
+                    logger.warning("Telegram 429 flood-wait on %s — sleeping %ds before retry #%d...", endpoint, retry_s + 2, attempt + 1)
+                    time.sleep(min(retry_s + 2, 75))
                     continue
                 return False, err_body, desc
             except Exception as e:
+                if attempt < 2:
+                    time.sleep(1.5)
+                    continue
                 return False, {}, str(e)
         return False, {}, "retry_exhausted"
 
@@ -8412,10 +8450,17 @@ class TelegramBotClient:
                         it_h.loss_autopsy = ""
                         it_h.failure_mode = ""
 
-            if (not auto_startup) or (not DailyLedgerManager.is_locked_in_channel(f"v40_0_live_board_recalibrated:{active_d_now}")):
+            if (not auto_startup) or (not DailyLedgerManager.is_locked_in_channel(f"v40_1_live_board_recalibrated:{active_d_now}")):
                 ExternalAnalyticsCollector.scrape_bcgame_official_portal()
                 today_fxs = LiveSportsbookAndStatsAPI.fetch_mens_fixtures_with_odds(active_d_now)
                 fx_lookup = {f"{normalize_team_str(x['home'])}_vs_{normalize_team_str(x['away'])}": x for x in today_fxs}
+
+                # Purge any wrong-league cached URL (e.g. Championship match accidentally tagged with uefa-champions-league)
+                url_cache_d = BCGameDirectLinkResolver._get_cache()
+                for ck_u, cv_u in list(url_cache_d.items()):
+                    if isinstance(cv_u, dict) and "wolverhampton" in ck_u and "uefa-champions-league" in str(cv_u.get("url", "")):
+                        cv_u["url"] = str(cv_u["url"]).replace("/international/uefa-champions-league/", "/england/championship/")
+                BCGameDirectLinkResolver._save_cache()
 
                 # Priority Tier-1 (`4 Official Singles` + `2-Leg Safe Combo` = 4-5 matches): full screen-odds + exact URLs in ~45s!
                 # Priority Tier-2 (`$5 Mega Lotto` extra legs): fast board/network URL capture (`fetch_screen_odds=False`)!
@@ -8456,7 +8501,7 @@ class TelegramBotClient:
                             nb_est = {"p_corners_over_95": 54.0}
                             true_odds = ExternalAnalyticsCollector.fetch_bcgame_accurate_odds(active_d_now, it_v.team_home, it_v.team_away, m_fx, dc_est, nb_est)
                             if true_odds.get("is_verified_on_bookmakers", 0.0) > 0:
-                                SafeCushionBetCreator.reconcile_single_with_live_bcgame(it_v, true_odds, is_raw_screen=False)
+                                SafeCushionBetCreator.reconcile_single_with_live_bcgame(it_v, true_odds, is_raw_screen=False, for_existing_post=True)
 
                     # Also refresh today's PENDING 2-Leg Safe Combo & Lotto legs (and fix any >1.50 Lotto underdog leg like PSV X2 @ 4.62!)
                     elif it_v.date_str == active_d_now and it_v.settlement == "PENDING" and it_v.combo_legs:
@@ -8525,7 +8570,7 @@ class TelegramBotClient:
                             it_v.selection = f"{len(cleaned_l_legs)}-Leg Logical Safe-Cushion Mega List ({it_v.odds:.2f}x)"
 
                 DailyLedgerManager.save_all_items(all_items)
-                DailyLedgerManager.mark_locked_in_channel(f"v40_0_live_board_recalibrated:{active_d_now}")
+                DailyLedgerManager.mark_locked_in_channel(f"v40_1_live_board_recalibrated:{active_d_now}")
             eod_map = load_json_dict(EOD_MESSAGE_IDS_FILE)
             handle = ChannelHistoryCleaner.extract_channel_handle(PUBLISH_CHANNEL_ID)
             posts = ChannelHistoryCleaner.fetch_all_channel_posts(PUBLISH_CHANNEL_ID)
@@ -8635,21 +8680,41 @@ class TelegramBotClient:
                     older_48h_dups.append(mid)
                 time.sleep(0.35)
 
+            # Prioritize TODAY'S (`active_d_now`) message IDs + Pinned Guide FIRST so live picks update in <10s with zero 429 flood risk!
+            today_priority_mids: Set[int] = set()
+            if guide_msg_id:
+                today_priority_mids.add(int(guide_msg_id))
+            for it_pr in all_items.values():
+                if it_pr.date_str == active_d_now:
+                    if getattr(it_pr, "channel_message_id", None):
+                        today_priority_mids.add(int(it_pr.channel_message_id))
+                    if getattr(it_pr, "result_message_id", None):
+                        today_priority_mids.add(int(it_pr.result_message_id))
+
+            to_edit_jobs.sort(key=lambda pair: (0 if int(pair[0]) in today_priority_mids else 1, -int(pair[0])))
+
             existing_text_by_id = {p["msg_id"]: p["text"] for p in posts}
+            existing_date_by_id = {p["msg_id"]: p.get("date_str", "") for p in posts}
             for mid, target_txt in to_edit_jobs:
                 cur_txt = existing_text_by_id.get(mid, "")
-                # Always run `edit_message` on Open Cards & Guide so `editMessageReplyMarkup` strips any old Partner button!
-                is_open_or_guide = any(h_k in target_txt for h_k in ("🟢 SINGLE BET", "🎟️ OPTIONAL 2-LEG", "🚀 OPTIONAL $5", "OFFICIAL @FOOTYBETT GUIDE"))
-                if (not is_open_or_guide) and ("Safe Alt Refund" not in cur_txt) and re.sub(r"\s+", " ", cur_txt).strip() == re.sub(r"\s+", " ", strip_copy_tags(target_txt)).strip():
+                is_today_or_guide = (int(mid) in today_priority_mids) or (existing_date_by_id.get(mid, "") == active_d_now)
+                norm_cur_t = re.sub(r"\s+", " ", cur_txt).strip()
+                norm_tgt_t = re.sub(r"\s+", " ", strip_copy_tags(target_txt)).strip()
+                # Skip historical (`< active_d_now`) posts whose visible text is already 100% identical (prevents 80+ redundant API calls!)
+                if (not is_today_or_guide) and cur_txt and ("Safe Alt Refund" not in cur_txt) and norm_cur_t == norm_tgt_t:
                     unchanged_cnt += 1
                     continue
                 ok_ed, status_ed = self.edit_message(PUBLISH_CHANNEL_ID, mid, target_txt)
                 if ok_ed:
                     if status_ed == "edited":
                         edited_cnt += 1
-                        time.sleep(1.05)
+                        logger.info("Edited @Footybett message_id=%s successfully", mid)
                     else:
                         unchanged_cnt += 1
+                    time.sleep(1.15)
+                else:
+                    logger.warning("Failed editing @Footybett message_id=%s: %s", mid, status_ed)
+                    time.sleep(1.15)
 
             bio_ok, bio_status = self.update_channel_and_bot_bios()
             guide_txt = BetSlipCardFormatter.format_channel_pinned_guide()
@@ -8665,7 +8730,7 @@ class TelegramBotClient:
 
             DailyLedgerManager.save_all_items(all_items)
             save_json_dict(EOD_MESSAGE_IDS_FILE, eod_map)
-            DailyLedgerManager.mark_locked_in_channel("channel_clean_v40_0_auto_done")
+            DailyLedgerManager.mark_locked_in_channel("channel_clean_v40_1_auto_done")
 
             won_all, lost_all, wr_all, net_all_r = BetSlipCardFormatter.get_totals_summary_tuple()
             r_usd = BankrollStakeSizer.get_unit_usd()
@@ -8675,11 +8740,11 @@ class TelegramBotClient:
                 dup_note = f"\nℹ️ Older >48h duplicates (Telegram requires 1 manual tap by owner to delete): {links}"
 
             report = (
-                "🧹 @Footybett CHANNEL CLEANUP & HISTORY UPGRADE COMPLETE (v40.0)\n"
+                "🧹 @Footybett CHANNEL CLEANUP & HISTORY UPGRADE COMPLETE (v40.1)\n"
                 "────────────────────────\n"
                 f"• Scanned Channel Posts : {len(posts)} messages\n"
                 f"• Deleted Duplicates    : {deleted_cnt} message(s)\n"
-                f"• Rewritten & Upgraded  : {edited_cnt} post(s) updated to v40.0 Verified-Existence BC.Game Odds & Direct Match Links\n"
+                f"• Rewritten & Upgraded  : {edited_cnt} post(s) updated to v40.1 Verified-Existence BC.Game Odds & Direct Match Links\n"
                 f"• Already Clean         : {unchanged_cnt} post(s)\n"
                 "• Pinned Partner Guide  : Active 📌\n"
                 f"• Channel & Bot Bio     : {bio_status}\n"
@@ -8834,9 +8899,9 @@ class TelegramBotClient:
     def background_worker_loop(self):
         logger.info("Footybett v37.0 Weighted Sharp-Consensus & Auto-Cleaner & Deep Match-Autopsy Worker started...")
         time.sleep(3)
-        if not DailyLedgerManager.is_locked_in_channel("channel_clean_v40_0_auto_done"):
+        if not DailyLedgerManager.is_locked_in_channel("channel_clean_v40_1_auto_done"):
             try:
-                logger.info("Running automatic one-time v40.0 @Footybett verified BC.Game markets, live odds, exact links & button cleanup & Partner-Button Removal & Safe Alt backfill & history upgrade...")
+                logger.info("Running automatic one-time v40.1 @Footybett rate-limit-safe verified BC.Game markets, live odds, exact links & button cleanup & Partner-Button Removal & Safe Alt backfill & history upgrade...")
                 self.clean_and_upgrade_channel_history(auto_startup=True)
             except Exception as ce:
                 logger.error("Auto channel cleanup error: %s", ce)
