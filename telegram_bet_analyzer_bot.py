@@ -1,6 +1,6 @@
 """
 Telegram Pro Football Betting Syndicate — Tier-1 Sharp Analyst Weighted Consensus,
-Exact BC.Game Match Links & Post-Match Boxscore Review Engine (v41.0 Production Release)
+Exact BC.Game Match Links & Post-Match Boxscore Review Engine (v41.1 Production Release)
 (@betyyyybot -> @Footybett)
 
 What's New in v36.0 (True Match-Stats Autopsy & Root-Cause Learning):
@@ -2252,6 +2252,13 @@ class DailyLedgerManager:
         save_json_set(PUBLISHED_LOCKS_FILE, locks)
 
     @classmethod
+    def unlock_in_channel(cls, lock_key: str):
+        locks = load_json_set(PUBLISHED_LOCKS_FILE)
+        if lock_key in locks:
+            locks.discard(lock_key)
+            save_json_set(PUBLISHED_LOCKS_FILE, locks)
+
+    @classmethod
     def load_all_history_items(cls) -> Dict[str, LedgerBetItem]:
         raw = load_json_dict(DAILY_LEDGER_FILE)
         valid_fields = {f.name for f in fields(LedgerBetItem)}
@@ -2270,7 +2277,7 @@ class DailyLedgerManager:
                 full_key = f"{item.date_str}:{item.bet_key}"
                 if cls.is_locked_in_channel(f"pick:{full_key}") or cls.is_locked_in_channel(f"pick_v26:{full_key}"):
                     item.published_to_channel = True
-                if cls.is_locked_in_channel(f"result:{full_key}"):
+                if item.settlement != "PENDING" and cls.is_locked_in_channel(f"result:{full_key}"):
                     item.published_result_to_channel = True
                 items[full_key] = item
             except Exception:
@@ -2813,14 +2820,36 @@ class LiveSportsbookAndStatsAPI:
 
         status_obj = comp.get("status", {}) or ev.get("status", {})
         st_type = status_obj.get("type", {})
-        state = st_type.get("state", "pre")
-        short_detail = st_type.get("shortDetail") or status_obj.get("displayClock") or "NS"
+        state = str(st_type.get("state", "pre") or "pre").lower()
+        st_name = str(st_type.get("name", "") or "").upper()
+        short_detail = str(st_type.get("shortDetail") or status_obj.get("displayClock") or "NS").strip()
+        sd_up = short_detail.upper()
         completed = bool(st_type.get("completed", False))
 
-        if completed or state == "post":
+        # v41.1 IRONCLAD FULL-TIME GUARD:
+        # 1. ESPN sets `state == "post"` on mid-game suspensions, flare delays, postponements, and halftime feed drops!
+        #    NEVER trust `state == "post"` without `completed is True` AND an explicit final status (`STATUS_FULL_TIME` / `FT`)!
+        # 2. PHYSICAL 103-MINUTE DURATION FLOOR: A 90m match + 15m halftime physically CANNOT reach Full Time in < 103 minutes
+        #    (`hours_left > -1.716`). Any match < 103 minutes after kickoff is strictly STILL ONGOING (`LIVE`)!
+        FINAL_STATUS_NAMES = {
+            "STATUS_FULL_TIME", "STATUS_FINAL", "STATUS_FINAL_AET", "STATUS_FINAL_PEN",
+            "STATUS_AFTER_PENALTIES", "STATUS_FULL_TIME_AET", "STATUS_END_OF_REGULATION"
+        }
+        NON_FINAL_TOKENS = ("SUSP", "DELAY", "POSTPON", "ABANDON", "CANCEL", "HALF", "1ST", "2ND", "INTERRUPT", "TBD")
+        has_non_final_tok = any(tok in st_name or tok in sd_up for tok in NON_FINAL_TOKENS) or bool(re.search(r"\d+['’]", sd_up))
+        explicit_ft = (
+            completed is True
+            and not has_non_final_tok
+            and (st_name in FINAL_STATUS_NAMES or sd_up in {"FT", "AET", "PEN", "FINAL", "FULL TIME"})
+        )
+        elapsed_min_since_ko = ((now_utc - kickoff_dt).total_seconds() / 60.0) if kickoff_dt else 999.0
+        truly_finished = bool(explicit_ft and elapsed_min_since_ko >= 103.0)
+        is_currently_live = bool((not truly_finished) and (state == "in" or (0.0 <= elapsed_min_since_ko < 135.0 and "POSTPON" not in st_name and "CANCEL" not in st_name)))
+
+        if truly_finished:
             status_code = "FT"
-        elif state == "in":
-            status_code = f"LIVE {short_detail}"
+        elif is_currently_live:
+            status_code = f"LIVE {short_detail}" if short_detail and short_detail != "NS" else f"LIVE {max(1, int(elapsed_min_since_ko))}m"
         else:
             status_code = "NS"
 
@@ -2856,8 +2885,8 @@ class LiveSportsbookAndStatsAPI:
             "gh": h_score,
             "ga": a_score,
             "state": state,
-            "is_finished": completed or state == "post",
-            "is_live": state == "in",
+            "is_finished": truly_finished,
+            "is_live": is_currently_live,
             "status_label": status_code,
             "clock": short_detail,
             "home_form": h_form,
@@ -3153,6 +3182,9 @@ class LiveSportsbookAndStatsAPI:
                     item.match_status = "FT"
                 else:
                     item.settlement = "PENDING"
+                    item.match_status = "LIVE" if any("LIVE" in str(lg.get("score_str", "")) for lg in item.combo_legs) else "PENDING"
+                    item.loss_autopsy = ""
+                    item.failure_mode = ""
             else:
                 matched = None
                 swapped = False
@@ -3206,7 +3238,13 @@ class LiveSportsbookAndStatsAPI:
                     tot_corners=tot_corners_val
                 )
                 item.settlement = primary_res
-                if primary_res == "WON ✅":
+                if primary_res == "PENDING":
+                    item.won_via_safe_alt = False
+                    item.settled_odds = 0.0
+                    item.settled_note = ""
+                    item.loss_autopsy = ""
+                    item.failure_mode = ""
+                elif primary_res == "WON ✅":
                     item.won_via_safe_alt = False
                     item.settled_odds = item.odds
                     item.settled_note = ""
@@ -8344,6 +8382,7 @@ class LiveChannelAdminEditor:
             r"^(?:fix|clean|dedup|deduplicate)\s+(?:the\s+)?(?:lotto|combo)",
             r"(?:single|leg)\s*#?\d+\s+(?:odds|link|selection|safe)",
             r"^(?:settle|grade)\s+(?:single|bet|combo|lotto)",
+            r"^(?:reopen|ungrade|revert)\b",
         ]
         return any(re.search(pat, low) for pat in nl_patterns)
 
@@ -8662,6 +8701,37 @@ class LiveChannelAdminEditor:
                 if mid_c > 1:
                     bot_client.edit_message(PUBLISH_CHANNEL_ID, mid_c, card_c)
                 return f"✅ Updated {m_leg_od.group(1).title()} Leg #{l_idx} odds to ⟦CODE⟧{new_od:.2f}⟦/CODE⟧ (New Total: ⟦CODE⟧{it_c.odds:.2f}x⟦/CODE⟧) on ⟦CODE⟧@Footybett⟦/CODE⟧!"
+
+            # ── ACTION 5b: Reopen / Delete Premature Result Replies (`reopen today` / `reopen besiktas` / `reopen lotto`) ──
+            if re.match(r"^(?:reopen|ungrade|revert)\b", low):
+                reopened_names: List[str] = []
+                for fk_r, it_r in all_items.items():
+                    if it_r.date_str != active_d or not it_r.is_approved:
+                        continue
+                    match_target = ("today" in low or "all" in low or low in ("reopen", "ungrade", "revert"))
+                    if not match_target:
+                        if "lotto" in low and (it_r.is_lotto_combo or it_r.market_type == "lotto_parlay"):
+                            match_target = True
+                        elif "combo" in low and it_r.is_combo and not it_r.is_lotto_combo:
+                            match_target = True
+                        elif not it_r.is_combo and any(tok in low for tok in BCGameLivePlaywrightEngine.get_team_alias_tokens(it_r.team_home) + BCGameLivePlaywrightEngine.get_team_alias_tokens(it_r.team_away) if len(tok) >= 4):
+                            match_target = True
+                    if match_target and (it_r.settlement != "PENDING" or getattr(it_r, "result_message_id", None) or it_r.published_result_to_channel):
+                        rmid_r = int(getattr(it_r, "result_message_id", 0) or 0)
+                        if rmid_r > 1:
+                            bot_client.delete_message(PUBLISH_CHANNEL_ID, rmid_r)
+                        it_r.settlement = "PENDING"
+                        it_r.match_status = "LIVE"
+                        it_r.result_message_id = None
+                        it_r.published_result_to_channel = False
+                        it_r.loss_autopsy = ""
+                        it_r.failure_mode = ""
+                        DailyLedgerManager.unlock_in_channel(f"result:{fk_r}")
+                        reopened_names.append(f"{it_r.team_home} vs {it_r.team_away}")
+                DailyLedgerManager.save_all_items(all_items)
+                if reopened_names:
+                    return f"✅ Reopened {len(reopened_names)} ongoing item(s) ({', '.join(reopened_names)}) — deleted premature result cards from ⟦CODE⟧@Footybett⟦/CODE⟧ and restored status to PENDING until true Full Time!"
+                return "ℹ️ All matching items are already PENDING with no premature result cards."
 
             # ── ACTION 6: Manual Settlement Override (`settle single 1 won|push|lost`) ──
             m_settle = re.search(r"^(?:settle|grade)\s+(.+?)\s+(won|win|push|refund|lost|loss)\b", low)
@@ -9279,6 +9349,9 @@ class TelegramBotClient:
                     if m_item is not None:
                         if m_item.settlement == "PENDING":
                             to_delete_ids.append(keep_p["msg_id"])
+                            m_item.result_message_id = None
+                            m_item.published_result_to_channel = False
+                            DailyLedgerManager.unlock_in_channel(f"result:{g_key}")
                         else:
                             m_item.published_to_channel = True
                             m_item.published_result_to_channel = True
@@ -9296,7 +9369,14 @@ class TelegramBotClient:
                     to_edit_jobs.append((cmid, BetSlipCardFormatter.format_open_bet_card(it_direct, pick_number=p_num_d)))
                     queued_mids.add(cmid)
                 rmid = int(getattr(it_direct, "result_message_id", 0) or 0)
-                if rmid > 1 and rmid not in queued_mids and it_direct.settlement != "PENDING":
+                if it_direct.settlement == "PENDING" and (rmid > 1 or it_direct.published_result_to_channel or DailyLedgerManager.is_locked_in_channel(f"result:{fk_direct}")):
+                    if rmid > 1:
+                        to_delete_ids.append(rmid)
+                        queued_mids.add(rmid)
+                    it_direct.result_message_id = None
+                    it_direct.published_result_to_channel = False
+                    DailyLedgerManager.unlock_in_channel(f"result:{fk_direct}")
+                elif rmid > 1 and rmid not in queued_mids and it_direct.settlement != "PENDING":
                     to_edit_jobs.append((rmid, BetSlipCardFormatter.format_closed_bet_card(it_direct, up_to_date=it_direct.date_str)))
                     queued_mids.add(rmid)
             for eod_d_k, eod_m_v in sorted(eod_map.items()):
@@ -9367,7 +9447,7 @@ class TelegramBotClient:
 
             DailyLedgerManager.save_all_items(all_items)
             save_json_dict(EOD_MESSAGE_IDS_FILE, eod_map)
-            DailyLedgerManager.mark_locked_in_channel("channel_clean_v41_0_auto_done")
+            DailyLedgerManager.mark_locked_in_channel("channel_clean_v41_1_auto_done")
 
             won_all, lost_all, wr_all, net_all_r = BetSlipCardFormatter.get_totals_summary_tuple()
             r_usd = BankrollStakeSizer.get_unit_usd()
@@ -9377,11 +9457,11 @@ class TelegramBotClient:
                 dup_note = f"\nℹ️ Older >48h duplicates (Telegram requires 1 manual tap by owner to delete): {links}"
 
             report = (
-                "🧹 @Footybett CHANNEL CLEANUP & HISTORY UPGRADE COMPLETE (v41.0)\n"
+                "🧹 @Footybett CHANNEL CLEANUP & HISTORY UPGRADE COMPLETE (v41.1)\n"
                 "────────────────────────\n"
                 f"• Scanned Channel Posts : {len(posts)} messages\n"
                 f"• Deleted Duplicates    : {deleted_cnt} message(s)\n"
-                f"• Rewritten & Upgraded  : {edited_cnt} post(s) updated to v41.0 Verified-Existence BC.Game Odds & Direct Match Links\n"
+                f"• Rewritten & Upgraded  : {edited_cnt} post(s) updated to v41.1 Verified-Existence BC.Game Odds & Direct Match Links\n"
                 f"• Already Clean         : {unchanged_cnt} post(s)\n"
                 "• Pinned Partner Guide  : Active 📌\n"
                 f"• Channel & Bot Bio     : {bio_status}\n"
@@ -9454,6 +9534,17 @@ class TelegramBotClient:
                     continue
                 pick_lock_key = f"pick:{full_key}"
                 result_lock_key = f"result:{full_key}"
+
+                if item.settlement == "PENDING" and (item.published_result_to_channel or getattr(item, "result_message_id", None) or DailyLedgerManager.is_locked_in_channel(result_lock_key)):
+                    prem_mid = int(getattr(item, "result_message_id", 0) or 0)
+                    if prem_mid > 1:
+                        self.delete_message(PUBLISH_CHANNEL_ID, prem_mid)
+                        logger.info("Deleted premature ongoing-match result message_id=%s for %s", prem_mid, full_key)
+                    item.result_message_id = None
+                    item.published_result_to_channel = False
+                    DailyLedgerManager.unlock_in_channel(result_lock_key)
+                    updated = True
+                    continue
 
                 if item.settlement in ["WON ✅", "LOST ❌", "PUSH ➖"]:
                     was_pub = bool(item.published_to_channel or int(getattr(item, "channel_message_id", 0) or 0) > 1)
@@ -9539,7 +9630,7 @@ class TelegramBotClient:
     def background_worker_loop(self):
         logger.info("Footybett v37.0 Weighted Sharp-Consensus & Auto-Cleaner & Deep Match-Autopsy Worker started...")
         time.sleep(3)
-        if not DailyLedgerManager.is_locked_in_channel("channel_clean_v41_0_auto_done"):
+        if not DailyLedgerManager.is_locked_in_channel("channel_clean_v41_1_auto_done"):
             try:
                 logger.info("Running automatic one-time v41.0 @Footybett Lotto-dedup, Live Admin Editor & rate-limit-safe verified BC.Game markets, live odds, exact links & button cleanup & Partner-Button Removal & Safe Alt backfill & history upgrade...")
                 self.clean_and_upgrade_channel_history(auto_startup=True)
