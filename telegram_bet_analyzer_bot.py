@@ -1,6 +1,6 @@
 """
 Telegram Pro Football Betting Syndicate — Tier-1 Sharp Analyst Weighted Consensus,
-Exact BC.Game Match Links & Post-Match Boxscore Review Engine (v40.1 Production Release)
+Exact BC.Game Match Links & Post-Match Boxscore Review Engine (v40.2 Production Release)
 (@betyyyybot -> @Footybett)
 
 What's New in v36.0 (True Match-Stats Autopsy & Root-Cause Learning):
@@ -536,22 +536,28 @@ def safe_truncate_marked_text(text: str, max_visible_chars: int = 3900) -> str:
 
 
 def render_telegram_html(text: str) -> str:
-    """Escapes all `<`, `>`, `&` safely and converts `⟦CODE⟧`, `⟦PARTNER_LINK⟧`, and `⟦BC_LINK:...⟧` into Telegram HTML."""
-    safe_raw = safe_truncate_marked_text(text, max_visible_chars=3900)
-    escaped = html.escape(safe_raw, quote=False)
-    escaped = escaped.replace("⟦CODE⟧", "<code>").replace("⟦/CODE⟧", "</code>")
-    safe_partner = html.escape(BCGAME_PARTNER_URL, quote=True)
-    escaped = escaped.replace("⟦PARTNER_LINK⟧", f'<a href="{safe_partner}"><b>').replace("⟦/PARTNER_LINK⟧", "</b></a>")
+    """Escapes all `<`, `>`, `&` safely, converts markers into Telegram HTML, and guarantees total HTML <= 4050 chars!"""
+    def _convert(vis_cap: int) -> str:
+        safe_raw = safe_truncate_marked_text(text, max_visible_chars=vis_cap)
+        esc = html.escape(safe_raw, quote=False)
+        esc = esc.replace("⟦CODE⟧", "<code>").replace("⟦/CODE⟧", "</code>")
+        safe_partner = html.escape(BCGAME_PARTNER_URL, quote=True)
+        esc = esc.replace("⟦PARTNER_LINK⟧", f'<a href="{safe_partner}"><b>').replace("⟦/PARTNER_LINK⟧", "</b></a>")
 
-    def _repl_bc_link(m: re.Match) -> str:
-        raw_u = html.unescape(m.group(1)).strip()
-        if not raw_u.startswith("https://bc.game/"):
-            raw_u = BCGAME_SOCCER_HUB_URL
-        esc_u = html.escape(raw_u, quote=True)
-        return f'<a href="{esc_u}"><b>{m.group(2)}</b></a>'
+        def _repl_bc_link(m: re.Match) -> str:
+            raw_u = html.unescape(m.group(1)).strip()
+            if not raw_u.startswith("https://bc.game/"):
+                raw_u = BCGAME_SOCCER_HUB_URL
+            esc_u = html.escape(raw_u, quote=True)
+            return f'<a href="{esc_u}"><b>{m.group(2)}</b></a>'
 
-    escaped = re.sub(r"⟦BC_LINK:([^⟧]+)⟧(.*?)⟦/BC_LINK⟧", _repl_bc_link, escaped)
-    return escaped
+        return re.sub(r"⟦BC_LINK:([^⟧]+)⟧(.*?)⟦/BC_LINK⟧", _repl_bc_link, esc)
+
+    for cap_try in (3900, 3200, 2600, 2100, 1700):
+        out_html = _convert(cap_try)
+        if len(out_html) <= 4020:
+            return out_html
+    return _convert(1400)[:4020]
 
 
 SHARED_CLUB_WORDS = {
@@ -6765,9 +6771,25 @@ class SafeCushionBetCreator:
 
         cushions: List[Tuple[float, Dict[str, Any]]] = []
 
-        # 1. Logical Home Double Chance (1X) — exact unaltered BC.Game odd + Majority Expert Gate
+        # 1a. Dominant Home Favorite `1x2` (when `dc_1x < 1.12` on UCL/UEL favorites like 1.18-1.46!)
+        odd_h_ml = round(bc_odds["home_1x2"], 2)
+        if ok_1x and dc["p_home_win"] >= 66.0 and h_recent_l <= 1 and h_win_rate >= a_win_rate + 0.14 and 1.16 <= odd_h_ml <= 1.46:
+            cushions.append((
+                dc["p_home_win"] + 12.0 + buzz_bonus + min(8.0, nf_1x * 1.8),
+                {"home": home, "away": away, "league": lg_short, "kickoff": ko_short, "market_type": "1x2", "selection": f"1x2 ➔ {home}", "line": None, "odds": odd_h_ml}
+            ))
+
+        # 1b. Dominant Away Favorite `1x2` (`1.18-1.45`)
+        odd_a_ml = round(bc_odds["away_1x2"], 2)
+        if ok_x2 and dc["p_away_win"] >= 66.0 and a_recent_l <= 1 and a_win_rate >= h_win_rate + 0.16 and 1.18 <= odd_a_ml <= 1.45:
+            cushions.append((
+                dc["p_away_win"] + 12.0 + buzz_bonus + min(8.0, nf_x2 * 1.8),
+                {"home": home, "away": away, "league": lg_short, "kickoff": ko_short, "market_type": "1x2", "selection": f"1x2 ➔ {away}", "line": None, "odds": odd_a_ml}
+            ))
+
+        # 1c. Logical Home Double Chance (1X) — exact unaltered BC.Game odd + Majority Expert Gate
         odd_1x = round(bc_odds["dc_1x"], 2)
-        if ok_1x and dc["p_home_1x"] >= 81.0 and h_recent_l <= 1 and h_win_rate >= a_win_rate + 0.10 and 1.12 <= odd_1x <= 1.44:
+        if ok_1x and dc["p_home_1x"] >= 80.0 and h_recent_l <= 1 and h_win_rate >= a_win_rate + 0.10 and 1.12 <= odd_1x <= 1.54:
             cushions.append((
                 dc["p_home_1x"] + buzz_bonus + min(8.0, nf_1x * 1.8),
                 {"home": home, "away": away, "league": lg_short, "kickoff": ko_short, "market_type": "1x2", "selection": f"Double Chance ➔ {home} or Draw (1X)", "line": None, "odds": odd_1x}
@@ -7037,14 +7059,19 @@ class SafeCushionBetCreator:
         if not force_now and now_utc.hour < 13:
             logger.info("Waiting for 13:00 UTC (15:00 Local) pre-match tipster release window before building daily slate...")
             return existing
+        # Never generate a late-night phantom Lotto after 19:00 UTC (21:00 Local) once today's main batch is already live!
+        if not force_now and main_batch_already_done and now_utc.hour >= 19:
+            return existing
 
         buzz_teams = ChannelBuzzRadar.fetch_channel_buzz_teams()
         fixtures = LiveSportsbookAndStatsAPI.fetch_mens_fixtures_with_odds(active_date)
         next_day = shift_date_str(active_date, 1)
-        # Only include next_day fixtures that kick off within <= 18h (tonight's late Americas/European games — NEVER Monday 48h matches!)
+        # Strictly restrict `next_day` fixtures to genuine overnight kickoffs (`< 07:00 UTC`) of tonight's card — NEVER next afternoon's European slate!
         for nf in LiveSportsbookAndStatsAPI.fetch_mens_fixtures_with_odds(next_day):
             hl_nf = nf.get("hours_until_kickoff")
-            if hl_nf is not None and 0 < hl_nf <= 18.0:
+            ko_dt_nf = parse_kickoff_utc(str(nf.get("raw_kickoff_iso") or nf.get("kickoff_iso") or ""))
+            is_overnight = (ko_dt_nf.hour < 7) if ko_dt_nf is not None else (hl_nf is not None and hl_nf <= 10.5)
+            if hl_nf is not None and 0 < hl_nf <= 14.5 and is_overnight:
                 fixtures.append(nf)
 
         paired_candidates: List[Tuple[int, int, float, LedgerBetItem, Dict[str, Any]]] = []
@@ -7276,17 +7303,19 @@ class SafeCushionBetCreator:
             lotto_odds = 1.0
             for _, c_leg in scored_mega_cushions:
                 leg_od = round(float(c_leg.get("odds", 1.24)), 2)
-                if leg_od < 1.10 or leg_od > 1.50:
+                sel_c_low = str(c_leg.get("selection", "")).lower()
+                max_leg_cap = 1.58 if ("double chance" in sel_c_low or "over 1.5" in sel_c_low) else 1.50
+                if leg_od < 1.10 or leg_od > max_leg_cap:
                     continue
-                if len(lotto_legs) >= 10 and lotto_odds >= 10.0:
-                    if len(lotto_legs) >= 16 or (lotto_odds * leg_od > 28.0):
+                if len(lotto_legs) >= 8 and lotto_odds >= 8.5:
+                    if len(lotto_legs) >= 12 or (lotto_odds * leg_od > 24.0):
                         break
-                if len(lotto_legs) >= 18:
+                if len(lotto_legs) >= 12:
                     break
                 lotto_legs.append(c_leg)
                 lotto_odds *= leg_od
 
-            if len(lotto_legs) >= 4 and lotto_odds >= 3.2:
+            if len(lotto_legs) >= 3 and lotto_odds >= 2.75:
                 BCGameDirectLinkResolver.batch_resolve_exact_urls([(str(x.get("home", "")), str(x.get("away", "")), str(x.get("league", ""))) for x in lotto_legs], force_odds=False)
                 for lg_l in lotto_legs:
                     lg_l["bcgame_url"] = BCGameDirectLinkResolver.resolve_match_url(
@@ -7584,17 +7613,26 @@ class BetSlipCardFormatter:
         r_usd = BankrollStakeSizer.get_unit_usd()
         all_items = list(DailyLedgerManager.load_all_history_items().values())
 
-        day_singles = [
+        def _was_posted_on_channel(it_chk: LedgerBetItem) -> bool:
+            return bool(it_chk.published_to_channel or int(getattr(it_chk, "channel_message_id", 0) or 0) > 1)
+
+        raw_day_singles = [
             i for i in all_items
             if i.date_str == target_date and i.is_approved and not BankrollStakeSizer.is_optional_combo_or_lotto(i)
         ]
+        posted_singles = [i for i in raw_day_singles if _was_posted_on_channel(i)]
+        day_singles = posted_singles if posted_singles else raw_day_singles
+
+        # STRICT CHANNEL GATE: Never list an Optional Combo or $5 Mega Lotto on the End-of-Day Recap unless it was ACTUALLY posted on `@Footybett`!
         day_safe_combos = [
             i for i in all_items
-            if i.date_str == target_date and i.is_approved and i.is_combo and not (i.is_lotto_combo or i.market_type == "lotto_parlay")
+            if i.date_str == target_date and i.is_approved and _was_posted_on_channel(i)
+            and i.is_combo and not (i.is_lotto_combo or i.market_type == "lotto_parlay")
         ]
         day_lottos = [
             i for i in all_items
-            if i.date_str == target_date and i.is_approved and (i.is_lotto_combo or i.market_type == "lotto_parlay")
+            if i.date_str == target_date and i.is_approved and _was_posted_on_channel(i)
+            and (i.is_lotto_combo or i.market_type == "lotto_parlay")
         ]
 
         d_won = sum(1 for i in day_singles if "WON" in i.settlement)
@@ -8389,6 +8427,17 @@ class TelegramBotClient:
             LiveSportsbookAndStatsAPI.grade_ledger_items()
             all_items = DailyLedgerManager.load_all_history_items()
             active_d_now = DailyLedgerManager.get_active_date_str()
+            yesterday_d_now = DailyLedgerManager.get_yesterday_str()
+            # Purge any historical (`< active_d_now`) phantom Lotto/Combo that was never actually published to `@Footybett`!
+            for fk_ph in list(all_items.keys()):
+                it_ph = all_items[fk_ph]
+                if (
+                    it_ph.date_str < active_d_now
+                    and (it_ph.is_combo or it_ph.is_lotto_combo)
+                    and not it_ph.published_to_channel
+                    and int(getattr(it_ph, "channel_message_id", 0) or 0) <= 1
+                ):
+                    del all_items[fk_ph]
             # Upgrade team names across all items to official BC.Game names, and purge any stale pre-v32 PENDING Lotto
             # from today that included 48h future matches (e.g. Monday's Bologna vs Udinese on Saturday)!
             purged_old_lotto = False
@@ -8450,7 +8499,7 @@ class TelegramBotClient:
                         it_h.loss_autopsy = ""
                         it_h.failure_mode = ""
 
-            if (not auto_startup) or (not DailyLedgerManager.is_locked_in_channel(f"v40_1_live_board_recalibrated:{active_d_now}")):
+            if (not auto_startup) or (not DailyLedgerManager.is_locked_in_channel(f"v40_2_live_board_recalibrated:{active_d_now}")):
                 ExternalAnalyticsCollector.scrape_bcgame_official_portal()
                 today_fxs = LiveSportsbookAndStatsAPI.fetch_mens_fixtures_with_odds(active_d_now)
                 fx_lookup = {f"{normalize_team_str(x['home'])}_vs_{normalize_team_str(x['away'])}": x for x in today_fxs}
@@ -8570,7 +8619,7 @@ class TelegramBotClient:
                             it_v.selection = f"{len(cleaned_l_legs)}-Leg Logical Safe-Cushion Mega List ({it_v.odds:.2f}x)"
 
                 DailyLedgerManager.save_all_items(all_items)
-                DailyLedgerManager.mark_locked_in_channel(f"v40_1_live_board_recalibrated:{active_d_now}")
+                DailyLedgerManager.mark_locked_in_channel(f"v40_2_live_board_recalibrated:{active_d_now}")
             eod_map = load_json_dict(EOD_MESSAGE_IDS_FILE)
             handle = ChannelHistoryCleaner.extract_channel_handle(PUBLISH_CHANNEL_ID)
             posts = ChannelHistoryCleaner.fetch_all_channel_posts(PUBLISH_CHANNEL_ID)
@@ -8671,6 +8720,12 @@ class TelegramBotClient:
                 if rmid > 1 and rmid not in queued_mids and it_direct.settlement != "PENDING":
                     to_edit_jobs.append((rmid, BetSlipCardFormatter.format_closed_bet_card(it_direct, up_to_date=it_direct.date_str)))
                     queued_mids.add(rmid)
+            for eod_d_k, eod_m_v in sorted(eod_map.items()):
+                if eod_d_k != "pinned_guide" and eod_d_k >= TRACKING_START_DATE:
+                    emid = int(eod_m_v or 0)
+                    if emid > 1 and emid not in queued_mids:
+                        to_edit_jobs.append((emid, BetSlipCardFormatter.format_end_of_day_channel_recap(eod_d_k)))
+                        queued_mids.add(emid)
 
             for mid in sorted(set(to_delete_ids)):
                 ok_del, _ = self.delete_message(PUBLISH_CHANNEL_ID, mid)
@@ -8684,6 +8739,9 @@ class TelegramBotClient:
             today_priority_mids: Set[int] = set()
             if guide_msg_id:
                 today_priority_mids.add(int(guide_msg_id))
+            for recent_eod_d in (active_d_now, yesterday_d_now):
+                if int(eod_map.get(recent_eod_d) or 0) > 1:
+                    today_priority_mids.add(int(eod_map[recent_eod_d]))
             for it_pr in all_items.values():
                 if it_pr.date_str == active_d_now:
                     if getattr(it_pr, "channel_message_id", None):
@@ -8730,7 +8788,7 @@ class TelegramBotClient:
 
             DailyLedgerManager.save_all_items(all_items)
             save_json_dict(EOD_MESSAGE_IDS_FILE, eod_map)
-            DailyLedgerManager.mark_locked_in_channel("channel_clean_v40_1_auto_done")
+            DailyLedgerManager.mark_locked_in_channel("channel_clean_v40_2_auto_done")
 
             won_all, lost_all, wr_all, net_all_r = BetSlipCardFormatter.get_totals_summary_tuple()
             r_usd = BankrollStakeSizer.get_unit_usd()
@@ -8740,11 +8798,11 @@ class TelegramBotClient:
                 dup_note = f"\nℹ️ Older >48h duplicates (Telegram requires 1 manual tap by owner to delete): {links}"
 
             report = (
-                "🧹 @Footybett CHANNEL CLEANUP & HISTORY UPGRADE COMPLETE (v40.1)\n"
+                "🧹 @Footybett CHANNEL CLEANUP & HISTORY UPGRADE COMPLETE (v40.2)\n"
                 "────────────────────────\n"
                 f"• Scanned Channel Posts : {len(posts)} messages\n"
                 f"• Deleted Duplicates    : {deleted_cnt} message(s)\n"
-                f"• Rewritten & Upgraded  : {edited_cnt} post(s) updated to v40.1 Verified-Existence BC.Game Odds & Direct Match Links\n"
+                f"• Rewritten & Upgraded  : {edited_cnt} post(s) updated to v40.2 Verified-Existence BC.Game Odds & Direct Match Links\n"
                 f"• Already Clean         : {unchanged_cnt} post(s)\n"
                 "• Pinned Partner Guide  : Active 📌\n"
                 f"• Channel & Bot Bio     : {bio_status}\n"
@@ -8819,6 +8877,9 @@ class TelegramBotClient:
                 result_lock_key = f"result:{full_key}"
 
                 if item.settlement in ["WON ✅", "LOST ❌", "PUSH ➖"]:
+                    was_pub = bool(item.published_to_channel or int(getattr(item, "channel_message_id", 0) or 0) > 1)
+                    if not was_pub:
+                        continue
                     close_card = BetSlipCardFormatter.format_closed_bet_card(item, up_to_date=item.date_str)
                     if not item.published_result_to_channel and (getattr(item, "result_message_id", None) or not DailyLedgerManager.is_locked_in_channel(result_lock_key)):
                         if getattr(item, "result_message_id", None):
@@ -8899,9 +8960,9 @@ class TelegramBotClient:
     def background_worker_loop(self):
         logger.info("Footybett v37.0 Weighted Sharp-Consensus & Auto-Cleaner & Deep Match-Autopsy Worker started...")
         time.sleep(3)
-        if not DailyLedgerManager.is_locked_in_channel("channel_clean_v40_1_auto_done"):
+        if not DailyLedgerManager.is_locked_in_channel("channel_clean_v40_2_auto_done"):
             try:
-                logger.info("Running automatic one-time v40.1 @Footybett rate-limit-safe verified BC.Game markets, live odds, exact links & button cleanup & Partner-Button Removal & Safe Alt backfill & history upgrade...")
+                logger.info("Running automatic one-time v40.2 @Footybett Lotto-sync & rate-limit-safe verified BC.Game markets, live odds, exact links & button cleanup & Partner-Button Removal & Safe Alt backfill & history upgrade...")
                 self.clean_and_upgrade_channel_history(auto_startup=True)
             except Exception as ce:
                 logger.error("Auto channel cleanup error: %s", ce)
