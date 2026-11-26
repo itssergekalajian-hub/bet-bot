@@ -1,6 +1,6 @@
 """
 Telegram Pro Football Betting Syndicate — Tier-1 Sharp Analyst Weighted Consensus,
-Exact BC.Game Match Links & Post-Match Boxscore Review Engine (v40.2 Production Release)
+Exact BC.Game Match Links & Post-Match Boxscore Review Engine (v41.0 Production Release)
 (@betyyyybot -> @Footybett)
 
 What's New in v36.0 (True Match-Stats Autopsy & Root-Cause Learning):
@@ -455,6 +455,8 @@ def normalize_team_str(name: str) -> str:
     s = "".join(c for c in unicodedata.normalize("NFD", name) if unicodedata.category(c) != "Mn")
     s = s.lower().strip()
     s = s.replace("⟦code⟧", " ").replace("⟦/code⟧", " ")
+    s = re.sub(r"([a-z])['’`]([a-z])", r"\1\2", s)
+    s = re.sub(r"\bst\.?\s+gilloise\b", "saint gilloise", s)
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(
         r"\b(fc|cf|sc|ac|afc|sk|fk|sv|tsg|rb|ud|cd|rcd|real|club|de|del|la|el|calcio|ssc|acf|cfc|osc|ogc|vfb|vfl|fsv|spvgg|hsc|usl|estac|bc|ss|us|aj|rc|sl|ca|kv|ec|fr|cr|se|rome|1|1907|1913|1909|1899|1846|04|05|07|29|38|63|96|98)\b",
@@ -717,6 +719,10 @@ class BCGameLivePlaywrightEngine:
             "nuremberg": ["nurnberg", "nuremberg"],
             "olympique marseille": ["marseille"],
             "olympique lyon": ["lyon"],
+            "gilloise": ["union saint gilloise", "royale union", "union sg", "saint gilloise", "gilloise"],
+            "cska sofia": ["cska sofia", "cska 1948", "pfc cska", "sofia"],
+            "beer sheva": ["hapoel beer sheva", "beer sheva", "be er sheva"],
+            "trabzonspor": ["trabzonspor", "trabzon"],
         }
         for ek, evs in extra_map.items():
             if ek in norm or ek in raw_clean:
@@ -7039,6 +7045,85 @@ class SafeCushionBetCreator:
         return True
 
     @classmethod
+    def clean_and_deduplicate_lotto_legs(
+        cls,
+        raw_legs: List[Dict[str, Any]],
+        min_leg_odds: float = 1.18,
+        prefer_exact_urls: bool = True
+    ) -> Tuple[List[Dict[str, Any]], float]:
+        """
+        v41.0 Lotto Quality & Deduplication Engine:
+        1. Syncs each leg's odds with live BC.Game screen odds if Playwright captured that match!
+        2. Deduplicates matches via fuzzy `teams_match` (keeping the leg with an exact 19-digit URL / live screen odd).
+        3. Drops `< min_leg_odds` (`1.14-1.17` filler traps) whenever `>= 4` solid legs remain!
+        4. Drops unverified league-board fallback legs whenever `>= 5` exact-URL legs already exist!
+        """
+        if not raw_legs:
+            return [], 1.0
+
+        deduped: List[Dict[str, Any]] = []
+        for lg in raw_legs:
+            lg_copy = dict(lg)
+            lh = to_bcgame_team_name(str(lg_copy.get("home", "")))
+            la = to_bcgame_team_name(str(lg_copy.get("away", "")))
+            lg_copy["home"], lg_copy["away"] = lh, la
+            lg_copy["bcgame_url"] = BCGameDirectLinkResolver.resolve_match_url(
+                lh, la, str(lg_copy.get("league", "")), existing_url=str(lg_copy.get("bcgame_url", "")), allow_network=False
+            )
+            # Sync live BC.Game screen odds if available for this match!
+            live_sc = BCGameLivePlaywrightEngine.get_live_match_odds(lh, la)
+            if live_sc:
+                ls_low = str(lg_copy.get("selection", "")).lower()
+                if "1x2" in ls_low:
+                    is_aw_l = LiveSportsbookAndStatsAPI._is_away_team_selected(str(lg_copy.get("selection", "")), lh, la)
+                    k_m = "away_1x2" if is_aw_l else "home_1x2"
+                    if live_sc.get(k_m):
+                        lg_copy["odds"] = round(float(live_sc[k_m]), 2)
+                elif "(1x)" in ls_low and live_sc.get("dc_1x"):
+                    lg_copy["odds"] = round(float(live_sc["dc_1x"]), 2)
+                elif "(x2)" in ls_low and live_sc.get("dc_x2"):
+                    lg_copy["odds"] = round(float(live_sc["dc_x2"]), 2)
+                elif "over 1.5" in ls_low and live_sc.get("over_15"):
+                    lg_copy["odds"] = round(float(live_sc["over_15"]), 2)
+                elif "under 3.5" in ls_low and live_sc.get("under_35"):
+                    lg_copy["odds"] = round(float(live_sc["under_35"]), 2)
+
+            dup_idx = None
+            for idx_e, ex in enumerate(deduped):
+                if (teams_match(lh, ex.get("home", "")) and teams_match(la, ex.get("away", ""))) or (
+                    teams_match(lh, ex.get("away", "")) and teams_match(la, ex.get("home", ""))
+                ):
+                    dup_idx = idx_e
+                    break
+            if dup_idx is not None:
+                ex_has_exact = BCGameDirectLinkResolver.is_valid_direct_match_url(str(deduped[dup_idx].get("bcgame_url", "")), lh, la)
+                nw_has_exact = BCGameDirectLinkResolver.is_valid_direct_match_url(str(lg_copy.get("bcgame_url", "")), lh, la)
+                if nw_has_exact and not ex_has_exact:
+                    deduped[dup_idx] = lg_copy
+                continue
+            deduped.append(lg_copy)
+
+        # Drop ultra-low `< 1.18` filler legs if at least 4 solid `>= 1.18` legs remain!
+        solid_odds_legs = [x for x in deduped if float(x.get("odds", 1.25)) >= min_leg_odds]
+        if len(solid_odds_legs) >= 4:
+            deduped = solid_odds_legs
+
+        # If `prefer_exact_urls` and at least 5 legs have exact 19-digit BC.Game match URLs, drop unlinked legs (like Torreense vs Celtic)!
+        if prefer_exact_urls:
+            exact_only = [
+                x for x in deduped
+                if BCGameDirectLinkResolver.is_valid_direct_match_url(str(x.get("bcgame_url", "")), str(x.get("home", "")), str(x.get("away", "")))
+            ]
+            if len(exact_only) >= 5:
+                deduped = exact_only
+
+        prod = 1.0
+        for x in deduped:
+            x["odds"] = round(float(x.get("odds", 1.25)), 2)
+            prod *= x["odds"]
+        return deduped, round(prod, 2)
+
+    @classmethod
     def generate_slate_and_combo_for_active_date(cls, force_now: bool = False) -> List[LedgerBetItem]:
         learning_state = SelfLearningEngine.recalibrate_from_ledger()
         active_date = DailyLedgerManager.get_active_date_str()
@@ -7302,20 +7387,30 @@ class SafeCushionBetCreator:
             lotto_legs: List[Dict[str, Any]] = []
             lotto_odds = 1.0
             for _, c_leg in scored_mega_cushions:
+                ch_name = to_bcgame_team_name(str(c_leg.get("home", "")))
+                ca_name = to_bcgame_team_name(str(c_leg.get("away", "")))
+                c_leg["home"], c_leg["away"] = ch_name, ca_name
+                # Strict fuzzy `teams_match` deduplication so apostrophe variants ("Be'er Sheva" vs "Beer Sheva") NEVER duplicate!
+                if any(
+                    (teams_match(ch_name, ex.get("home", "")) and teams_match(ca_name, ex.get("away", "")))
+                    or (teams_match(ch_name, ex.get("away", "")) and teams_match(ca_name, ex.get("home", "")))
+                    for ex in lotto_legs
+                ):
+                    continue
                 leg_od = round(float(c_leg.get("odds", 1.24)), 2)
                 sel_c_low = str(c_leg.get("selection", "")).lower()
                 max_leg_cap = 1.58 if ("double chance" in sel_c_low or "over 1.5" in sel_c_low) else 1.50
-                if leg_od < 1.10 or leg_od > max_leg_cap:
+                if leg_od < 1.18 or leg_od > max_leg_cap:
                     continue
-                if len(lotto_legs) >= 8 and lotto_odds >= 8.5:
-                    if len(lotto_legs) >= 12 or (lotto_odds * leg_od > 24.0):
+                if len(lotto_legs) >= 7 and lotto_odds >= 7.5:
+                    if len(lotto_legs) >= 10 or (lotto_odds * leg_od > 22.0):
                         break
-                if len(lotto_legs) >= 12:
+                if len(lotto_legs) >= 10:
                     break
                 lotto_legs.append(c_leg)
                 lotto_odds *= leg_od
 
-            if len(lotto_legs) >= 3 and lotto_odds >= 2.75:
+            if len(lotto_legs) >= 3 and lotto_odds >= 2.65:
                 BCGameDirectLinkResolver.batch_resolve_exact_urls([(str(x.get("home", "")), str(x.get("away", "")), str(x.get("league", ""))) for x in lotto_legs], force_odds=False)
                 for lg_l in lotto_legs:
                     lg_l["bcgame_url"] = BCGameDirectLinkResolver.resolve_match_url(
@@ -7325,6 +7420,7 @@ class SafeCushionBetCreator:
                         existing_url=str(lg_l.get("bcgame_url", "")),
                         allow_network=True
                     )
+                lotto_legs, lotto_odds = cls.clean_and_deduplicate_lotto_legs(lotto_legs, min_leg_odds=1.18, prefer_exact_urls=True)
                 lotto_odds = round(lotto_odds, 2)
                 lotto_desc = f"{len(lotto_legs)}-Leg Logical Safe-Cushion Mega List ({lotto_odds:.2f}x)"
                 l_hash = hashlib.md5(json.dumps(lotto_legs, sort_keys=True).encode("utf-8")).hexdigest()[:8]
@@ -8219,6 +8315,460 @@ class ChannelHistoryCleaner:
         return "UNMATCHED_KEEP", f"unmatched_{post['msg_id']}", None
 
 
+class LiveChannelAdminEditor:
+    """
+    v41.0 Instant In-Bot `@Footybett` Live Post & Ledger Editor:
+    Allows verified `@Footybett` channel admins (`creator` / `administrator` via Telegram `getChatMember`)
+    to edit live channel posts & `daily_ledger.json` directly from Telegram DM in plain English or `/fix`
+    — ZERO code edits, ZERO `git push`, ZERO VPS restarts needed!
+    """
+    _last_forwarded_target_by_user: Dict[int, str] = {}
+
+    @classmethod
+    def looks_like_admin_edit_command(cls, text: str, has_forwarded_channel_post: bool = False) -> bool:
+        t = (text or "").strip()
+        low = t.lower()
+        if not t:
+            return False
+        if low.startswith(("/fix", "/edit", "/admin")):
+            return True
+        if has_forwarded_channel_post and any(
+            k in low for k in ("odds", "link", "http", "selection", "safe", "remove", "delete", "won", "lost", "push", "@")
+        ):
+            return True
+        # Natural-language plain-English admin instructions
+        nl_patterns = [
+            r"^(?:fix|edit|update|change|set|correct)\s+(?:single|bet|pick|combo|lotto|leg|#?\d)",
+            r"^(?:remove|drop|delete)\s+(?:lotto|combo|single|bet|leg\b|duplicate)",
+            r"^(?:remove|drop)\s+.+\s+from\s+(?:lotto|combo)",
+            r"^(?:fix|clean|dedup|deduplicate)\s+(?:the\s+)?(?:lotto|combo)",
+            r"(?:single|leg)\s*#?\d+\s+(?:odds|link|selection|safe)",
+            r"^(?:settle|grade)\s+(?:single|bet|combo|lotto)",
+        ]
+        return any(re.search(pat, low) for pat in nl_patterns)
+
+    @classmethod
+    def _get_today_ordered_singles(cls, all_items: Dict[str, LedgerBetItem], active_date: str) -> List[Tuple[int, str, LedgerBetItem]]:
+        s_list: List[Tuple[str, LedgerBetItem]] = []
+        for fk, it in sorted(
+            all_items.items(),
+            key=lambda kv: (int(getattr(kv[1], "channel_message_id", 0) or 999999999), kv[0])
+        ):
+            if it.date_str == active_date and it.is_approved and not it.is_combo and not it.is_lotto_combo:
+                s_list.append((fk, it))
+        return [(idx, fk, it) for idx, (fk, it) in enumerate(s_list, 1)]
+
+    @classmethod
+    def _find_target_single(
+        cls,
+        query_text: str,
+        all_items: Dict[str, LedgerBetItem],
+        active_date: str
+    ) -> Optional[Tuple[int, str, LedgerBetItem]]:
+        ordered = cls._get_today_ordered_singles(all_items, active_date)
+        low = query_text.lower()
+        m_num = re.search(r"(?:single|bet|pick)\s*#?(\d+)|^#(\d+)\b", low)
+        if m_num:
+            idx_want = int(m_num.group(1) or m_num.group(2))
+            for idx, fk, it in ordered:
+                if idx == idx_want:
+                    return (idx, fk, it)
+        # Match by club name
+        for idx, fk, it in ordered:
+            for t_tok in BCGameLivePlaywrightEngine.get_team_alias_tokens(it.team_home) + BCGameLivePlaywrightEngine.get_team_alias_tokens(it.team_away):
+                if len(t_tok) >= 4 and t_tok in low:
+                    return (idx, fk, it)
+        # Also check yesterday if not found today
+        for fk, it in sorted(all_items.items(), key=lambda kv: kv[0], reverse=True):
+            if not it.is_combo and not it.is_lotto_combo and it.is_approved:
+                for t_tok in BCGameLivePlaywrightEngine.get_team_alias_tokens(it.team_home) + BCGameLivePlaywrightEngine.get_team_alias_tokens(it.team_away):
+                    if len(t_tok) >= 4 and t_tok in low:
+                        return (1, fk, it)
+        return None
+
+    @classmethod
+    def _ensure_message_id_for_item(cls, it: LedgerBetItem, posts_cache: Optional[List[Dict[str, Any]]] = None) -> int:
+        cmid = int(getattr(it, "channel_message_id", 0) or 0)
+        if cmid > 1:
+            return cmid
+        posts = posts_cache if posts_cache is not None else ChannelHistoryCleaner.fetch_all_channel_posts(PUBLISH_CHANNEL_ID, max_pages=3)
+        temp_map = {f"{it.date_str}:{it.bet_key}": it}
+        for p in reversed(posts):
+            cat, g_key, m_it = ChannelHistoryCleaner.classify_post(p, temp_map)
+            if m_it is not None and cat in ("SINGLE_OPEN", "COMBO_OPEN", "LOTTO_OPEN"):
+                it.channel_message_id = int(p["msg_id"])
+                return int(p["msg_id"])
+        return 0
+
+    @classmethod
+    def format_admin_dashboard(cls) -> str:
+        all_items = DailyLedgerManager.load_all_history_items()
+        active_d = DailyLedgerManager.get_active_date_str()
+        singles = cls._get_today_ordered_singles(all_items, active_d)
+        combos = [it for it in all_items.values() if it.date_str == active_d and it.is_approved and it.is_combo and not it.is_lotto_combo]
+        lottos = [it for it in all_items.values() if it.date_str == active_d and it.is_approved and (it.is_lotto_combo or it.market_type == "lotto_parlay")]
+
+        lines = [
+            f"✏️ @FOOTYBETT LIVE CHANNEL EDITOR ({active_d})",
+            "────────────────────────",
+            "Active Posts Today:"
+        ]
+        for idx, _, s in singles:
+            has_ex = "✅ Exact URL" if BCGameDirectLinkResolver.is_valid_direct_match_url(s.search_url, s.team_home, s.team_away) else "⚠️ Board URL"
+            mid_s = getattr(s, "channel_message_id", None) or "?"
+            lines.append(f"• Single #{idx} (msg {mid_s}): ⟦CODE⟧{s.team_home} vs {s.team_away}⟦/CODE⟧ ➔ {s.selection} (@ {s.odds:.2f}) [{has_ex}]")
+        if combos:
+            c0 = combos[0]
+            lines.append(f"• Safe Combo (msg {c0.channel_message_id or '?'}): {len(c0.combo_legs or [])} legs (@ {c0.odds:.2f})")
+        if lottos:
+            l0 = lottos[0]
+            lines.append(f"• $5 Lotto (msg {l0.channel_message_id or '?'}): {len(l0.combo_legs or [])} legs ({l0.odds:.2f}x)")
+
+        lines.extend([
+            "────────────────────────",
+            "Just type what to fix in plain English (or tap to copy):",
+            "• ⟦CODE⟧/fix lotto⟦/CODE⟧ (deduplicate & clean Lotto legs)",
+            "• ⟦CODE⟧/fix remove lotto leg 7⟦/CODE⟧ or ⟦CODE⟧remove torreense from lotto⟦/CODE⟧",
+            "• ⟦CODE⟧/fix single 2 odds 1.72⟦/CODE⟧ or ⟦CODE⟧change besiktas odds to 1.72⟦/CODE⟧",
+            "• ⟦CODE⟧/fix single 4 link https://bc.game/sports/soccer/...⟦/CODE⟧",
+            "• ⟦CODE⟧/fix single 2 selection Main Tab ➔ Total ➔ Over 2.5 @ 1.74⟦/CODE⟧",
+            "• ⟦CODE⟧/fix single 2 safealt Main Tab ➔ 1x2 ➔ Besiktas JK @ 1.27⟦/CODE⟧",
+            "• ⟦CODE⟧/fix delete single 4⟦/CODE⟧ or ⟦CODE⟧/fix settle single 1 won⟦/CODE⟧"
+        ])
+        return "\n".join(lines)
+
+    @classmethod
+    def execute_admin_instruction(cls, bot_client: Any, raw_text: str, user_id: int = 0, forwarded_msg_id: int = 0) -> str:
+        with bot_client.channel_publish_lock:
+            clean_cmd = re.sub(r"^(?:/fix|/edit|/admin)\b\s*:?\s*", "", (raw_text or "").strip(), flags=re.IGNORECASE).strip()
+            if not clean_cmd or clean_cmd.lower() in ("help", "menu", "status", "list"):
+                return cls.format_admin_dashboard()
+
+            all_items = DailyLedgerManager.load_all_history_items()
+            active_d = DailyLedgerManager.get_active_date_str()
+            low = clean_cmd.lower()
+
+            # If user forwarded a specific channel post earlier or in this message, bind its item if no target named
+            bound_fk = ""
+            if forwarded_msg_id > 1:
+                for fk_b, it_b in all_items.items():
+                    if int(getattr(it_b, "channel_message_id", 0) or 0) == forwarded_msg_id:
+                        bound_fk = fk_b
+                        cls._last_forwarded_target_by_user[user_id] = fk_b
+                        break
+            elif user_id in cls._last_forwarded_target_by_user and not any(k in low for k in ("single", "lotto", "combo")):
+                bound_fk = cls._last_forwarded_target_by_user.get(user_id, "")
+
+            # ── ACTION 1: Deduplicate / Auto-Clean Today's Lotto (`fix lotto` / `dedup lotto` / `clean lotto`) ──
+            if low in ("lotto", "fix lotto", "dedup lotto", "deduplicate lotto", "clean lotto") or re.match(r"^(?:dedup|deduplicate|clean)\s+(?:the\s+)?lotto$", low):
+                lottos = [(fk, it) for fk, it in all_items.items() if it.date_str == active_d and it.is_approved and (it.is_lotto_combo or it.market_type == "lotto_parlay")]
+                if not lottos:
+                    return "❌ No active $5 Mega Lotto found for today."
+                fk_l, it_l = lottos[0]
+                before_cnt = len(it_l.combo_legs or [])
+                new_legs, new_prod = SafeCushionBetCreator.clean_and_deduplicate_lotto_legs(it_l.combo_legs or [], min_leg_odds=1.18, prefer_exact_urls=True)
+                it_l.combo_legs = new_legs
+                it_l.odds = new_prod
+                it_l.team_away = f"({len(new_legs)} Logical Cushions)"
+                it_l.confidence_stars = f"🚀 {len(new_legs)}-LEG MEGA CUSHION ({it_l.odds:.1f}x)"
+                it_l.selection = f"{len(new_legs)}-Leg Logical Safe-Cushion Mega List ({it_l.odds:.2f}x)"
+                DailyLedgerManager.save_all_items(all_items)
+                mid_l = cls._ensure_message_id_for_item(it_l)
+                new_card = BetSlipCardFormatter.format_open_bet_card(it_l)
+                if mid_l > 1:
+                    ok_e, st_e = bot_client.edit_message(PUBLISH_CHANNEL_ID, mid_l, new_card)
+                    DailyLedgerManager.save_all_items(all_items)
+                    return f"✅ Cleaned & edited live Lotto on ⟦CODE⟧@Footybett⟦/CODE⟧ (msg {mid_l}): {before_cnt} ➔ {len(new_legs)} unique legs ({it_l.odds:.2f}x)!\n\n{new_card}"
+                return f"✅ Cleaned Lotto in ledger ({before_cnt} ➔ {len(new_legs)} legs, {it_l.odds:.2f}x), could not locate channel message_id."
+
+            # ── ACTION 2: Delete a Post (`delete single 4` / `delete lotto` / `delete combo` / `delete https://t.me/Footybett/123`) ──
+            m_tme_del = re.search(r"delete\s+(?:https?://)?t\.me/[A-Za-z0-9_]+/(\d+)", low)
+            if m_tme_del:
+                del_mid = int(m_tme_del.group(1))
+                ok_d, desc_d = bot_client.delete_message(PUBLISH_CHANNEL_ID, del_mid)
+                for fk_d, it_d in all_items.items():
+                    if int(getattr(it_d, "channel_message_id", 0) or 0) == del_mid:
+                        it_d.is_approved = False
+                DailyLedgerManager.save_all_items(all_items)
+                return f"🗑️ Deleted message ⟦CODE⟧{del_mid}⟦/CODE⟧ from ⟦CODE⟧@Footybett⟦/CODE⟧ ({desc_d})."
+
+            if re.match(r"^(?:delete|cancel)\s+(?:the\s+)?(?:lotto|combo|single|bet)", low):
+                if "lotto" in low:
+                    targets = [(fk, it) for fk, it in all_items.items() if it.date_str == active_d and it.is_approved and (it.is_lotto_combo or it.market_type == "lotto_parlay")]
+                elif "combo" in low:
+                    targets = [(fk, it) for fk, it in all_items.items() if it.date_str == active_d and it.is_approved and it.is_combo and not it.is_lotto_combo]
+                else:
+                    found_s = cls._find_target_single(clean_cmd, all_items, active_d)
+                    targets = [(found_s[1], found_s[2])] if found_s else []
+                if not targets:
+                    return "❌ Could not find that active post to delete."
+                fk_t, it_t = targets[0]
+                mid_t = cls._ensure_message_id_for_item(it_t)
+                if mid_t > 1:
+                    bot_client.delete_message(PUBLISH_CHANNEL_ID, mid_t)
+                it_t.is_approved = False
+                DailyLedgerManager.save_all_items(all_items)
+                return f"🗑️ Deleted ⟦CODE⟧{it_t.team_home} vs {it_t.team_away}⟦/CODE⟧ (msg {mid_t}) from ⟦CODE⟧@Footybett⟦/CODE⟧ and removed it from today's active ledger."
+
+            # ── ACTION 3: Remove Specific Leg(s) from Lotto or Safe Combo (by Leg Number(s) OR Team Name!) ──
+            if ("remove" in low or "drop" in low) and ("lotto" in low or "combo" in low or "leg" in low):
+                is_combo_target = ("combo" in low and "lotto" not in low)
+                pool = [
+                    (fk, it) for fk, it in all_items.items()
+                    if it.date_str == active_d and it.is_approved and (
+                        (it.is_combo and not it.is_lotto_combo) if is_combo_target else (it.is_lotto_combo or it.market_type == "lotto_parlay")
+                    )
+                ]
+                if not pool:
+                    return "❌ No active Lotto/Combo found for today."
+                fk_c, it_c = pool[0]
+                legs_cur = list(it_c.combo_legs or [])
+                # Check leg numbers (e.g. "remove lotto leg 7" or "remove lotto legs 1, 5, 8")
+                after_leg_kw = re.sub(r"^.*?(?:leg|legs|lotto|combo)\s*", "", low)
+                leg_nums = {int(x) for x in re.findall(r"\b(\d{1,2})\b", after_leg_kw) if 1 <= int(x) <= len(legs_cur)}
+                removed_labels: List[str] = []
+                kept_legs: List[Dict[str, Any]] = []
+
+                if leg_nums:
+                    for idx_l, lg in enumerate(legs_cur, 1):
+                        if idx_l in leg_nums:
+                            removed_labels.append(f"#{idx_l} {lg.get('home')} vs {lg.get('away')}")
+                        else:
+                            kept_legs.append(lg)
+                else:
+                    # Match by team name keyword (e.g. "remove torreense from lotto")
+                    team_q = re.sub(r"\b(remove|drop|delete|from|the|lotto|combo|leg|legs|duplicate)\b", " ", low)
+                    team_q = re.sub(r"\s+", " ", team_q).strip()
+                    for idx_l, lg in enumerate(legs_cur, 1):
+                        lh_n = normalize_team_str(str(lg.get("home", "")))
+                        la_n = normalize_team_str(str(lg.get("away", "")))
+                        if team_q and len(team_q) >= 3 and (team_q in lh_n or team_q in la_n or teams_match(team_q, lh_n) or teams_match(team_q, la_n)):
+                            removed_labels.append(f"#{idx_l} {lg.get('home')} vs {lg.get('away')}")
+                        else:
+                            kept_legs.append(lg)
+
+                if not removed_labels or not kept_legs:
+                    return "❌ Specify valid leg number(s) or team name to remove (e.g. ⟦CODE⟧/fix remove lotto leg 7⟦/CODE⟧ or ⟦CODE⟧remove torreense from lotto⟦/CODE⟧)."
+
+                prod_new = 1.0
+                for kl in kept_legs:
+                    prod_new *= float(kl.get("odds", 1.25))
+                it_c.combo_legs = kept_legs
+                it_c.odds = round(prod_new, 2)
+                if not is_combo_target:
+                    it_c.team_away = f"({len(kept_legs)} Logical Cushions)"
+                    it_c.confidence_stars = f"🚀 {len(kept_legs)}-LEG MEGA CUSHION ({it_c.odds:.1f}x)"
+                    it_c.selection = f"{len(kept_legs)}-Leg Logical Safe-Cushion Mega List ({it_c.odds:.2f}x)"
+                else:
+                    it_c.selection = " + ".join(f"{lg['home']} vs {lg['away']} ({lg['selection']})" for lg in kept_legs)
+                DailyLedgerManager.save_all_items(all_items)
+                mid_c = cls._ensure_message_id_for_item(it_c)
+                updated_card = BetSlipCardFormatter.format_open_bet_card(it_c)
+                if mid_c > 1:
+                    bot_client.edit_message(PUBLISH_CHANNEL_ID, mid_c, updated_card)
+                    DailyLedgerManager.save_all_items(all_items)
+                return f"✅ Removed {', '.join(removed_labels)} and updated ⟦CODE⟧@Footybett⟦/CODE⟧ live ({len(kept_legs)} legs • {it_c.odds:.2f}x)!\n\n{updated_card}"
+
+            # ── ACTION 4: Update Direct BC.Game URL (`... link https://bc.game/...`) Across Single + Combo + Lotto! ──
+            m_url = re.search(r"(https://bc\.game/sports/soccer/\S+)", clean_cmd, re.IGNORECASE)
+            if m_url:
+                new_bc_url = m_url.group(1).rstrip(").,")
+                edited_posts_cnt = 0
+                matched_names = ""
+
+                # Check if user targeted a specific Lotto/Combo leg number first (`lotto leg 1 link https://...`)
+                m_lleg = re.search(r"(lotto|combo)\s+leg\s*#?(\d{1,2})", low)
+                if m_lleg:
+                    is_cmb = m_lleg.group(1) == "combo"
+                    leg_idx_u = int(m_lleg.group(2))
+                    c_pool = [
+                        it for it in all_items.values()
+                        if it.date_str == active_d and it.is_approved and (
+                            (it.is_combo and not it.is_lotto_combo) if is_cmb else (it.is_lotto_combo or it.market_type == "lotto_parlay")
+                        )
+                    ]
+                    if c_pool and c_pool[0].combo_legs and 1 <= leg_idx_u <= len(c_pool[0].combo_legs):
+                        tgt_leg = c_pool[0].combo_legs[leg_idx_u - 1]
+                        tgt_leg["bcgame_url"] = new_bc_url
+                        BCGameDirectLinkResolver.record_discovered_match_url(str(tgt_leg.get("home", "")), str(tgt_leg.get("away", "")), new_bc_url)
+                        matched_names = f"{tgt_leg.get('home')} vs {tgt_leg.get('away')}"
+
+                if not matched_names:
+                    found_s = cls._find_target_single(clean_cmd, all_items, active_d)
+                    if not found_s and bound_fk and bound_fk in all_items:
+                        found_s = (1, bound_fk, all_items[bound_fk])
+                    if found_s:
+                        _, _, s_it = found_s
+                        s_it.search_url = new_bc_url
+                        BCGameDirectLinkResolver.record_discovered_match_url(s_it.team_home, s_it.team_away, new_bc_url)
+                        matched_names = f"{s_it.team_home} vs {s_it.team_away}"
+
+                # Propagate that match's URL across ALL today's Singles, Combo legs, and Lotto legs!
+                ordered_singles = cls._get_today_ordered_singles(all_items, active_d)
+                single_num_map = {fk: idx for idx, fk, _ in ordered_singles}
+                for fk_u, it_u in all_items.items():
+                    if it_u.date_str != active_d or not it_u.is_approved:
+                        continue
+                    touched = False
+                    if not it_u.is_combo:
+                        if it_u.search_url == new_bc_url or (matched_names and teams_match(it_u.team_home, matched_names)):
+                            it_u.search_url = new_bc_url
+                            touched = True
+                    elif it_u.combo_legs:
+                        for lg_u in it_u.combo_legs:
+                            if lg_u.get("bcgame_url") == new_bc_url or (
+                                matched_names and teams_match(str(lg_u.get("home", "")), matched_names) and teams_match(str(lg_u.get("away", "")), matched_names)
+                            ):
+                                lg_u["bcgame_url"] = new_bc_url
+                                touched = True
+                    if touched:
+                        mid_u = cls._ensure_message_id_for_item(it_u)
+                        if mid_u > 1:
+                            p_n = single_num_map.get(fk_u)
+                            bot_client.edit_message(PUBLISH_CHANNEL_ID, mid_u, BetSlipCardFormatter.format_open_bet_card(it_u, pick_number=p_n))
+                            edited_posts_cnt += 1
+
+                DailyLedgerManager.save_all_items(all_items)
+                if edited_posts_cnt > 0:
+                    return f"✅ Updated direct BC.Game link for ⟦CODE⟧{matched_names or 'match'}⟦/CODE⟧ across {edited_posts_cnt} live post(s) on ⟦CODE⟧@Footybett⟦/CODE⟧!"
+                return "✅ Saved BC.Game link to cache (specify e.g. ⟦CODE⟧/fix single 4 link https://bc.game/...⟦/CODE⟧ to bind to a specific pick)."
+
+            # ── ACTION 5: Update Lotto or Safe Combo Leg Odds (`lotto leg 3 odds 1.29` / `combo leg 1 odds 1.31`) ──
+            m_leg_od = re.search(r"(lotto|combo)\s+leg\s*#?(\d{1,2})\s+(?:odds?|@|to)\s*(\d+\.\d+)", low)
+            if m_leg_od:
+                is_cmb = m_leg_od.group(1) == "combo"
+                l_idx = int(m_leg_od.group(2))
+                new_od = round(float(m_leg_od.group(3)), 2)
+                c_pool = [
+                    it for it in all_items.values()
+                    if it.date_str == active_d and it.is_approved and (
+                        (it.is_combo and not it.is_lotto_combo) if is_cmb else (it.is_lotto_combo or it.market_type == "lotto_parlay")
+                    )
+                ]
+                if not c_pool or not c_pool[0].combo_legs or not (1 <= l_idx <= len(c_pool[0].combo_legs)):
+                    return "❌ Invalid leg number."
+                it_c = c_pool[0]
+                it_c.combo_legs[l_idx - 1]["odds"] = new_od
+                prod_c = 1.0
+                for lg in it_c.combo_legs:
+                    prod_c *= float(lg.get("odds", 1.25))
+                it_c.odds = round(prod_c, 2)
+                if not is_cmb:
+                    it_c.confidence_stars = f"🚀 {len(it_c.combo_legs)}-LEG MEGA CUSHION ({it_c.odds:.1f}x)"
+                    it_c.selection = f"{len(it_c.combo_legs)}-Leg Logical Safe-Cushion Mega List ({it_c.odds:.2f}x)"
+                DailyLedgerManager.save_all_items(all_items)
+                mid_c = cls._ensure_message_id_for_item(it_c)
+                card_c = BetSlipCardFormatter.format_open_bet_card(it_c)
+                if mid_c > 1:
+                    bot_client.edit_message(PUBLISH_CHANNEL_ID, mid_c, card_c)
+                return f"✅ Updated {m_leg_od.group(1).title()} Leg #{l_idx} odds to ⟦CODE⟧{new_od:.2f}⟦/CODE⟧ (New Total: ⟦CODE⟧{it_c.odds:.2f}x⟦/CODE⟧) on ⟦CODE⟧@Footybett⟦/CODE⟧!"
+
+            # ── ACTION 6: Manual Settlement Override (`settle single 1 won|push|lost`) ──
+            m_settle = re.search(r"^(?:settle|grade)\s+(.+?)\s+(won|win|push|refund|lost|loss)\b", low)
+            if m_settle:
+                target_q, outcome_w = m_settle.group(1), m_settle.group(2)
+                found_s = cls._find_target_single(target_q, all_items, active_d)
+                if not found_s:
+                    return "❌ Could not match that Single to settle."
+                _, fk_s, it_s = found_s
+                if outcome_w in ("won", "win"):
+                    it_s.settlement = "WON ✅"
+                    it_s.settled_odds = it_s.odds
+                elif outcome_w in ("push", "refund"):
+                    it_s.settlement = "PUSH ➖"
+                    it_s.settled_odds = 1.00
+                else:
+                    it_s.settlement = "LOST ❌"
+                it_s.match_status = "FT"
+                DailyLedgerManager.save_all_items(all_items)
+                close_card = BetSlipCardFormatter.format_closed_bet_card(it_s, up_to_date=it_s.date_str)
+                if getattr(it_s, "result_message_id", None):
+                    bot_client.edit_message(PUBLISH_CHANNEL_ID, int(it_s.result_message_id), close_card)
+                else:
+                    rmid = bot_client.send_message(PUBLISH_CHANNEL_ID, close_card, remove_kb=False, reply_to_message_id=getattr(it_s, "channel_message_id", None))
+                    if rmid and rmid > 1:
+                        it_s.result_message_id = rmid
+                        it_s.published_result_to_channel = True
+                        DailyLedgerManager.save_all_items(all_items)
+                eod_map = load_json_dict(EOD_MESSAGE_IDS_FILE)
+                if int(eod_map.get(it_s.date_str) or 0) > 1:
+                    bot_client.edit_message(PUBLISH_CHANNEL_ID, int(eod_map[it_s.date_str]), BetSlipCardFormatter.format_end_of_day_channel_recap(it_s.date_str))
+                return f"✅ Settled ⟦CODE⟧{it_s.team_home} vs {it_s.team_away}⟦/CODE⟧ as {it_s.settlement} and synced ⟦CODE⟧@Footybett⟦/CODE⟧!"
+
+            # ── ACTION 7: Edit a Single's Selection, Safe Alt, Match Note, or Odds! ──
+            found_single = cls._find_target_single(clean_cmd, all_items, active_d)
+            if not found_single and bound_fk and bound_fk in all_items and not all_items[bound_fk].is_combo:
+                ord_s = cls._get_today_ordered_singles(all_items, active_d)
+                p_idx = next((i for i, k, _ in ord_s if k == bound_fk), 1)
+                found_single = (p_idx, bound_fk, all_items[bound_fk])
+
+            if found_single:
+                p_idx, fk_s, it_s = found_single
+                updated_desc = ""
+
+                # 7a. Safe Alt update (`safealt ...` or `safe alt ...`)
+                m_sa = re.search(r"safe\s*alt\s*(?:to|:|=)?\s*(.+)$", clean_cmd, re.IGNORECASE)
+                # 7b. Note / Match Read update (`note ...` or `read ...`)
+                m_nt = re.search(r"(?:note|match\s*read|rationale)\s*(?:to|:|=)?\s*(.+)$", clean_cmd, re.IGNORECASE)
+                # 7c. Selection update (`selection ...`)
+                m_sel = re.search(r"(?:selection|market|pick\s+to)\s*(?:to|:|=)?\s*(.+)$", clean_cmd, re.IGNORECASE)
+
+                if m_sa:
+                    raw_sa = m_sa.group(1).strip()
+                    m_od_sa = re.search(r"@\s*(\d+\.\d+)", raw_sa)
+                    if m_od_sa and "(@" not in raw_sa:
+                        od_v_sa = float(m_od_sa.group(1))
+                        raw_sa = re.sub(r"\s*@\s*\d+\.\d+", f" (@ {od_v_sa:.2f})", raw_sa)
+                    it_s.alt_bcgame_line = raw_sa
+                    updated_desc = f"Safe Alt ➔ {it_s.alt_bcgame_line}"
+                elif m_nt:
+                    it_s.rationale = m_nt.group(1).strip()
+                    updated_desc = f"Match Read ➔ {it_s.rationale}"
+                elif m_sel:
+                    raw_sel = m_sel.group(1).strip()
+                    m_od_in = re.search(r"@\s*(\d+\.\d+)", raw_sel)
+                    if m_od_in:
+                        it_s.odds = round(float(m_od_in.group(1)), 2)
+                        raw_sel = re.sub(r"\s*\(?@\s*\d+\.\d+\)?", "", raw_sel).strip()
+                    it_s.selection = raw_sel
+                    sl_low = raw_sel.lower()
+                    if "over" in sl_low or "under" in sl_low:
+                        it_s.market_type = "corners_over_under" if "corner" in sl_low else "goals_over_under"
+                        m_ln = re.search(r"(\d+\.\d+|\d+)", sl_low)
+                        it_s.line = float(m_ln.group(1)) if m_ln else it_s.line
+                    elif "both teams" in sl_low or "btts" in sl_low:
+                        it_s.market_type = "btts"
+                        it_s.line = None
+                    elif "draw no bet" in sl_low:
+                        it_s.market_type = "dnb"
+                        it_s.line = None
+                    elif "handicap" in sl_low:
+                        it_s.market_type = "handicap"
+                    else:
+                        it_s.market_type = "1x2"
+                        it_s.line = None
+                    it_s.alt_bcgame_line = BankrollStakeSizer.build_guaranteed_safe_alt_line(
+                        it_s.selection, it_s.market_type, it_s.team_home, it_s.team_away, None, it_s.odds
+                    )
+                    updated_desc = f"Selection ➔ {it_s.selection} (@ {it_s.odds:.2f})"
+                else:
+                    m_od_only = re.search(r"(?:odds?\s*(?:to|=|:)?|@)\s*(\d+\.\d+)|\b(\d\.\d{2})\b$", clean_cmd, re.IGNORECASE)
+                    if m_od_only:
+                        it_s.odds = round(float(m_od_only.group(1) or m_od_only.group(2)), 2)
+                        updated_desc = f"Odds ➔ @ {it_s.odds:.2f}"
+
+                if updated_desc:
+                    DailyLedgerManager.save_all_items(all_items)
+                    mid_s = cls._ensure_message_id_for_item(it_s)
+                    new_card_s = BetSlipCardFormatter.format_open_bet_card(it_s, pick_number=p_idx)
+                    if mid_s > 1:
+                        bot_client.edit_message(PUBLISH_CHANNEL_ID, mid_s, new_card_s)
+                        DailyLedgerManager.save_all_items(all_items)
+                    return f"✅ Updated Single #{p_idx} (⟦CODE⟧{it_s.team_home} vs {it_s.team_away}⟦/CODE⟧): {updated_desc} on ⟦CODE⟧@Footybett⟦/CODE⟧!\n\n{new_card_s}"
+
+            return "ℹ️ I didn't catch that exact edit format. Here are the live controls:\n\n" + cls.format_admin_dashboard()
+
+
 class TelegramBotClient:
     REMOVE_BOTTOM_KEYBOARD = {"remove_keyboard": True}
 
@@ -8226,8 +8776,30 @@ class TelegramBotClient:
         self.bot_token = bot_token.strip()
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
         self.channel_publish_lock = threading.Lock()
+        self._admin_cache: Dict[int, Tuple[bool, float]] = {}
         DailyLedgerManager.load_all_history_items()
         SelfLearningEngine.recalibrate_from_ledger()
+
+    def is_channel_admin(self, user_id: Optional[int]) -> bool:
+        """Verifies via Telegram `getChatMember` that `user_id` is Creator/Administrator of `@Footybett` (zero config!)."""
+        if not user_id or int(user_id) <= 0:
+            return False
+        uid = int(user_id)
+        env_admins = {int(x.strip()) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip().isdigit()}
+        if uid in env_admins:
+            return True
+        now_t = time.time()
+        if uid in self._admin_cache and (now_t - self._admin_cache[uid][1]) < 900:
+            return self._admin_cache[uid][0]
+        ok, body, _ = self._call_telegram_json(
+            "getChatMember",
+            {"chat_id": PUBLISH_CHANNEL_ID, "user_id": uid},
+            timeout=6
+        )
+        status = str(body.get("result", {}).get("status", "")).lower() if ok else ""
+        is_adm = status in ("creator", "administrator")
+        self._admin_cache[uid] = (is_adm, now_t)
+        return is_adm
 
     def _call_telegram_json(self, endpoint: str, payload_data: Dict[str, Any], timeout: int = 12) -> Tuple[bool, Dict[str, Any], str]:
         url = f"{self.base_url}/{endpoint}"
@@ -8291,7 +8863,8 @@ class TelegramBotClient:
             if leg_btns:
                 rows.append(leg_btns)
         elif "🚀 OPTIONAL $5 MEGA SAFE-LIST LOTTO" in up:
-            first_u = bc_links[0][0] if bc_links else BCGAME_SOCCER_HUB_URL
+            exact_first = next((u_l for u_l, _ in bc_links if re.search(r"-\d{17,21}/?$", u_l)), "")
+            first_u = exact_first or (bc_links[0][0] if bc_links else BCGAME_SOCCER_HUB_URL)
             rows.append([{"text": "⚽ Open BC.Game Football Board ↗", "url": first_u}])
 
         return {"inline_keyboard": rows}
@@ -8499,7 +9072,7 @@ class TelegramBotClient:
                         it_h.loss_autopsy = ""
                         it_h.failure_mode = ""
 
-            if (not auto_startup) or (not DailyLedgerManager.is_locked_in_channel(f"v40_2_live_board_recalibrated:{active_d_now}")):
+            if (not auto_startup) or (not DailyLedgerManager.is_locked_in_channel(f"v41_0_live_board_recalibrated:{active_d_now}")):
                 ExternalAnalyticsCollector.scrape_bcgame_official_portal()
                 today_fxs = LiveSportsbookAndStatsAPI.fetch_mens_fixtures_with_odds(active_d_now)
                 fx_lookup = {f"{normalize_team_str(x['home'])}_vs_{normalize_team_str(x['away'])}": x for x in today_fxs}
@@ -8614,12 +9187,17 @@ class TelegramBotClient:
                                         lg_l["odds"] = t_od_l["over_15"]
                                 prod_l *= float(lg_l.get("odds", 1.25))
                                 cleaned_l_legs.append(lg_l)
-                            it_v.combo_legs = cleaned_l_legs
-                            it_v.odds = round(prod_l, 2)
-                            it_v.selection = f"{len(cleaned_l_legs)}-Leg Logical Safe-Cushion Mega List ({it_v.odds:.2f}x)"
+                            dedup_legs, dedup_prod = SafeCushionBetCreator.clean_and_deduplicate_lotto_legs(
+                                cleaned_l_legs, min_leg_odds=1.18, prefer_exact_urls=True
+                            )
+                            it_v.combo_legs = dedup_legs
+                            it_v.odds = dedup_prod
+                            it_v.team_away = f"({len(dedup_legs)} Logical Cushions)"
+                            it_v.confidence_stars = f"🚀 {len(dedup_legs)}-LEG MEGA CUSHION ({it_v.odds:.1f}x)"
+                            it_v.selection = f"{len(dedup_legs)}-Leg Logical Safe-Cushion Mega List ({it_v.odds:.2f}x)"
 
                 DailyLedgerManager.save_all_items(all_items)
-                DailyLedgerManager.mark_locked_in_channel(f"v40_2_live_board_recalibrated:{active_d_now}")
+                DailyLedgerManager.mark_locked_in_channel(f"v41_0_live_board_recalibrated:{active_d_now}")
             eod_map = load_json_dict(EOD_MESSAGE_IDS_FILE)
             handle = ChannelHistoryCleaner.extract_channel_handle(PUBLISH_CHANNEL_ID)
             posts = ChannelHistoryCleaner.fetch_all_channel_posts(PUBLISH_CHANNEL_ID)
@@ -8635,6 +9213,7 @@ class TelegramBotClient:
                 if not it.is_combo and not it.is_lotto_combo:
                     by_date_singles.setdefault(it.date_str, []).append(it)
             for d_s, s_list in by_date_singles.items():
+                s_list.sort(key=lambda x: (int(getattr(x, "channel_message_id", 0) or 999999999), x.bet_key))
                 for idx_s, s_it in enumerate(s_list, 1):
                     day_single_numbers[f"{s_it.date_str}:{s_it.bet_key}"] = idx_s
 
@@ -8788,7 +9367,7 @@ class TelegramBotClient:
 
             DailyLedgerManager.save_all_items(all_items)
             save_json_dict(EOD_MESSAGE_IDS_FILE, eod_map)
-            DailyLedgerManager.mark_locked_in_channel("channel_clean_v40_2_auto_done")
+            DailyLedgerManager.mark_locked_in_channel("channel_clean_v41_0_auto_done")
 
             won_all, lost_all, wr_all, net_all_r = BetSlipCardFormatter.get_totals_summary_tuple()
             r_usd = BankrollStakeSizer.get_unit_usd()
@@ -8798,11 +9377,11 @@ class TelegramBotClient:
                 dup_note = f"\nℹ️ Older >48h duplicates (Telegram requires 1 manual tap by owner to delete): {links}"
 
             report = (
-                "🧹 @Footybett CHANNEL CLEANUP & HISTORY UPGRADE COMPLETE (v40.2)\n"
+                "🧹 @Footybett CHANNEL CLEANUP & HISTORY UPGRADE COMPLETE (v41.0)\n"
                 "────────────────────────\n"
                 f"• Scanned Channel Posts : {len(posts)} messages\n"
                 f"• Deleted Duplicates    : {deleted_cnt} message(s)\n"
-                f"• Rewritten & Upgraded  : {edited_cnt} post(s) updated to v40.2 Verified-Existence BC.Game Odds & Direct Match Links\n"
+                f"• Rewritten & Upgraded  : {edited_cnt} post(s) updated to v41.0 Verified-Existence BC.Game Odds & Direct Match Links\n"
                 f"• Already Clean         : {unchanged_cnt} post(s)\n"
                 "• Pinned Partner Guide  : Active 📌\n"
                 f"• Channel & Bot Bio     : {bio_status}\n"
@@ -8960,9 +9539,9 @@ class TelegramBotClient:
     def background_worker_loop(self):
         logger.info("Footybett v37.0 Weighted Sharp-Consensus & Auto-Cleaner & Deep Match-Autopsy Worker started...")
         time.sleep(3)
-        if not DailyLedgerManager.is_locked_in_channel("channel_clean_v40_2_auto_done"):
+        if not DailyLedgerManager.is_locked_in_channel("channel_clean_v41_0_auto_done"):
             try:
-                logger.info("Running automatic one-time v40.2 @Footybett Lotto-sync & rate-limit-safe verified BC.Game markets, live odds, exact links & button cleanup & Partner-Button Removal & Safe Alt backfill & history upgrade...")
+                logger.info("Running automatic one-time v41.0 @Footybett Lotto-dedup, Live Admin Editor & rate-limit-safe verified BC.Game markets, live odds, exact links & button cleanup & Partner-Button Removal & Safe Alt backfill & history upgrade...")
                 self.clean_and_upgrade_channel_history(auto_startup=True)
             except Exception as ce:
                 logger.error("Auto channel cleanup error: %s", ce)
@@ -8976,6 +9555,7 @@ class TelegramBotClient:
     def set_official_menu_commands(self):
         commands = [
             {"command": "scan", "description": "🎯 Today's Official 1R Singles & Optional Combos"},
+            {"command": "fix", "description": "✏️ Edit Live @Footybett Posts, Odds, Links & Lotto"},
             {"command": "clean", "description": "🧹 Clean Duplicates & Upgrade @Footybett History"},
             {"command": "results", "description": "🏁 Refresh Live Scores & Outcomes"},
             {"command": "learn", "description": "📋 View Post-Match Tactical Reviews"},
@@ -9011,8 +9591,22 @@ class TelegramBotClient:
                 offset = upd["update_id"] + 1
                 msg = upd.get("message") or upd.get("channel_post") or {}
                 chat_id = msg.get("chat", {}).get("id")
+                from_user_id = (msg.get("from") or {}).get("id") or (chat_id if isinstance(chat_id, int) and chat_id > 0 else 0)
                 text = (msg.get("text", "") or msg.get("caption", "")).strip()
                 photos = msg.get("photo", [])
+
+                # Detect forwarded `@Footybett` post message_id (either directly forwarded or replied-to forward!)
+                fwd_mid = 0
+                for cand_m in (msg, msg.get("reply_to_message") or {}):
+                    if not isinstance(cand_m, dict):
+                        continue
+                    fo = cand_m.get("forward_origin") or {}
+                    if isinstance(fo, dict) and fo.get("message_id"):
+                        fwd_mid = int(fo["message_id"])
+                        break
+                    if cand_m.get("forward_from_message_id"):
+                        fwd_mid = int(cand_m["forward_from_message_id"])
+                        break
 
                 if not chat_id:
                     continue
@@ -9039,6 +9633,33 @@ class TelegramBotClient:
                     continue
 
                 low_t = text.lower()
+
+                # 1a. Handle Live In-Bot Channel Admin Edits (`/fix`, `/edit`, `/admin`, forwarded @Footybett post, or plain-English edit!)
+                if isinstance(chat_id, int) and chat_id > 0 and (
+                    fwd_mid > 1 or LiveChannelAdminEditor.looks_like_admin_edit_command(text, has_forwarded_channel_post=(fwd_mid > 1))
+                ):
+                    if self.is_channel_admin(from_user_id):
+                        # If admin just forwarded a channel post with no instruction yet, bind it and prompt what to change!
+                        if fwd_mid > 1 and not LiveChannelAdminEditor.looks_like_admin_edit_command(text, has_forwarded_channel_post=False) and ("🟢 SINGLE" in text or "🎟️ OPTIONAL" in text or "🚀 OPTIONAL" in text):
+                            LiveChannelAdminEditor.execute_admin_instruction(self, "status", user_id=from_user_id, forwarded_msg_id=fwd_mid)
+                            self.send_message(
+                                chat_id,
+                                f"📌 Locked onto forwarded ⟦CODE⟧@Footybett⟦/CODE⟧ post (msg {fwd_mid})!\n"
+                                "Reply with what to change — e.g.:\n"
+                                "• ⟦CODE⟧odds 1.72⟦/CODE⟧\n"
+                                "• ⟦CODE⟧link https://bc.game/sports/soccer/...⟦/CODE⟧\n"
+                                "• ⟦CODE⟧selection Main Tab ➔ Total ➔ Over 2.5 @ 1.74⟦/CODE⟧\n"
+                                "• ⟦CODE⟧remove lotto leg 7⟦/CODE⟧ or ⟦CODE⟧delete⟦/CODE⟧"
+                            )
+                            continue
+                        def handle_live_fix(cid, raw_i, uid_i, fmid_i):
+                            reply_txt = LiveChannelAdminEditor.execute_admin_instruction(self, raw_i, user_id=uid_i, forwarded_msg_id=fmid_i)
+                            self.send_message(cid, reply_txt)
+                        threading.Thread(target=handle_live_fix, args=[chat_id, text, from_user_id, fwd_mid], daemon=True).start()
+                        continue
+                    elif low_t.startswith(("/fix", "/edit", "/admin")):
+                        self.send_message(chat_id, "🔒 Live channel editing is restricted to verified @Footybett administrators.")
+                        continue
 
                 # 1b. Handle /clean (Full Channel Deduplication & History Upgrade)
                 if low_t in ["/clean", "/cleanchannel", "/fixhistory"]:
