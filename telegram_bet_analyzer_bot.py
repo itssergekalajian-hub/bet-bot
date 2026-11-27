@@ -81,14 +81,22 @@ BCGAME_LEAGUE_BOARD_URLS: Dict[str, str] = {
     "uefa.champions": "https://bc.game/sports/soccer/international/uefa-champions-league-2470546796305330203",
     "ned.1": "https://bc.game/sports/soccer/netherlands/eredivisie",
     "por.1": "https://bc.game/sports/soccer/portugal/primeira-liga",
-    "tur.1": "https://bc.game/sports/soccer/turkey/super-lig",
+    "tur.1": "https://bc.game/sports/soccer/turkiye/super-lig",
+    "usa.1": "https://bc.game/sports/soccer/usa/mls",
+    "mex.1": "https://bc.game/sports/soccer/mexico/liga-mx",
     "bra.1": "https://bc.game/sports/soccer/brazil/brasileiro-serie-a",
     "arg.1": "https://bc.game/sports/soccer/argentina/liga-profesional",
     "eng.2": "https://bc.game/sports/soccer/england/championship",
     "esp.2": "https://bc.game/sports/soccer/spain/laliga-2",
     "ita.2": "https://bc.game/sports/soccer/italy/serie-b",
     "ger.2": "https://bc.game/sports/soccer/germany/2-bundesliga",
+    "fra.2": "https://bc.game/sports/soccer/france/ligue-2",
     "bel.1": "https://bc.game/sports/soccer/belgium/pro-league",
+    "sco.1": "https://bc.game/sports/soccer/scotland/premiership",
+    "aut.1": "https://bc.game/sports/soccer/austria/bundesliga",
+    "sui.1": "https://bc.game/sports/soccer/switzerland/super-league",
+    "gre.1": "https://bc.game/sports/soccer/greece/super-league",
+    "den.1": "https://bc.game/sports/soccer/denmark/superliga",
     "uefa.europa": "https://bc.game/sports/soccer/international/uefa-europa-league",
     "uefa.europa.conf": "https://bc.game/sports/soccer/international/uefa-conference-league",
 }
@@ -999,7 +1007,14 @@ class BCGameLivePlaywrightEngine:
         return out
 
     @classmethod
-    def _ingest_sptpub_json(cls, data: Any, default_cat: str = "", default_trn: str = "") -> List[Tuple[str, str, str]]:
+    def _ingest_sptpub_json(
+        cls,
+        data: Any,
+        default_cat: str = "",
+        default_trn: str = "",
+        target_home: str = "",
+        target_away: str = ""
+    ) -> List[Tuple[str, str, str]]:
         """
         Walks Betby `*.sptpub.com` REST & WebSocket JSON payloads — supporting:
           1. Nested event objects (`{"id": "273...", "competitors": [...]}`)
@@ -1094,9 +1109,16 @@ class BCGameLivePlaywrightEngine:
                 if cid_ref in cat_map:
                     cat_slug = cat_map[cid_ref]
 
-            if not cat_slug and default_cat:
+            is_target_pair = bool(
+                target_home and target_away
+                and (
+                    (teams_match(h_name, target_home) and teams_match(a_name, target_away))
+                    or (teams_match(h_name, target_away) and teams_match(a_name, target_home))
+                )
+            )
+            if not cat_slug and default_cat and (is_target_pair or not target_home):
                 cat_slug = default_cat
-            if not trn_slug and default_trn:
+            if not trn_slug and default_trn and (is_target_pair or not target_home):
                 trn_slug = default_trn
 
             ev_slug = _clean_slug_non_numeric(desc.get("slug") or raw_obj.get("slug") or "") or cls._slugify_part(f"{h_name}-{a_name}")
@@ -1368,12 +1390,14 @@ class BCGameLivePlaywrightEngine:
                     )
                     page = context.new_page()
                     raw_urls_seen: List[str] = []
-                    active_board_slugs = {"cat": "", "trn": ""}
+                    active_board_slugs = {"cat": "", "trn": "", "th": "", "ta": ""}
                     recent_clicked_event_ids: List[str] = []
 
-                    def _set_board_slugs_from_url(b_u: str) -> None:
+                    def _set_board_slugs_from_url(b_u: str, th: str = "", ta: str = "") -> None:
                         active_board_slugs["cat"] = ""
                         active_board_slugs["trn"] = ""
+                        active_board_slugs["th"] = th
+                        active_board_slugs["ta"] = ta
                         m_b = re.search(r"/sports/soccer/([a-z0-9\-]+)/([a-z0-9\-]+?)(?:-\d{15,21})?/?$", str(b_u or ""))
                         if m_b:
                             active_board_slugs["cat"] = m_b.group(1)
@@ -1415,7 +1439,9 @@ class BCGameLivePlaywrightEngine:
                                     cls._ingest_sptpub_json(
                                         resp.json(),
                                         default_cat=active_board_slugs["cat"],
-                                        default_trn=active_board_slugs["trn"]
+                                        default_trn=active_board_slugs["trn"],
+                                        target_home=active_board_slugs["th"],
+                                        target_away=active_board_slugs["ta"]
                                     )
                         except Exception:
                             pass
@@ -1436,7 +1462,9 @@ class BCGameLivePlaywrightEngine:
                                                 cls._ingest_sptpub_json(
                                                     json.loads(txt_p[s_idx:]),
                                                     default_cat=active_board_slugs["cat"],
-                                                    default_trn=active_board_slugs["trn"]
+                                                    default_trn=active_board_slugs["trn"],
+                                                    target_home=active_board_slugs["th"],
+                                                    target_away=active_board_slugs["ta"]
                                                 )
                                                 break
                                             except Exception:
@@ -1607,7 +1635,7 @@ class BCGameLivePlaywrightEngine:
                         a_bc = to_bcgame_team_name(a_raw)
                         mk = f"{normalize_team_str(h_bc)}_vs_{normalize_team_str(a_bc)}"
                         board_u = BCGameDirectLinkResolver.resolve_league_board_url(lg_ctx)
-                        _set_board_slugs_from_url(board_u)
+                        _set_board_slugs_from_url(board_u, h_bc, a_bc)
 
                         cached_u = BCGameDirectLinkResolver.get_cached_exact_url(h_bc, a_bc)
                         has_live_o = bool(cls.get_live_match_odds(h_bc, a_bc))
@@ -1638,7 +1666,7 @@ class BCGameLivePlaywrightEngine:
                         # Fallback: Real Betby Shadow-DOM Search inside `https://bc.game/sports/soccer-1` (only for Tier-1 matches or first 6)
                         if (not cached_u and not on_match_page) and (fetch_screen_odds or idx_m < 6):
                             try:
-                                _set_board_slugs_from_url(board_u)
+                                _set_board_slugs_from_url(board_u, h_bc, a_bc)
                                 page.goto(BCGAME_SOCCER_HUB_URL, wait_until="domcontentloaded", timeout=14000)
                                 _wait_betby_ready(7500)
                                 search_q = cls.get_team_alias_tokens(h_bc)[-1] if len(h_bc) > 14 else h_bc
@@ -1816,6 +1844,18 @@ class BCGameDirectLinkResolver:
             return BCGAME_LEAGUE_BOARD_URLS["esp.2"]
         if "serie b" in raw and "italy" in raw:
             return BCGAME_LEAGUE_BOARD_URLS["ita.2"]
+        if "mls" in raw or "major league soccer" in raw or "usa -" in raw:
+            return BCGAME_LEAGUE_BOARD_URLS["usa.1"]
+        if "pro league" in raw or "belgium" in raw or "jupiler" in raw:
+            return BCGAME_LEAGUE_BOARD_URLS["bel.1"]
+        if "ligue 2" in raw:
+            return BCGAME_LEAGUE_BOARD_URLS["fra.2"]
+        if "2. bundesliga" in raw or "2 bundesliga" in raw:
+            return BCGAME_LEAGUE_BOARD_URLS["ger.2"]
+        if "liga mx" in raw or "mexico" in raw:
+            return BCGAME_LEAGUE_BOARD_URLS["mex.1"]
+        if "scotland" in raw or "scottish premiership" in raw:
+            return BCGAME_LEAGUE_BOARD_URLS["sco.1"]
         return BCGAME_SOCCER_HUB_URL
 
     @classmethod
@@ -2043,6 +2083,10 @@ class LedgerBetItem:
     settled_odds: float = 0.0
     settled_note: str = ""
     match_stats_summary: str = ""
+    event_id: str = ""
+    kickoff_epoch: float = 0.0
+    published_at_epoch: float = 0.0
+    manual_settled: bool = False
 
 
 class BankrollStakeSizer:
@@ -2924,6 +2968,7 @@ class LiveSportsbookAndStatsAPI:
                         m_key = f"{normalize_team_str(parsed['home'])}_vs_{normalize_team_str(parsed['away'])}"
                         if m_key not in seen_match_keys:
                             seen_match_keys.add(m_key)
+                            parsed["board_query_date"] = date_str
                             results.append(parsed)
             except Exception:
                 pass
@@ -3084,6 +3129,152 @@ class LiveSportsbookAndStatsAPI:
         is_ft = ("FT" in up or "FINAL" in up or "AET" in up or "PEN" in up) and ("LIVE" not in up)
         return gh, ga, is_ft
 
+    @staticmethod
+    def _parse_utc_epoch_from_kickoff_text(date_str: str, kickoff_str: str) -> float:
+        """
+        Parses exact UTC epoch from `kickoff_str` (e.g. `'03:00 Local (01:00 UTC) (In 11h 40m)'` or `'Sat 03:00'`)
+        paired with `date_str` (`'2026-11-27'`).
+        If UTC hour is `00:00-05:59` (`02:00-07:59 Local` late-night Americas kickoff on `date_str`'s slate),
+        maps to `date_str + 1 day` (`2026-11-28 01:00 UTC`)!
+        """
+        if not date_str or not kickoff_str:
+            return 0.0
+        try:
+            m_utc = re.search(r"\(\s*(\d{1,2}):(\d{2})\s*UTC\s*\)", str(kickoff_str), re.IGNORECASE)
+            if m_utc:
+                hh_u, mm_u = int(m_utc.group(1)), int(m_utc.group(2))
+                eff_d = shift_date_str(date_str, 1) if hh_u < 6 else date_str
+                dt_u = datetime.datetime.strptime(f"{eff_d} {hh_u:02d}:{mm_u:02d}", "%Y-%m-%d %H:%M").replace(tzinfo=datetime.timezone.utc)
+                return float(dt_u.timestamp())
+            # Fallback for leg `short_kickoff` like `"Sat 03:00"` or `"Fri 21:45"` (Lebanon Local = UTC+2)
+            m_loc = re.search(r"\b([A-Za-z]{3})?\s*(\d{1,2}):(\d{2})\b", str(kickoff_str))
+            if m_loc:
+                wday_lbl = (m_loc.group(1) or "").strip().lower()
+                hh_l, mm_l = int(m_loc.group(2)), int(m_loc.group(3))
+                base_dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+                base_wday = base_dt.strftime("%a").lower()
+                eff_local_d = shift_date_str(date_str, 1) if ((wday_lbl and wday_lbl != base_wday) or hh_l < 8) else date_str
+                dt_loc = datetime.datetime.strptime(f"{eff_local_d} {hh_l:02d}:{mm_l:02d}", "%Y-%m-%d %H:%M") - datetime.timedelta(hours=2)
+                return float(dt_loc.replace(tzinfo=datetime.timezone.utc).timestamp())
+        except Exception:
+            pass
+        return 0.0
+
+    @classmethod
+    def infer_earliest_settle_epoch(cls, item: LedgerBetItem, for_loss: bool = False) -> float:
+        """
+        v41.2 MATHEMATICAL WALL-CLOCK LOCK:
+        Returns the earliest Unix timestamp at which `item` is physically capable of finishing Full Time (`kickoff + 103m`
+        AND `published_at_epoch + 103m`). Makes settling an unstarted or just-posted match 100% impossible!
+        """
+        MIN_MATCH_DURATION_SEC = 103.0 * 60.0
+        pub_floor = (float(getattr(item, "published_at_epoch", 0.0) or 0.0) + MIN_MATCH_DURATION_SEC) if float(getattr(item, "published_at_epoch", 0.0) or 0.0) > 0 else 0.0
+
+        if item.is_combo and item.combo_legs:
+            leg_epochs: List[float] = []
+            lost_leg_epochs: List[float] = []
+            for lg in item.combo_legs:
+                l_ep = float(lg.get("kickoff_epoch", 0.0) or 0.0)
+                if l_ep <= 0:
+                    l_ep = cls._parse_utc_epoch_from_kickoff_text(item.date_str, str(lg.get("short_kickoff", "") or lg.get("kickoff_str", "")))
+                if l_ep > 0:
+                    leg_epochs.append(l_ep)
+                    if "LOST" in str(lg.get("settlement", "")):
+                        lost_leg_epochs.append(l_ep)
+            if for_loss and lost_leg_epochs:
+                return max(pub_floor, min(lost_leg_epochs) + MIN_MATCH_DURATION_SEC)
+            if not for_loss and leg_epochs:
+                return max(pub_floor, max(leg_epochs) + MIN_MATCH_DURATION_SEC)
+            if leg_epochs:
+                return max(pub_floor, min(leg_epochs) + MIN_MATCH_DURATION_SEC)
+            return pub_floor
+
+        ko_ep = float(getattr(item, "kickoff_epoch", 0.0) or 0.0)
+        if ko_ep <= 0:
+            ko_ep = cls._parse_utc_epoch_from_kickoff_text(item.date_str, item.kickoff_str)
+        if ko_ep > 0:
+            return max(pub_floor, ko_ep + MIN_MATCH_DURATION_SEC)
+        return pub_floor
+
+    @classmethod
+    def is_item_physically_allowed_to_settle(cls, item: LedgerBetItem, now_epoch: Optional[float] = None) -> bool:
+        """Returns True ONLY if wall-clock `now_epoch` is past `kickoff + 103m` AND `published_at + 103m` (or `manual_settled`)."""
+        if getattr(item, "manual_settled", False):
+            return True
+        now_t = float(now_epoch if now_epoch is not None else time.time())
+        is_loss_chk = "LOST" in str(item.settlement or "")
+        earliest_ep = cls.infer_earliest_settle_epoch(item, for_loss=is_loss_chk)
+        if earliest_ep > 0 and now_t < earliest_ep:
+            return False
+        return True
+
+    @staticmethod
+    def _is_fixture_in_valid_bet_date_window(em: Dict[str, Any], bet_date_str: str, expected_event_id: str = "") -> bool:
+        """
+        v41.2 IRONCLAD SAME-SLATE FIXTURE WINDOW GUARD:
+        Prevents cross-date repeat-matchup collisions (e.g., MLS Best-of-3 Playoffs or Cup + League rematches
+        like `Columbus Crew vs Inter Miami CF` on `2026-11-27` matching an earlier `3-0 FT` meeting from mid-November!).
+        A fixture `em` is ONLY eligible to grade a bet on `bet_date_str` if:
+          1. If both `expected_event_id` and `em['event_id']` are non-empty, they MUST match identically.
+          2. `em['fixture_date']` (or `em['board_query_date']`) MUST be `bet_date_str` or `bet_date_str + 1 day`
+             (Americas late-night kickoffs `00:00-06:00 UTC` on `bet_date_str + 1`) — NEVER `< bet_date_str`!
+          3. If `em['kickoff_dt']` is present, it MUST fall inside `[bet_date_str 00:00 UTC - 2h, bet_date_str 00:00 UTC + 38h]`.
+        """
+        ev_em = str(em.get("event_id", "") or "").strip()
+        ev_exp = str(expected_event_id or "").strip()
+        if ev_exp and ev_em and ev_exp != ev_em:
+            return False
+
+        next_day_str = shift_date_str(bet_date_str, 1)
+        valid_dates = {bet_date_str, next_day_str}
+        fx_d = str(em.get("fixture_date", "") or "").strip()
+        bq_d = str(em.get("board_query_date", "") or "").strip()
+
+        if fx_d and fx_d not in valid_dates:
+            return False
+        if not fx_d and bq_d and bq_d not in valid_dates:
+            return False
+
+        ko_dt = em.get("kickoff_dt")
+        if isinstance(ko_dt, datetime.datetime):
+            try:
+                day_start_utc = datetime.datetime.strptime(bet_date_str, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
+                delta_hours = (ko_dt - day_start_utc).total_seconds() / 3600.0
+                if delta_hours < -2.0 or delta_hours > 38.0:
+                    return False
+            except Exception:
+                pass
+        return True
+
+    @classmethod
+    def _find_matching_fixture_for_bet(
+        cls,
+        home: str,
+        away: str,
+        bet_date_str: str,
+        all_candidates: List[Dict[str, Any]],
+        expected_event_id: str = ""
+    ) -> Tuple[Optional[Dict[str, Any]], bool]:
+        """Finds the exact same-window fixture for `(home, away)` on `bet_date_str`, prioritizing exact `fixture_date == bet_date_str`."""
+        hits: List[Tuple[int, Dict[str, Any], bool]] = []
+        for em in all_candidates:
+            if not cls._is_fixture_in_valid_bet_date_window(em, bet_date_str, expected_event_id=expected_event_id):
+                continue
+            swapped = False
+            if teams_match(home, em["home"]) and teams_match(away, em["away"]):
+                swapped = False
+            elif teams_match(home, em["away"]) and teams_match(away, em["home"]):
+                swapped = True
+            else:
+                continue
+            exact_id_prio = 0 if (expected_event_id and str(em.get("event_id", "")) == str(expected_event_id)) else 1
+            same_day_prio = 0 if str(em.get("fixture_date", "")) == bet_date_str else 1
+            hits.append((exact_id_prio * 10 + same_day_prio, em, swapped))
+        if not hits:
+            return None, False
+        hits.sort(key=lambda x: x[0])
+        return hits[0][1], hits[0][2]
+
     @classmethod
     def grade_ledger_items(cls) -> List[LedgerBetItem]:
         all_items = DailyLedgerManager.load_all_history_items()
@@ -3094,15 +3285,30 @@ class LiveSportsbookAndStatsAPI:
         dates_to_check = {active_date, shift_date_str(active_date, -1), shift_date_str(active_date, 1)}
         for item in all_items.values():
             dates_to_check.add(item.date_str)
+            dates_to_check.add(shift_date_str(item.date_str, 1))
 
         all_candidates: List[Dict[str, Any]] = []
+        seen_cand_ids: Set[str] = set()
         for d_str in sorted(dates_to_check):
-            all_candidates.extend(cls.fetch_mens_fixtures_with_odds(d_str))
+            for fx_c in cls.fetch_mens_fixtures_with_odds(d_str):
+                cid_u = f"{fx_c.get('event_id') or ''}:{fx_c.get('fixture_date') or d_str}:{normalize_team_str(fx_c.get('home', ''))}_{normalize_team_str(fx_c.get('away', ''))}"
+                if cid_u not in seen_cand_ids:
+                    seen_cand_ids.add(cid_u)
+                    all_candidates.append(fx_c)
 
+        reopen_shields = load_json_dict(os.path.join(BASE_DIR, "manual_reopen_shields.json"))
+        now_epoch = time.time()
         newly_settled = []
 
         for full_key, item in all_items.items():
             prev_settlement = item.settlement
+            shield_until = float(reopen_shields.get(full_key, 0.0) or 0.0)
+            if shield_until > now_epoch:
+                # Respect admin manual `/fix reopen` shield!
+                item.settlement = "PENDING"
+                if item.match_status == "FT":
+                    item.match_status = "PENDING"
+                continue
 
             if item.is_combo and item.combo_legs:
                 leg_statuses = []
@@ -3110,15 +3316,9 @@ class LiveSportsbookAndStatsAPI:
                 for leg in item.combo_legs:
                     lh = leg.get("home", "")
                     la = leg.get("away", "")
-                    matched_leg = None
-                    swapped = False
-                    for em in all_candidates:
-                        if teams_match(lh, em["home"]) and teams_match(la, em["away"]):
-                            matched_leg, swapped = em, False
-                            break
-                        elif teams_match(lh, em["away"]) and teams_match(la, em["home"]):
-                            matched_leg, swapped = em, True
-                            break
+                    matched_leg, swapped = cls._find_matching_fixture_for_bet(
+                        lh, la, item.date_str, all_candidates, expected_event_id=str(leg.get("event_id", "") or "")
+                    )
 
                     if matched_leg:
                         gh = matched_leg["ga"] if swapped else matched_leg["gh"]
@@ -3126,8 +3326,8 @@ class LiveSportsbookAndStatsAPI:
                         is_fin = matched_leg["is_finished"]
                         status_lbl = matched_leg["status_label"]
                     else:
-                        parsed_leg = cls._parse_stored_score(leg.get("score_str", ""))
-                        if not parsed_leg and item.score_str and "|" in item.score_str:
+                        parsed_leg = cls._parse_stored_score(leg.get("score_str", "")) if item.date_str < active_date else None
+                        if not parsed_leg and item.date_str < active_date and item.score_str and "|" in item.score_str:
                             for seg in item.score_str.split("|"):
                                 if teams_match(lh, seg) or teams_match(la, seg):
                                     m_seg = re.search(r"(\d+)\s*-\s*(\d+)", seg)
@@ -3135,9 +3335,14 @@ class LiveSportsbookAndStatsAPI:
                                         parsed_leg = (int(m_seg.group(1)), int(m_seg.group(2)), True)
                                         break
                         if not parsed_leg:
-                            # Also check if we have a single bet for the same match in all_items!
+                            # ONLY check single bets from the EXACT SAME `item.date_str`!
                             for other_it in all_items.values():
-                                if not other_it.is_combo and teams_match(lh, other_it.team_home) and teams_match(la, other_it.team_away):
+                                if (
+                                    other_it.date_str == item.date_str
+                                    and not other_it.is_combo
+                                    and teams_match(lh, other_it.team_home)
+                                    and teams_match(la, other_it.team_away)
+                                ):
                                     parsed_leg = cls._parse_stored_score(other_it.score_str)
                                     if parsed_leg:
                                         break
@@ -3185,16 +3390,20 @@ class LiveSportsbookAndStatsAPI:
                     item.match_status = "LIVE" if any("LIVE" in str(lg.get("score_str", "")) for lg in item.combo_legs) else "PENDING"
                     item.loss_autopsy = ""
                     item.failure_mode = ""
+                if item.settlement != "PENDING" and not cls.is_item_physically_allowed_to_settle(item, now_epoch=now_epoch):
+                    logger.warning("v41.2 Clock Lock blocked premature combo/lotto settlement on %s", full_key)
+                    item.settlement = "PENDING"
+                    item.match_status = "PENDING"
+                    item.loss_autopsy = ""
+                    item.failure_mode = ""
             else:
-                matched = None
-                swapped = False
-                for em in all_candidates:
-                    if teams_match(item.team_home, em["home"]) and teams_match(item.team_away, em["away"]):
-                        matched, swapped = em, False
-                        break
-                    elif teams_match(item.team_home, em["away"]) and teams_match(item.team_away, em["home"]):
-                        matched, swapped = em, True
-                        break
+                matched, swapped = cls._find_matching_fixture_for_bet(
+                    item.team_home,
+                    item.team_away,
+                    item.date_str,
+                    all_candidates,
+                    expected_event_id=getattr(item, "event_id", "") or ""
+                )
 
                 if matched:
                     gh = matched["ga"] if swapped else matched["gh"]
@@ -3203,7 +3412,12 @@ class LiveSportsbookAndStatsAPI:
                     is_live = matched["is_live"]
                     status_label = matched["status_label"]
                     event_id = matched.get("event_id", "")
+                    if event_id and not getattr(item, "event_id", ""):
+                        item.event_id = str(event_id)
                 else:
+                    # NEVER trust a stale `(FT)` score on today's slate if no same-day fixture exists!
+                    if item.date_str >= active_date:
+                        continue
                     parsed_sc = cls._parse_stored_score(item.score_str)
                     if not parsed_sc:
                         continue
@@ -3220,11 +3434,16 @@ class LiveSportsbookAndStatsAPI:
                     if c_sum > 0:
                         tot_corners_val = c_sum
 
-                if tot_corners_val is not None:
-                    item.score_str = f"{gh}-{ga} ({status_label} • {tot_corners_val} Corners)"
+                is_unstarted_single = (not is_finished) and (not is_live) and str(status_label).upper() in {"NS", "PRE", "UPCOMING", "SCHEDULED", "TIMED", "PENDING"}
+                if is_unstarted_single:
+                    item.score_str = "-"
+                    item.match_status = "PENDING"
                 else:
-                    item.score_str = f"{gh}-{ga} ({status_label})"
-                item.match_status = "FT" if is_finished else ("LIVE" if is_live else status_label)
+                    if tot_corners_val is not None:
+                        item.score_str = f"{gh}-{ga} ({status_label} • {tot_corners_val} Corners)"
+                    else:
+                        item.score_str = f"{gh}-{ga} ({status_label})"
+                    item.match_status = "FT" if is_finished else ("LIVE" if is_live else status_label)
 
                 primary_res = cls.grade_single_condition(
                     item.market_type,
@@ -3237,6 +3456,12 @@ class LiveSportsbookAndStatsAPI:
                     item.team_away,
                     tot_corners=tot_corners_val
                 )
+                if primary_res != "PENDING" and not cls.is_item_physically_allowed_to_settle(item, now_epoch=now_epoch):
+                    logger.warning("v41.2 Clock Lock blocked premature settlement on %s (%s vs %s, ko=%s)", full_key, item.team_home, item.team_away, item.kickoff_str)
+                    primary_res = "PENDING"
+                    is_finished = False
+                    item.score_str = "-" if not is_live else item.score_str
+                    item.match_status = "LIVE" if is_live else "PENDING"
                 item.settlement = primary_res
                 if primary_res == "PENDING":
                     item.won_via_safe_alt = False
@@ -3244,6 +3469,8 @@ class LiveSportsbookAndStatsAPI:
                     item.settled_note = ""
                     item.loss_autopsy = ""
                     item.failure_mode = ""
+                    if is_unstarted_single:
+                        item.match_stats_summary = ""
                 elif primary_res == "WON ✅":
                     item.won_via_safe_alt = False
                     item.settled_odds = item.odds
@@ -8371,18 +8598,19 @@ class LiveChannelAdminEditor:
         if low.startswith(("/fix", "/edit", "/admin")):
             return True
         if has_forwarded_channel_post and any(
-            k in low for k in ("odds", "link", "http", "selection", "safe", "remove", "delete", "won", "lost", "push", "@")
+            k in low for k in ("odds", "link", "http", "selection", "safe", "remove", "delete", "won", "lost", "push", "reopen", "ungrade", "revert", "pending", "start", "@")
         ):
             return True
         # Natural-language plain-English admin instructions
         nl_patterns = [
             r"^(?:fix|edit|update|change|set|correct)\s+(?:single|bet|pick|combo|lotto|leg|#?\d)",
-            r"^(?:remove|drop|delete)\s+(?:lotto|combo|single|bet|leg\b|duplicate)",
+            r"^(?:remove|drop|delete)\s+(?:lotto|combo|single|bet|leg\b|duplicate|result)",
             r"^(?:remove|drop)\s+.+\s+from\s+(?:lotto|combo)",
             r"^(?:fix|clean|dedup|deduplicate)\s+(?:the\s+)?(?:lotto|combo)",
-            r"(?:single|leg)\s*#?\d+\s+(?:odds|link|selection|safe)",
+            r"(?:single|leg)\s*#?\d+\s+(?:odds|link|selection|safe|reopen|pending)",
             r"^(?:settle|grade)\s+(?:single|bet|combo|lotto)",
-            r"^(?:reopen|ungrade|revert)\b",
+            r"^(?:reopen|ungrade|revert|reset)\b",
+            r"(?:didn'?t|did not|hasn'?t|not)\s+start",
         ]
         return any(re.search(pat, low) for pat in nl_patterns)
 
@@ -8455,23 +8683,27 @@ class LiveChannelAdminEditor:
         for idx, _, s in singles:
             has_ex = "✅ Exact URL" if BCGameDirectLinkResolver.is_valid_direct_match_url(s.search_url, s.team_home, s.team_away) else "⚠️ Board URL"
             mid_s = getattr(s, "channel_message_id", None) or "?"
-            lines.append(f"• Single #{idx} (msg {mid_s}): ⟦CODE⟧{s.team_home} vs {s.team_away}⟦/CODE⟧ ➔ {s.selection} (@ {s.odds:.2f}) [{has_ex}]")
+            rmid_s = getattr(s, "result_message_id", None)
+            st_lbl = "🟢 PENDING" if s.settlement == "PENDING" else f"{s.settlement}" + (f" • reply msg {rmid_s}" if rmid_s else "")
+            lines.append(f"• Single #{idx} (msg {mid_s}): ⟦CODE⟧{s.team_home} vs {s.team_away}⟦/CODE⟧ ➔ {s.selection} (@ {s.odds:.2f}) [{has_ex} | {st_lbl}]")
         if combos:
             c0 = combos[0]
-            lines.append(f"• Safe Combo (msg {c0.channel_message_id or '?'}): {len(c0.combo_legs or [])} legs (@ {c0.odds:.2f})")
+            c_st = "🟢 PENDING" if c0.settlement == "PENDING" else c0.settlement
+            lines.append(f"• Safe Combo (msg {c0.channel_message_id or '?'}): {len(c0.combo_legs or [])} legs (@ {c0.odds:.2f}) [{c_st}]")
         if lottos:
             l0 = lottos[0]
-            lines.append(f"• $5 Lotto (msg {l0.channel_message_id or '?'}): {len(l0.combo_legs or [])} legs ({l0.odds:.2f}x)")
+            l_st = "🟢 PENDING" if l0.settlement == "PENDING" else l0.settlement
+            lines.append(f"• $5 Lotto (msg {l0.channel_message_id or '?'}): {len(l0.combo_legs or [])} legs ({l0.odds:.2f}x) [{l_st}]")
 
         lines.extend([
             "────────────────────────",
             "Just type what to fix in plain English (or tap to copy):",
+            "• ⟦CODE⟧/fix reopen single 3⟦/CODE⟧ or ⟦CODE⟧/fix reopen columbus⟦/CODE⟧ (deletes false result & resets to PENDING)",
+            "• ⟦CODE⟧/fix reopen today⟦/CODE⟧ (deletes any premature result replies today)",
             "• ⟦CODE⟧/fix lotto⟦/CODE⟧ (deduplicate & clean Lotto legs)",
-            "• ⟦CODE⟧/fix remove lotto leg 7⟦/CODE⟧ or ⟦CODE⟧remove torreense from lotto⟦/CODE⟧",
-            "• ⟦CODE⟧/fix single 2 odds 1.72⟦/CODE⟧ or ⟦CODE⟧change besiktas odds to 1.72⟦/CODE⟧",
-            "• ⟦CODE⟧/fix single 4 link https://bc.game/sports/soccer/...⟦/CODE⟧",
+            "• ⟦CODE⟧/fix remove lotto leg 7⟦/CODE⟧ or ⟦CODE⟧remove rizespor from lotto⟦/CODE⟧",
+            "• ⟦CODE⟧/fix single 3 odds 1.77⟦/CODE⟧ or ⟦CODE⟧/fix single 4 link https://bc.game/sports/soccer/...⟦/CODE⟧",
             "• ⟦CODE⟧/fix single 2 selection Main Tab ➔ Total ➔ Over 2.5 @ 1.74⟦/CODE⟧",
-            "• ⟦CODE⟧/fix single 2 safealt Main Tab ➔ 1x2 ➔ Besiktas JK @ 1.27⟦/CODE⟧",
             "• ⟦CODE⟧/fix delete single 4⟦/CODE⟧ or ⟦CODE⟧/fix settle single 1 won⟦/CODE⟧"
         ])
         return "\n".join(lines)
@@ -8491,7 +8723,7 @@ class LiveChannelAdminEditor:
             bound_fk = ""
             if forwarded_msg_id > 1:
                 for fk_b, it_b in all_items.items():
-                    if int(getattr(it_b, "channel_message_id", 0) or 0) == forwarded_msg_id:
+                    if int(getattr(it_b, "channel_message_id", 0) or 0) == forwarded_msg_id or int(getattr(it_b, "result_message_id", 0) or 0) == forwarded_msg_id:
                         bound_fk = fk_b
                         cls._last_forwarded_target_by_user[user_id] = fk_b
                         break
@@ -8525,10 +8757,29 @@ class LiveChannelAdminEditor:
             if m_tme_del:
                 del_mid = int(m_tme_del.group(1))
                 ok_d, desc_d = bot_client.delete_message(PUBLISH_CHANNEL_ID, del_mid)
+                reopened_lbl = ""
+                shields_f = os.path.join(BASE_DIR, "manual_reopen_shields.json")
+                shields_d = load_json_dict(shields_f)
                 for fk_d, it_d in all_items.items():
-                    if int(getattr(it_d, "channel_message_id", 0) or 0) == del_mid:
+                    if int(getattr(it_d, "result_message_id", 0) or 0) == del_mid:
+                        it_d.settlement = "PENDING"
+                        it_d.match_status = "PENDING"
+                        it_d.score_str = "-"
+                        it_d.match_stats_summary = ""
+                        it_d.won_via_safe_alt = False
+                        it_d.settled_odds = 0.0
+                        it_d.settled_note = ""
+                        it_d.result_message_id = None
+                        it_d.published_result_to_channel = False
+                        DailyLedgerManager.unlock_in_channel(f"result:{fk_d}")
+                        shields_d[fk_d] = time.time() + 7200.0
+                        reopened_lbl = f"{it_d.team_home} vs {it_d.team_away}"
+                    elif int(getattr(it_d, "channel_message_id", 0) or 0) == del_mid:
                         it_d.is_approved = False
+                save_json_dict(shields_f, shields_d)
                 DailyLedgerManager.save_all_items(all_items)
+                if reopened_lbl:
+                    return f"🗑️ Deleted false result message ⟦CODE⟧{del_mid}⟦/CODE⟧ from ⟦CODE⟧@Footybett⟦/CODE⟧ and reset ⟦CODE⟧{reopened_lbl}⟦/CODE⟧ back to PENDING (shielded for 2h)!"
                 return f"🗑️ Deleted message ⟦CODE⟧{del_mid}⟦/CODE⟧ from ⟦CODE⟧@Footybett⟦/CODE⟧ ({desc_d})."
 
             if re.match(r"^(?:delete|cancel)\s+(?:the\s+)?(?:lotto|combo|single|bet)", low):
@@ -8702,45 +8953,100 @@ class LiveChannelAdminEditor:
                     bot_client.edit_message(PUBLISH_CHANNEL_ID, mid_c, card_c)
                 return f"✅ Updated {m_leg_od.group(1).title()} Leg #{l_idx} odds to ⟦CODE⟧{new_od:.2f}⟦/CODE⟧ (New Total: ⟦CODE⟧{it_c.odds:.2f}x⟦/CODE⟧) on ⟦CODE⟧@Footybett⟦/CODE⟧!"
 
-            # ── ACTION 5b: Reopen / Delete Premature Result Replies (`reopen today` / `reopen besiktas` / `reopen lotto`) ──
-            if re.match(r"^(?:reopen|ungrade|revert)\b", low):
+            # ── ACTION 5b: Reopen / Delete Premature Result Replies (`reopen single 3` / `reopen columbus` / `reopen today` / `miami didn't start`) ──
+            if (
+                re.match(r"^(?:reopen|ungrade|revert|reset)\b", low)
+                or re.search(r"\b(?:reopen|ungrade|revert)\b", low)
+                or re.search(r"(?:didn'?t|did not|hasn'?t|not)\s+start", low)
+                or (re.search(r"^(?:delete|remove)\s+result\b", low) is not None)
+            ):
                 reopened_names: List[str] = []
+                deleted_rmids: List[int] = []
+                target_single_fk = ""
+                found_rs = cls._find_target_single(clean_cmd, all_items, active_d)
+                if found_rs:
+                    target_single_fk = found_rs[1]
+                elif bound_fk and bound_fk in all_items:
+                    target_single_fk = bound_fk
+
+                recent_posts_scan: Optional[List[Dict[str, Any]]] = None
+                shields_file = os.path.join(BASE_DIR, "manual_reopen_shields.json")
+                shields_map = load_json_dict(shields_file)
+
                 for fk_r, it_r in all_items.items():
-                    if it_r.date_str != active_d or not it_r.is_approved:
+                    if it_r.date_str not in {active_d, shift_date_str(active_d, -1)} or not it_r.is_approved:
                         continue
-                    match_target = ("today" in low or "all" in low or low in ("reopen", "ungrade", "revert"))
-                    if not match_target:
-                        if "lotto" in low and (it_r.is_lotto_combo or it_r.market_type == "lotto_parlay"):
-                            match_target = True
-                        elif "combo" in low and it_r.is_combo and not it_r.is_lotto_combo:
-                            match_target = True
-                        elif not it_r.is_combo and any(tok in low for tok in BCGameLivePlaywrightEngine.get_team_alias_tokens(it_r.team_home) + BCGameLivePlaywrightEngine.get_team_alias_tokens(it_r.team_away) if len(tok) >= 4):
-                            match_target = True
-                    if match_target and (it_r.settlement != "PENDING" or getattr(it_r, "result_message_id", None) or it_r.published_result_to_channel):
+                    match_target = False
+                    if fk_r == target_single_fk:
+                        match_target = True
+                    elif ("today" in low or "all" in low or low in ("reopen", "ungrade", "revert", "reset")) and it_r.date_str == active_d:
+                        match_target = True
+                    elif "lotto" in low and it_r.date_str == active_d and (it_r.is_lotto_combo or it_r.market_type == "lotto_parlay"):
+                        match_target = True
+                    elif "combo" in low and it_r.date_str == active_d and it_r.is_combo and not it_r.is_lotto_combo:
+                        match_target = True
+                    elif not it_r.is_combo and it_r.date_str == active_d and any(
+                        tok in low for tok in BCGameLivePlaywrightEngine.get_team_alias_tokens(it_r.team_home) + BCGameLivePlaywrightEngine.get_team_alias_tokens(it_r.team_away) if len(tok) >= 4
+                    ):
+                        match_target = True
+
+                    if match_target and (
+                        it_r.settlement != "PENDING"
+                        or getattr(it_r, "result_message_id", None)
+                        or it_r.published_result_to_channel
+                        or DailyLedgerManager.is_locked_in_channel(f"result:{fk_r}")
+                    ):
                         rmid_r = int(getattr(it_r, "result_message_id", 0) or 0)
+                        if rmid_r <= 1:
+                            # Fallback scan of recent `@Footybett` posts in case `result_message_id` wasn't persisted
+                            if recent_posts_scan is None:
+                                recent_posts_scan = ChannelHistoryCleaner.fetch_all_channel_posts(PUBLISH_CHANNEL_ID, max_pages=2)
+                            tmp_m = {fk_r: it_r}
+                            for p_sc in reversed(recent_posts_scan):
+                                cat_sc, _, m_sc = ChannelHistoryCleaner.classify_post(p_sc, tmp_m)
+                                if m_sc is not None and cat_sc in ("SINGLE_CLOSED", "COMBO_CLOSED", "LOTTO_CLOSED"):
+                                    rmid_r = int(p_sc["msg_id"])
+                                    break
                         if rmid_r > 1:
                             bot_client.delete_message(PUBLISH_CHANNEL_ID, rmid_r)
+                            deleted_rmids.append(rmid_r)
                         it_r.settlement = "PENDING"
-                        it_r.match_status = "LIVE"
+                        it_r.match_status = "PENDING"
+                        it_r.score_str = "-"
+                        it_r.match_stats_summary = ""
+                        it_r.won_via_safe_alt = False
+                        it_r.settled_odds = 0.0
+                        it_r.settled_note = ""
                         it_r.result_message_id = None
                         it_r.published_result_to_channel = False
                         it_r.loss_autopsy = ""
                         it_r.failure_mode = ""
+                        it_r.manual_settled = False
                         DailyLedgerManager.unlock_in_channel(f"result:{fk_r}")
+                        shields_map[fk_r] = time.time() + 7200.0
                         reopened_names.append(f"{it_r.team_home} vs {it_r.team_away}")
+
+                save_json_dict(shields_file, shields_map)
                 DailyLedgerManager.save_all_items(all_items)
                 if reopened_names:
-                    return f"✅ Reopened {len(reopened_names)} ongoing item(s) ({', '.join(reopened_names)}) — deleted premature result cards from ⟦CODE⟧@Footybett⟦/CODE⟧ and restored status to PENDING until true Full Time!"
-                return "ℹ️ All matching items are already PENDING with no premature result cards."
+                    del_str = f" (deleted reply msg {', '.join(str(x) for x in deleted_rmids)})" if deleted_rmids else ""
+                    return (
+                        f"✅ Reopened {len(reopened_names)} item(s): ⟦CODE⟧{', '.join(reopened_names)}⟦/CODE⟧{del_str}!\n"
+                        "• Deleted premature result reply from ⟦CODE⟧@Footybett⟦/CODE⟧\n"
+                        "• Restored Official Singles W-L & locked status to PENDING until real Full Time!"
+                    )
+                return "ℹ️ That match is already PENDING with no result reply on @Footybett."
 
             # ── ACTION 6: Manual Settlement Override (`settle single 1 won|push|lost`) ──
-            m_settle = re.search(r"^(?:settle|grade)\s+(.+?)\s+(won|win|push|refund|lost|loss)\b", low)
+            m_settle = re.search(r"^(?:settle|grade)\s+(.+?)\s+(won|win|push|refund|lost|loss|pending)\b", low)
             if m_settle:
                 target_q, outcome_w = m_settle.group(1), m_settle.group(2)
                 found_s = cls._find_target_single(target_q, all_items, active_d)
                 if not found_s:
                     return "❌ Could not match that Single to settle."
                 _, fk_s, it_s = found_s
+                if outcome_w == "pending":
+                    return cls.execute_admin_instruction(bot_client, f"/fix reopen {target_q}", user_id=user_id)
                 if outcome_w in ("won", "win"):
                     it_s.settlement = "WON ✅"
                     it_s.settled_odds = it_s.odds
@@ -8750,6 +9056,7 @@ class LiveChannelAdminEditor:
                 else:
                     it_s.settlement = "LOST ❌"
                 it_s.match_status = "FT"
+                it_s.manual_settled = True
                 DailyLedgerManager.save_all_items(all_items)
                 close_card = BetSlipCardFormatter.format_closed_bet_card(it_s, up_to_date=it_s.date_str)
                 if getattr(it_s, "result_message_id", None):
@@ -9142,17 +9449,34 @@ class TelegramBotClient:
                         it_h.loss_autopsy = ""
                         it_h.failure_mode = ""
 
-            if (not auto_startup) or (not DailyLedgerManager.is_locked_in_channel(f"v41_0_live_board_recalibrated:{active_d_now}")):
+            if (not auto_startup) or (not DailyLedgerManager.is_locked_in_channel(f"v41_2_live_board_recalibrated:{active_d_now}")):
                 ExternalAnalyticsCollector.scrape_bcgame_official_portal()
                 today_fxs = LiveSportsbookAndStatsAPI.fetch_mens_fixtures_with_odds(active_d_now)
                 fx_lookup = {f"{normalize_team_str(x['home'])}_vs_{normalize_team_str(x['away'])}": x for x in today_fxs}
 
                 # Purge any wrong-league cached URL (e.g. Championship match accidentally tagged with uefa-champions-league)
+                def _fix_wrong_country_slug(u_in: str) -> str:
+                    u_out = str(u_in or "")
+                    if "columbus-crew-inter-miami" in u_out:
+                        u_out = re.sub(r"/sports/soccer/[a-z0-9-]+/[a-z0-9-]+/columbus-crew-inter-miami", "/sports/soccer/usa/mls/columbus-crew-inter-miami", u_out)
+                    if "/sports/soccer/turkey/super-lig" in u_out:
+                        u_out = u_out.replace("/sports/soccer/turkey/super-lig", "/sports/soccer/turkiye/super-lig")
+                    if "wolverhampton" in u_out and "/international/uefa-champions-league/" in u_out:
+                        u_out = u_out.replace("/international/uefa-champions-league/", "/england/championship/")
+                    return u_out
+
                 url_cache_d = BCGameDirectLinkResolver._get_cache()
                 for ck_u, cv_u in list(url_cache_d.items()):
-                    if isinstance(cv_u, dict) and "wolverhampton" in ck_u and "uefa-champions-league" in str(cv_u.get("url", "")):
-                        cv_u["url"] = str(cv_u["url"]).replace("/international/uefa-champions-league/", "/england/championship/")
+                    if isinstance(cv_u, dict) and cv_u.get("url"):
+                        cv_u["url"] = _fix_wrong_country_slug(str(cv_u["url"]))
                 BCGameDirectLinkResolver._save_cache()
+                for it_url_fix in all_items.values():
+                    if it_url_fix.search_url:
+                        it_url_fix.search_url = _fix_wrong_country_slug(it_url_fix.search_url)
+                    if it_url_fix.combo_legs:
+                        for lg_uf in it_url_fix.combo_legs:
+                            if lg_uf.get("bcgame_url"):
+                                lg_uf["bcgame_url"] = _fix_wrong_country_slug(str(lg_uf["bcgame_url"]))
 
                 # Priority Tier-1 (`4 Official Singles` + `2-Leg Safe Combo` = 4-5 matches): full screen-odds + exact URLs in ~45s!
                 # Priority Tier-2 (`$5 Mega Lotto` extra legs): fast board/network URL capture (`fetch_screen_odds=False`)!
@@ -9267,7 +9591,7 @@ class TelegramBotClient:
                             it_v.selection = f"{len(dedup_legs)}-Leg Logical Safe-Cushion Mega List ({it_v.odds:.2f}x)"
 
                 DailyLedgerManager.save_all_items(all_items)
-                DailyLedgerManager.mark_locked_in_channel(f"v41_0_live_board_recalibrated:{active_d_now}")
+                DailyLedgerManager.mark_locked_in_channel(f"v41_2_live_board_recalibrated:{active_d_now}")
             eod_map = load_json_dict(EOD_MESSAGE_IDS_FILE)
             handle = ChannelHistoryCleaner.extract_channel_handle(PUBLISH_CHANNEL_ID)
             posts = ChannelHistoryCleaner.fetch_all_channel_posts(PUBLISH_CHANNEL_ID)
@@ -9447,7 +9771,7 @@ class TelegramBotClient:
 
             DailyLedgerManager.save_all_items(all_items)
             save_json_dict(EOD_MESSAGE_IDS_FILE, eod_map)
-            DailyLedgerManager.mark_locked_in_channel("channel_clean_v41_1_auto_done")
+            DailyLedgerManager.mark_locked_in_channel("channel_clean_v41_2_auto_done")
 
             won_all, lost_all, wr_all, net_all_r = BetSlipCardFormatter.get_totals_summary_tuple()
             r_usd = BankrollStakeSizer.get_unit_usd()
@@ -9457,11 +9781,11 @@ class TelegramBotClient:
                 dup_note = f"\nℹ️ Older >48h duplicates (Telegram requires 1 manual tap by owner to delete): {links}"
 
             report = (
-                "🧹 @Footybett CHANNEL CLEANUP & HISTORY UPGRADE COMPLETE (v41.1)\n"
+                "🧹 @Footybett CHANNEL CLEANUP & HISTORY UPGRADE COMPLETE (v41.2)\n"
                 "────────────────────────\n"
                 f"• Scanned Channel Posts : {len(posts)} messages\n"
                 f"• Deleted Duplicates    : {deleted_cnt} message(s)\n"
-                f"• Rewritten & Upgraded  : {edited_cnt} post(s) updated to v41.1 Verified-Existence BC.Game Odds & Direct Match Links\n"
+                f"• Rewritten & Upgraded  : {edited_cnt} post(s) updated to v41.2 Same-Date Settlement & Exact MLS/BC.Game BC.Game Odds & Direct Match Links\n"
                 f"• Already Clean         : {unchanged_cnt} post(s)\n"
                 "• Pinned Partner Guide  : Active 📌\n"
                 f"• Channel & Bot Bio     : {bio_status}\n"
@@ -9504,6 +9828,8 @@ class TelegramBotClient:
                     msg_id = self.send_message(PUBLISH_CHANNEL_ID, open_card, remove_kb=False)
                     if msg_id:
                         it.published_to_channel = True
+                        if not getattr(it, "published_at_epoch", 0.0):
+                            it.published_at_epoch = time.time()
                         if msg_id > 1:
                             it.channel_message_id = msg_id
                         DailyLedgerManager.mark_locked_in_channel(pick_lock_key)
@@ -9513,7 +9839,7 @@ class TelegramBotClient:
                         published_count += 1
                         updated = True
                         time.sleep(1.0)
-            else:
+            elif DailyLedgerManager.is_locked_in_channel(batch_lock_key):
                 for fk, it in today_pending:
                     if (it.is_lotto_combo or it.market_type == "lotto_parlay") and not DailyLedgerManager.is_locked_in_channel(lotto_lock_key):
                         open_card = BetSlipCardFormatter.format_open_bet_card(it)
@@ -9540,6 +9866,21 @@ class TelegramBotClient:
                     if prem_mid > 1:
                         self.delete_message(PUBLISH_CHANNEL_ID, prem_mid)
                         logger.info("Deleted premature ongoing-match result message_id=%s for %s", prem_mid, full_key)
+                    item.result_message_id = None
+                    item.published_result_to_channel = False
+                    DailyLedgerManager.unlock_in_channel(result_lock_key)
+                    updated = True
+                    continue
+
+                if item.settlement in ["WON ✅", "LOST ❌", "PUSH ➖"] and not LiveSportsbookAndStatsAPI.is_item_physically_allowed_to_settle(item):
+                    logger.warning("v41.2 Publish Firewall reverted premature %s on %s (%s)", item.settlement, full_key, item.kickoff_str)
+                    prem_mid2 = int(getattr(item, "result_message_id", 0) or 0)
+                    if prem_mid2 > 1:
+                        self.delete_message(PUBLISH_CHANNEL_ID, prem_mid2)
+                    item.settlement = "PENDING"
+                    item.match_status = "PENDING"
+                    item.score_str = "-"
+                    item.match_stats_summary = ""
                     item.result_message_id = None
                     item.published_result_to_channel = False
                     DailyLedgerManager.unlock_in_channel(result_lock_key)
@@ -9630,7 +9971,7 @@ class TelegramBotClient:
     def background_worker_loop(self):
         logger.info("Footybett v37.0 Weighted Sharp-Consensus & Auto-Cleaner & Deep Match-Autopsy Worker started...")
         time.sleep(3)
-        if not DailyLedgerManager.is_locked_in_channel("channel_clean_v41_1_auto_done"):
+        if not DailyLedgerManager.is_locked_in_channel("channel_clean_v41_2_auto_done"):
             try:
                 logger.info("Running automatic one-time v41.0 @Footybett Lotto-dedup, Live Admin Editor & rate-limit-safe verified BC.Game markets, live odds, exact links & button cleanup & Partner-Button Removal & Safe Alt backfill & history upgrade...")
                 self.clean_and_upgrade_channel_history(auto_startup=True)
@@ -9740,7 +10081,7 @@ class TelegramBotClient:
                                 "• ⟦CODE⟧odds 1.72⟦/CODE⟧\n"
                                 "• ⟦CODE⟧link https://bc.game/sports/soccer/...⟦/CODE⟧\n"
                                 "• ⟦CODE⟧selection Main Tab ➔ Total ➔ Over 2.5 @ 1.74⟦/CODE⟧\n"
-                                "• ⟦CODE⟧remove lotto leg 7⟦/CODE⟧ or ⟦CODE⟧delete⟦/CODE⟧"
+                                "• ⟦CODE⟧reopen⟦/CODE⟧ (delete false result & reset to PENDING) or ⟦CODE⟧delete⟦/CODE⟧"
                             )
                             continue
                         def handle_live_fix(cid, raw_i, uid_i, fmid_i):
