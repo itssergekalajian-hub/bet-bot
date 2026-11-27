@@ -3282,10 +3282,13 @@ class LiveSportsbookAndStatsAPI:
             return []
 
         active_date = DailyLedgerManager.get_active_date_str()
-        dates_to_check = {active_date, shift_date_str(active_date, -1), shift_date_str(active_date, 1)}
+        yesterday_date = shift_date_str(active_date, -1)
+        # v41.3 FROZEN HISTORY: Only query ESPN for yesterday, today, and tomorrow (never re-grade old settled weeks!)
+        dates_to_check = {yesterday_date, active_date, shift_date_str(active_date, 1)}
         for item in all_items.values():
-            dates_to_check.add(item.date_str)
-            dates_to_check.add(shift_date_str(item.date_str, 1))
+            if item.settlement == "PENDING" and item.date_str >= yesterday_date:
+                dates_to_check.add(item.date_str)
+                dates_to_check.add(shift_date_str(item.date_str, 1))
 
         all_candidates: List[Dict[str, Any]] = []
         seen_cand_ids: Set[str] = set()
@@ -3302,6 +3305,9 @@ class LiveSportsbookAndStatsAPI:
 
         for full_key, item in all_items.items():
             prev_settlement = item.settlement
+            # v41.3 NEVER re-grade or mutate historical items older than yesterday!
+            if item.date_str < yesterday_date and item.settlement in ["WON ✅", "LOST ❌", "PUSH ➖"]:
+                continue
             shield_until = float(reopen_shields.get(full_key, 0.0) or 0.0)
             if shield_until > now_epoch:
                 # Respect admin manual `/fix reopen` shield!
@@ -3502,14 +3508,7 @@ class LiveSportsbookAndStatsAPI:
                         alt_mtype, alt_sel_clean, alt_ln_val, gh, ga, is_finished,
                         item.team_home, item.team_away, tot_corners=tot_corners_val
                     )
-                    if alt_res == "WON ✅" and item.date_str <= "2026-11-20":
-                        item.settlement = "WON ✅"
-                        item.won_via_safe_alt = True
-                        item.settled_odds = alt_odd_val
-                        item.settled_note = f"🛡️ Safe Alt Hit: {alt_sel_clean} @ {alt_odd_val:.2f} (Primary: {primary_res.split()[0]})"
-                        item.loss_autopsy = ""
-                        item.failure_mode = ""
-                    elif alt_res == "PUSH ➖" and primary_res == "LOST ❌":
+                    if alt_res == "PUSH ➖" and primary_res == "LOST ❌":
                         # e.g. Como 1907 vs Cagliari Calcio (Over 2.5 Primary + Safe Alt Over 2.0 -> 2-0 FT = 2 Goals REFUND, NOT a Loss!)
                         item.settlement = "PUSH ➖"
                         item.won_via_safe_alt = True
@@ -3536,10 +3535,17 @@ class LiveSportsbookAndStatsAPI:
                     item.failure_mode = f_mode
                     item.loss_autopsy = autopsy_str
 
-            # If a previously published WON ✅ bet was overturned by VAR or fixed from an X2/Away grading bug,
-            # flag it so the channel receives an immediate Official FT / VAR Correction card!
-            if prev_settlement != item.settlement and prev_settlement in ["WON ✅", "LOST ❌", "PUSH ➖"] and item.published_result_to_channel:
-                corr_lock = f"settlement_sync_v32_1:{full_key}:{item.settlement}"
+            # v41.3 ZERO NEW DUPLICATE/HISTORICAL POSTS:
+            # Never set `published_result_to_channel = False` unless `item.date_str == active_date` AND an existing
+            # `result_message_id > 1` is already on the channel so it edits IN-PLACE rather than sending a new post!
+            if (
+                item.date_str == active_date
+                and prev_settlement != item.settlement
+                and prev_settlement in ["WON ✅", "LOST ❌", "PUSH ➖"]
+                and item.published_result_to_channel
+                and int(getattr(item, "result_message_id", 0) or 0) > 1
+            ):
+                corr_lock = f"settlement_sync_v41_3:{full_key}:{item.settlement}"
                 if not DailyLedgerManager.is_locked_in_channel(corr_lock):
                     item.published_result_to_channel = False
                     DailyLedgerManager.mark_locked_in_channel(corr_lock)
@@ -8574,6 +8580,15 @@ class ChannelHistoryCleaner:
             g_key = f"{best_single.date_str}:{best_single.bet_key}"
             return ("SINGLE_CLOSED" if is_closed_header else "SINGLE_OPEN"), g_key, best_single
 
+        # v41.3 ORPHAN / HISTORICAL ROGUE RESULT GUARD:
+        # If a post has a closed result header (`SINGLE BET WON/LOST/PUSH`, `OPTIONAL 2-LEG`, `OPTIONAL $5 LOTTO`)
+        # on a recent date (`>= 2026-11-26`) and matches ZERO ledger item within ±3 days of `p_date`
+        # (e.g. a Nov 15 `Granada CF vs UD Las Palmas` result accidentally posted on Nov 27!), classify it as clutter to delete!
+        if is_closed_header and (not p_date or p_date >= "2026-11-26") and any(
+            h_kw in first_line for h_kw in ("SINGLE BET WON", "SINGLE BET LOST", "SINGLE BET PUSH", "SINGLE BET REFUNDED", "OPTIONAL 2-LEG", "OPTIONAL $5 LOTTO")
+        ):
+            return "PRE_RESET_OR_CLUTTER", f"orphan_result_{post['msg_id']}", None
+
         if any(w in up for w in ["BOT STARTED", "SYSTEM UPDATE", "TEST MESSAGE", "TESTING", "CLEANING CHANNEL"]):
             return "PRE_RESET_OR_CLUTTER", f"sys_{post['msg_id']}", None
 
@@ -8781,6 +8796,36 @@ class LiveChannelAdminEditor:
                 if reopened_lbl:
                     return f"🗑️ Deleted false result message ⟦CODE⟧{del_mid}⟦/CODE⟧ from ⟦CODE⟧@Footybett⟦/CODE⟧ and reset ⟦CODE⟧{reopened_lbl}⟦/CODE⟧ back to PENDING (shielded for 2h)!"
                 return f"🗑️ Deleted message ⟦CODE⟧{del_mid}⟦/CODE⟧ from ⟦CODE⟧@Footybett⟦/CODE⟧ ({desc_d})."
+
+            if re.match(r"^(?:delete|remove|cancel)\s+", low) and "from lotto" not in low and "from combo" not in low and "lotto leg" not in low and "combo leg" not in low:
+                # First check if user named a rogue/historical result post by club name (e.g. `/fix delete granada` or `/fix delete las palmas`) or `last`!
+                del_q = re.sub(r"^(?:delete|remove|cancel)\s+(?:the\s+)?(?:result\s+)?", "", low).strip()
+                if del_q and not re.match(r"^(?:lotto|combo|single|bet)\b", del_q):
+                    deleted_any_rogue: List[str] = []
+                    for fk_rg, it_rg in sorted(all_items.items(), key=lambda kv: int(getattr(kv[1], "result_message_id", 0) or 0), reverse=True):
+                        rmid_rg = int(getattr(it_rg, "result_message_id", 0) or 0)
+                        cmid_rg = int(getattr(it_rg, "channel_message_id", 0) or 0)
+                        toks_rg = BCGameLivePlaywrightEngine.get_team_alias_tokens(it_rg.team_home) + BCGameLivePlaywrightEngine.get_team_alias_tokens(it_rg.team_away)
+                        if (del_q in ("last", "last result", "rogue")) or any(len(tk) >= 4 and tk in del_q for tk in toks_rg):
+                            if rmid_rg > 1:
+                                bot_client.delete_message(PUBLISH_CHANNEL_ID, rmid_rg)
+                                it_rg.result_message_id = None
+                                if it_rg.date_str < active_d:
+                                    it_rg.published_result_to_channel = True
+                                    DailyLedgerManager.mark_locked_in_channel(f"result:{fk_rg}")
+                                else:
+                                    it_rg.settlement = "PENDING"
+                                    it_rg.published_result_to_channel = False
+                                deleted_any_rogue.append(f"{it_rg.team_home} vs {it_rg.team_away} (msg {rmid_rg})")
+                                if del_q in ("last", "last result", "rogue"):
+                                    break
+                            elif cmid_rg > 1 and it_rg.date_str == active_d:
+                                bot_client.delete_message(PUBLISH_CHANNEL_ID, cmid_rg)
+                                it_rg.is_approved = False
+                                deleted_any_rogue.append(f"{it_rg.team_home} vs {it_rg.team_away} (msg {cmid_rg})")
+                    if deleted_any_rogue:
+                        DailyLedgerManager.save_all_items(all_items)
+                        return f"🗑️ Deleted {', '.join(deleted_any_rogue)} from ⟦CODE⟧@Footybett⟦/CODE⟧ and locked it permanently!"
 
             if re.match(r"^(?:delete|cancel)\s+(?:the\s+)?(?:lotto|combo|single|bet)", low):
                 if "lotto" in low:
@@ -9286,12 +9331,17 @@ class TelegramBotClient:
         chat_id: Any,
         text: str,
         remove_kb: bool = True,
-        reply_to_message_id: Optional[int] = None
+        reply_to_message_id: Optional[int] = None,
+        require_valid_reply: bool = False
     ) -> Optional[int]:
         """
         Sends a Telegram message and returns the integer `message_id` on success (`None` on failure).
-        Supports native Telegram reply-tagging via `reply_parameters` and Partner CTA buttons on channel picks.
+        When `require_valid_reply=True` (used for ALL channel Result Replies!), sets `allow_sending_without_reply=False`
+        so Telegram's own server physically refuses to post an orphan result if the original Open Bet message is missing!
         """
+        if require_valid_reply and (not reply_to_message_id or int(reply_to_message_id) <= 1):
+            logger.warning("Blocked orphan result card with missing reply_to_message_id=%s", reply_to_message_id)
+            return None
         html_text = render_telegram_html(text)
         payload_data: Dict[str, Any] = {
             "chat_id": chat_id,
@@ -9306,7 +9356,7 @@ class TelegramBotClient:
         if reply_to_message_id and int(reply_to_message_id) > 0:
             payload_data["reply_parameters"] = {
                 "message_id": int(reply_to_message_id),
-                "allow_sending_without_reply": True
+                "allow_sending_without_reply": (not require_valid_reply)
             }
         ok, body, desc = self._call_telegram_json("sendMessage", payload_data, timeout=10)
         if ok:
@@ -9670,8 +9720,13 @@ class TelegramBotClient:
                     keep_p, m_item = entries[-1]
                     for dup_p, _ in entries[:-1]:
                         to_delete_ids.append(dup_p["msg_id"])
-                    if m_item is not None:
-                        if m_item.settlement == "PENDING":
+                    if m_item is None:
+                        to_delete_ids.append(keep_p["msg_id"])
+                    elif m_item is not None:
+                        has_open_in_channel = (int(getattr(m_item, "channel_message_id", 0) or 0) > 1) or any(
+                            k_cat in ("SINGLE_OPEN", "COMBO_OPEN", "LOTTO_OPEN") and k_gk == g_key for (k_cat, k_gk) in grouped.keys()
+                        )
+                        if m_item.settlement == "PENDING" or (not has_open_in_channel and keep_p.get("date_str", "") >= "2026-11-26"):
                             to_delete_ids.append(keep_p["msg_id"])
                             m_item.result_message_id = None
                             m_item.published_result_to_channel = False
@@ -9685,14 +9740,55 @@ class TelegramBotClient:
 
             # Guarantee direct in-place edits for ALL ledger items that have an exact saved `channel_message_id`
             # (especially today's last 6 posts!) even if `t.me/s/` public web preview lagged behind Telegram API!
+            # Determine minimum message_id of today's posts (e.g. 217) so any historical `< yesterday_d_now` item
+            # that accidentally posted a rogue result_message_id today (`>= min_today_mid` or with `cmid <= 1`) is DELETED!
+            today_open_mids = [
+                int(getattr(x, "channel_message_id", 0) or 0)
+                for x in all_items.values()
+                if x.date_str == active_d_now and int(getattr(x, "channel_message_id", 0) or 0) > 1
+            ]
+            min_today_mid = min(today_open_mids) if today_open_mids else 999999999
+
             queued_mids = {int(m_id) for m_id, _ in to_edit_jobs} | set(to_delete_ids)
             for fk_direct, it_direct in sorted(all_items.items(), key=lambda kv: kv[0]):
+                # Revert any bogus legacy `Safe Alt Hit: ... (Primary: LOST)` mutation (e.g. Granada vs Las Palmas 2026-11-15)
+                if getattr(it_direct, "won_via_safe_alt", False) and "Safe Alt Hit:" in str(getattr(it_direct, "settled_note", "")) and "Primary: LOST" in str(getattr(it_direct, "settled_note", "")):
+                    it_direct.settlement = "LOST ❌"
+                    it_direct.won_via_safe_alt = False
+                    it_direct.settled_odds = 0.0
+                    it_direct.settled_note = ""
+
                 cmid = int(getattr(it_direct, "channel_message_id", 0) or 0)
+                rmid = int(getattr(it_direct, "result_message_id", 0) or 0)
+
+                # v41.3 DELETE ANY ORPHAN OR HISTORICAL ROGUE RESULT (`cmid <= 1` or old match with `rmid >= min_today_mid`)!
+                is_rogue_orphan_result = (
+                    rmid > 1
+                    and (
+                        cmid <= 1
+                        or (it_direct.date_str < yesterday_d_now and rmid >= min_today_mid)
+                    )
+                )
+                if is_rogue_orphan_result:
+                    to_delete_ids.append(rmid)
+                    queued_mids.add(rmid)
+                    it_direct.result_message_id = None
+                    if it_direct.date_str < active_d_now:
+                        it_direct.published_result_to_channel = True
+                        DailyLedgerManager.mark_locked_in_channel(f"result:{fk_direct}")
+                        if cmid <= 1:
+                            it_direct.published_to_channel = False
+                    continue
+
+                # Permanently lock all historical (`< active_d_now`) settled items so they NEVER fire a new post!
+                if it_direct.date_str < active_d_now and it_direct.settlement in ["WON ✅", "LOST ❌", "PUSH ➖"]:
+                    it_direct.published_result_to_channel = True
+                    DailyLedgerManager.mark_locked_in_channel(f"result:{fk_direct}")
+
                 if cmid > 1 and cmid not in queued_mids:
                     p_num_d = day_single_numbers.get(fk_direct) if (not it_direct.is_combo and not it_direct.is_lotto_combo) else None
                     to_edit_jobs.append((cmid, BetSlipCardFormatter.format_open_bet_card(it_direct, pick_number=p_num_d)))
                     queued_mids.add(cmid)
-                rmid = int(getattr(it_direct, "result_message_id", 0) or 0)
                 if it_direct.settlement == "PENDING" and (rmid > 1 or it_direct.published_result_to_channel or DailyLedgerManager.is_locked_in_channel(f"result:{fk_direct}")):
                     if rmid > 1:
                         to_delete_ids.append(rmid)
@@ -9700,7 +9796,7 @@ class TelegramBotClient:
                     it_direct.result_message_id = None
                     it_direct.published_result_to_channel = False
                     DailyLedgerManager.unlock_in_channel(f"result:{fk_direct}")
-                elif rmid > 1 and rmid not in queued_mids and it_direct.settlement != "PENDING":
+                elif rmid > 1 and cmid > 1 and rmid not in queued_mids and it_direct.settlement != "PENDING":
                     to_edit_jobs.append((rmid, BetSlipCardFormatter.format_closed_bet_card(it_direct, up_to_date=it_direct.date_str)))
                     queued_mids.add(rmid)
             for eod_d_k, eod_m_v in sorted(eod_map.items()):
@@ -9771,7 +9867,7 @@ class TelegramBotClient:
 
             DailyLedgerManager.save_all_items(all_items)
             save_json_dict(EOD_MESSAGE_IDS_FILE, eod_map)
-            DailyLedgerManager.mark_locked_in_channel("channel_clean_v41_2_auto_done")
+            DailyLedgerManager.mark_locked_in_channel("channel_clean_v41_3_auto_done")
 
             won_all, lost_all, wr_all, net_all_r = BetSlipCardFormatter.get_totals_summary_tuple()
             r_usd = BankrollStakeSizer.get_unit_usd()
@@ -9781,7 +9877,7 @@ class TelegramBotClient:
                 dup_note = f"\nℹ️ Older >48h duplicates (Telegram requires 1 manual tap by owner to delete): {links}"
 
             report = (
-                "🧹 @Footybett CHANNEL CLEANUP & HISTORY UPGRADE COMPLETE (v41.2)\n"
+                "🧹 @Footybett CHANNEL CLEANUP & HISTORY UPGRADE COMPLETE (v41.3)\n"
                 "────────────────────────\n"
                 f"• Scanned Channel Posts : {len(posts)} messages\n"
                 f"• Deleted Duplicates    : {deleted_cnt} message(s)\n"
@@ -9888,29 +9984,48 @@ class TelegramBotClient:
                     continue
 
                 if item.settlement in ["WON ✅", "LOST ❌", "PUSH ➖"]:
-                    was_pub = bool(item.published_to_channel or int(getattr(item, "channel_message_id", 0) or 0) > 1)
-                    if not was_pub:
+                    # v41.3 5-LOCK IRONCLAD RESULT PUBLISHER GATE:
+                    # 1. NEVER send a brand-new result card for historical dates (`< active_date`, except overnight
+                    #    `yesterday_date` kickoffs before `10:00 UTC` / `12:00 Local`)!
+                    now_u_hr = datetime.datetime.now(datetime.timezone.utc).hour
+                    is_live_eligible_date = (item.date_str == active_date) or (item.date_str == yesterday_date and now_u_hr < 10)
+                    parent_open_mid = int(getattr(item, "channel_message_id", 0) or 0)
+                    existing_res_mid = int(getattr(item, "result_message_id", 0) or 0)
+
+                    # 2. If item is from an older historical date, silently lock it so it NEVER posts to the channel!
+                    if not is_live_eligible_date:
+                        if not item.published_result_to_channel or not DailyLedgerManager.is_locked_in_channel(result_lock_key):
+                            item.published_result_to_channel = True
+                            DailyLedgerManager.mark_locked_in_channel(result_lock_key)
+                            updated = True
                         continue
+
+                    # 3. NEVER send a result for a bet that does NOT have a real posted `channel_message_id > 1` on `@Footybett`!
+                    if parent_open_mid <= 1:
+                        continue
+
                     close_card = BetSlipCardFormatter.format_closed_bet_card(item, up_to_date=item.date_str)
-                    if not item.published_result_to_channel and (getattr(item, "result_message_id", None) or not DailyLedgerManager.is_locked_in_channel(result_lock_key)):
-                        if getattr(item, "result_message_id", None):
-                            ok_ed, _ = self.edit_message(PUBLISH_CHANNEL_ID, int(item.result_message_id), close_card)
+                    if not item.published_result_to_channel and (existing_res_mid > 1 or not DailyLedgerManager.is_locked_in_channel(result_lock_key)):
+                        if existing_res_mid > 1:
+                            ok_ed, _ = self.edit_message(PUBLISH_CHANNEL_ID, existing_res_mid, close_card)
                             if ok_ed:
                                 item.published_result_to_channel = True
                                 DailyLedgerManager.mark_locked_in_channel(result_lock_key)
                                 updated = True
                         else:
+                            # 4. `require_valid_reply=True` (`allow_sending_without_reply=False`): Telegram's own server
+                            #    rejects sending if `parent_open_mid` does not exist on `@Footybett`!
                             res_mid = self.send_message(
                                 PUBLISH_CHANNEL_ID,
                                 close_card,
                                 remove_kb=False,
-                                reply_to_message_id=getattr(item, "channel_message_id", None)
+                                reply_to_message_id=parent_open_mid,
+                                require_valid_reply=True
                             )
-                            if res_mid:
+                            if res_mid and res_mid > 1:
                                 item.published_to_channel = True
                                 item.published_result_to_channel = True
-                                if res_mid > 1:
-                                    item.result_message_id = res_mid
+                                item.result_message_id = res_mid
                                 DailyLedgerManager.mark_locked_in_channel(pick_lock_key)
                                 DailyLedgerManager.mark_locked_in_channel(result_lock_key)
                                 updated = True
@@ -9943,7 +10058,7 @@ class TelegramBotClient:
                             if ok_ed:
                                 DailyLedgerManager.mark_locked_in_channel(eod_lock_key)
                                 DailyLedgerManager.mark_locked_in_channel(f"{eod_lock_key}:{recap_hash}")
-                    elif not DailyLedgerManager.is_locked_in_channel(eod_lock_key):
+                    elif not DailyLedgerManager.is_locked_in_channel(eod_lock_key) and (check_d == active_date or datetime.datetime.now(datetime.timezone.utc).hour < 10):
                         new_eod_mid = self.send_message(PUBLISH_CHANNEL_ID, recap_card, remove_kb=False)
                         if new_eod_mid:
                             if new_eod_mid > 1:
@@ -9971,7 +10086,7 @@ class TelegramBotClient:
     def background_worker_loop(self):
         logger.info("Footybett v37.0 Weighted Sharp-Consensus & Auto-Cleaner & Deep Match-Autopsy Worker started...")
         time.sleep(3)
-        if not DailyLedgerManager.is_locked_in_channel("channel_clean_v41_2_auto_done"):
+        if not DailyLedgerManager.is_locked_in_channel("channel_clean_v41_3_auto_done"):
             try:
                 logger.info("Running automatic one-time v41.0 @Footybett Lotto-dedup, Live Admin Editor & rate-limit-safe verified BC.Game markets, live odds, exact links & button cleanup & Partner-Button Removal & Safe Alt backfill & history upgrade...")
                 self.clean_and_upgrade_channel_history(auto_startup=True)
