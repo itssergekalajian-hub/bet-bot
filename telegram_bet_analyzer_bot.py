@@ -4751,7 +4751,7 @@ class ExpertConsensusHub:
         if "away_winner" in bc_tips:
             combined["away_win"].add("BC.Game")
             combined["away_x2"].add("BC.Game")
-        if bc_portal_entry.get("draw_1x2"):
+        if "draw" in bc_tips:
             combined["draw"].add("BC.Game")
         if "over_25" in bc_tips:
             combined["over_25"].add("BC.Game")
@@ -4809,6 +4809,26 @@ class ExpertConsensusHub:
             elif dc.get("p_away_win", 0.0) >= 52.0:
                 combined["away_win"].add("ClubElo")
                 combined["away_x2"].add("ClubElo")
+
+        # Merge Calibrated Dixon-Coles Poisson xG Signal ONLY on genuine statistical edge (never on coin-flips!)
+        if dc.get("p_home_win", 0.0) >= 57.5:
+            combined["home_win"].add("Poisson xG")
+            combined["home_1x"].add("Poisson xG")
+            if dc.get("p_home_win", 0.0) >= 66.0 and dc.get("lam_h", 0.0) >= 1.85:
+                combined["home_handicap"].add("Poisson xG")
+        elif dc.get("p_home_dnb", 0.0) >= 67.5 and dc.get("p_home_win", 0.0) >= 48.0:
+            combined["home_1x"].add("Poisson xG")
+        if dc.get("p_away_win", 0.0) >= 53.5:
+            combined["away_win"].add("Poisson xG")
+            combined["away_x2"].add("Poisson xG")
+        elif dc.get("p_away_dnb", 0.0) >= 66.5 and dc.get("p_away_win", 0.0) >= 46.0:
+            combined["away_x2"].add("Poisson xG")
+        if dc.get("p_over_25", 0.0) >= 57.0 and dc.get("lam_total", 0.0) >= 2.75:
+            combined["over_25"].add("Poisson xG")
+        elif dc.get("p_under_25", 0.0) >= 58.5 and 0 < dc.get("lam_total", 9.0) <= 2.15:
+            combined["under_25"].add("Poisson xG")
+        if dc.get("p_btts_yes", 0.0) >= 57.5 and dc.get("lam_h", 0.0) >= 1.15 and dc.get("lam_a", 0.0) >= 1.05:
+            combined["btts_yes"].add("Poisson xG")
 
         # Merge 35+ Watched Telegram Tipster Channels
         if ch_tip and ch_votes > 0:
@@ -6654,8 +6674,6 @@ class SafeCushionBetCreator:
 
         raw_h_sample = hw + hd + hl
         raw_a_sample = aw + ad + al
-        if strict_channel_quality and (raw_h_sample < 3 or raw_a_sample < 3):
-            return None, None
         h_games = max(1, raw_h_sample)
         a_games = max(1, raw_a_sample)
         h_win_rate = hw / h_games if (hw + hd + hl) > 0 else 0.45
@@ -6712,6 +6730,12 @@ class SafeCushionBetCreator:
             deep_stats["h_ga_avg"] = float(apif_pred.get("h_ga_season", 0.0))
             deep_stats["a_gf_avg"] = float(apif_pred.get("a_gf_season", 0.0))
             deep_stats["a_ga_avg"] = float(apif_pred.get("a_ga_season", 0.0))
+
+        # v46.1 Verified Sample Gate: Allow verified ESPN `/summary` deep_stats OR API-Football season stats when raw `/scoreboard` omits W-D-L,
+        # while STILL strictly blocking blind Cup/unknown matches where BOTH raw form AND deep season stats are missing!
+        has_verified_season_profile = bool(deep_stats.get("has_deep_stats") or apif_pred.get("advice"))
+        if strict_channel_quality and (raw_h_sample < 3 or raw_a_sample < 3) and not has_verified_season_profile:
+            return None, None
 
         dc = QuantitativeEnsembleModels.run_dixon_coles_matrix(
             h_form, a_form, h_win_rate, h_loss_rate, a_win_rate, a_loss_rate,
@@ -7062,7 +7086,14 @@ class SafeCushionBetCreator:
             if strict_channel_quality and (cand_item.odds < MIN_SINGLE_ODDS or cand_item.odds > 2.04):
                 continue
             m_src_cnt = re.search(r"\((\d+)/\d+\s+Sources", cand_item.rationale or "")
-            n_src_est = int(m_src_cnt.group(1)) if m_src_cnt else (2 if "Backed by" in (cand_item.rationale or "") else 1)
+            plus_more = re.search(r"\+(\d+)\s+more", cand_item.rationale or "")
+            if m_src_cnt:
+                n_src_est = int(m_src_cnt.group(1))
+            elif "Backed by" in (cand_item.rationale or ""):
+                head_s = (cand_item.rationale or "").split("•")[0]
+                n_src_est = head_s.count("+") + 1 + (int(plus_more.group(1)) - 1 if plus_more else 0)
+            else:
+                n_src_est = 2
             dec_wr, push_pct, true_ev = cls.calculate_true_calibrated_ev(
                 cand_item.market_type,
                 cand_item.selection,
@@ -7072,10 +7103,10 @@ class SafeCushionBetCreator:
                 bc_odds,
                 home,
                 away,
-                n_for=n_src_est,
+                n_for=max(2, n_src_est),
                 elite_for=min(2, all_elite_votes)
             )
-            if strict_channel_quality and true_ev < 3.2:
+            if strict_channel_quality and true_ev < 2.2:
                 continue
             cand_item.model_prob = round(dec_wr, 1)
             cand_item.edge_ev = round(true_ev, 2)
@@ -7584,11 +7615,22 @@ class SafeCushionBetCreator:
         existing = DailyLedgerManager.load_active_date_items()
         existing_singles = [i for i in existing if not i.is_combo]
 
-        has_lotto_already = any(i.is_lotto_combo or i.market_type == "lotto_parlay" for i in existing)
+        has_lotto_already = any(
+            (i.is_lotto_combo or i.market_type == "lotto_parlay") and i.published_to_channel
+            for i in existing
+        )
         batch_lock_key = f"daily_batch_locked_v26:{active_date}"
         lotto_lock_key = f"daily_lotto_locked_v32:{active_date}"
+        published_today_singles = [
+            i for i in existing_singles
+            if i.published_to_channel and int(getattr(i, "channel_message_id", 0) or 0) > 1
+        ]
+        if not published_today_singles and not any(i.published_to_channel for i in existing_singles):
+            if DailyLedgerManager.is_locked_in_channel(batch_lock_key):
+                logger.warning("Cleared stale %s because 0 singles are published for %s", batch_lock_key, active_date)
+                DailyLedgerManager.unlock_in_channel(batch_lock_key)
         main_batch_already_done = DailyLedgerManager.is_locked_in_channel(batch_lock_key) or (
-            len(existing_singles) >= 2 and any(i.published_to_channel for i in existing_singles)
+            len(existing_singles) >= 1 and any(i.published_to_channel for i in existing_singles)
         )
         if main_batch_already_done and (has_lotto_already or DailyLedgerManager.is_locked_in_channel(lotto_lock_key)):
             return existing
@@ -7718,6 +7760,10 @@ class SafeCushionBetCreator:
             pool_final = exact_verified_pairs if len(exact_verified_pairs) >= 2 else (exact_verified_pairs + fallback_pairs)
             chosen_final_pairs = pool_final[: max(0, slots_left)]
             top_pairs = chosen_final_pairs
+            logger.info(
+                "Slate builder (%s): scanned=%d upcoming fixtures -> %d raw +EV candidates -> %d final verified singles",
+                active_date, len(fixtures), len(paired_candidates), len(chosen_final_pairs)
+            )
             for _, _, _, single, _ in chosen_final_pairs:
                 DailyLedgerManager.upsert_bet(single)
 
@@ -11457,8 +11503,8 @@ class TelegramBotClient:
             lotto_lock_key = f"daily_lotto_locked_v32:{active_date}"
             today_pending_singles = [x for x in today_pending if not x[1].is_combo and not x[1].is_lotto_combo]
             if len(today_pending_singles) >= 1 and not DailyLedgerManager.is_locked_in_channel(batch_lock_key):
-                DailyLedgerManager.mark_locked_in_channel(batch_lock_key)
                 single_idx = 0
+                posted_any_single = False
                 for fk, it in today_pending:
                     pick_lock_key = f"pick:{fk}"
                     if not it.is_combo:
@@ -11475,11 +11521,15 @@ class TelegramBotClient:
                             it.channel_message_id = msg_id
                         DailyLedgerManager.mark_locked_in_channel(pick_lock_key)
                         DailyLedgerManager.mark_locked_in_channel(f"pick_v26:{fk}")
+                        if not it.is_combo and not it.is_lotto_combo:
+                            posted_any_single = True
                         if it.is_lotto_combo or it.market_type == "lotto_parlay":
                             DailyLedgerManager.mark_locked_in_channel(lotto_lock_key)
                         published_count += 1
                         updated = True
                         time.sleep(1.0)
+                if posted_any_single:
+                    DailyLedgerManager.mark_locked_in_channel(batch_lock_key)
             elif DailyLedgerManager.is_locked_in_channel(batch_lock_key):
                 for fk, it in today_pending:
                     if (it.is_lotto_combo or it.market_type == "lotto_parlay") and not DailyLedgerManager.is_locked_in_channel(lotto_lock_key):
@@ -11660,7 +11710,8 @@ class TelegramBotClient:
     def set_official_menu_commands(self):
         commands = [
             {"command": "pnl", "description": "📊 Main Bets vs Safe Alt Results (Start / Monthly / Weekly)"},
-            {"command": "scan", "description": "🎯 Today's Official 1R Singles & Optional Combos"},
+            {"command": "scan", "description": "🎯 View Today's Singles, Safe Combo & Lotto"},
+            {"command": "publish", "description": "🚀 Scan & Post Today's Verified +EV Slate Now"},
             {"command": "fix", "description": "✏️ Edit Live @Footybett Posts, Odds, Links & Lotto"},
             {"command": "clean", "description": "🧹 Clean Duplicates & Upgrade @Footybett History"},
             {"command": "results", "description": "🏁 Refresh Live Scores & Outcomes"},
@@ -11871,6 +11922,22 @@ class TelegramBotClient:
                         f"{ch_list_str}\n\n"
                         f"➕ To add a channel: send ⟦CODE⟧/addchannel @channelname⟦/CODE⟧ or paste a ⟦CODE⟧t.me/...⟦/CODE⟧ link."
                     )
+                    continue
+
+                # 2.0 Handle /publish or /postnow (Admin On-Demand Slate Builder & Channel Publisher)
+                if low_t in ["/publish", "/postnow", "/forcescan"]:
+                    if not self.is_channel_admin(from_user_id):
+                        self.send_message(chat_id, "🔒 Publishing is restricted to verified @Footybett administrators.")
+                        continue
+                    def handle_publish_cmd(cid):
+                        smid = self.send_message(cid, "🔎 Scanning upcoming fixtures, sharp consensus & live BC.Game odds...")
+                        SafeCushionBetCreator.generate_slate_and_combo_for_active_date(force_now=True)
+                        pub_n = self.sync_and_publish_to_footybett()
+                        summary = BetSlipCardFormatter.format_clean_today_and_total()
+                        hdr = f"✅ Published {pub_n} new post(s) to {PUBLISH_CHANNEL_ID}!\n\n" if pub_n > 0 else "ℹ️ Slate check complete:\n\n"
+                        if not (smid and isinstance(cid, int) and cid > 0 and self.edit_dm_message(cid, smid, hdr + summary)):
+                            self.send_message(cid, hdr + summary)
+                    threading.Thread(target=handle_publish_cmd, args=[chat_id], daemon=True).start()
                     continue
 
                 # 2a. Handle /lotto
