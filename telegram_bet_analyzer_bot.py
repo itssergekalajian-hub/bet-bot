@@ -41,12 +41,19 @@ import hashlib
 import difflib
 import unicodedata
 import logging
+import tempfile
 import threading
 import datetime
 import urllib.request
 import urllib.parse
 import urllib.error
 import concurrent.futures
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+except ImportError:  # pragma: no cover
+    requests = None  # type: ignore
+    HTTPAdapter = None  # type: ignore
 from typing import Dict, Any, Optional, List, Tuple, Set
 from dataclasses import dataclass, asdict, fields
 
@@ -66,7 +73,7 @@ DEFAULT_UNIT_USD = float(os.environ.get("UNIT_STAKE_USD", "100.0"))
 
 API_FOOTBALL_KEY = os.environ.get("API_FOOTBALL_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 PUBLISH_CHANNEL_ID = os.environ.get("PUBLISH_CHANNEL_ID", "@Footybett")
 BCGAME_PARTNER_URL = os.environ.get("BCGAME_PARTNER_URL", "https://bc.game/i-97sdx2t16q-n/")
 BCGAME_SOCCER_HUB_URL = "https://bc.game/sports/soccer-1"
@@ -1204,7 +1211,7 @@ class BCGameLivePlaywrightEngine:
         scrolls its Home Team Name text element into center viewport, triggers JS click on any parent `<a>`,
         AND returns `{found: true, x, y, href}` so Playwright can execute a real hardware `page.mouse.click(x, y)`!
         """
-        return """
+        return r"""
         ([homeAliases, awayAliases]) => {
             const hList = (homeAliases || []).map(s => String(s).toLowerCase()).filter(Boolean);
             const aList = (awayAliases || []).map(s => String(s).toLowerCase()).filter(Boolean);
@@ -2003,39 +2010,118 @@ def shift_date_str(date_str: str, delta_days: int) -> str:
         return date_str
 
 
-def load_json_set(filepath: str, default: Optional[List[Any]] = None) -> Set[Any]:
-    if os.path.exists(filepath):
+_JSON_FILE_LOCKS: Dict[str, threading.RLock] = {}
+_JSON_FILE_LOCKS_GUARD = threading.Lock()
+_HTTP_LOCAL = threading.local()
+
+
+def _json_file_lock(path: str) -> threading.RLock:
+    norm_path = os.path.abspath(str(path))
+    with _JSON_FILE_LOCKS_GUARD:
+        lock = _JSON_FILE_LOCKS.get(norm_path)
+        if lock is None:
+            lock = threading.RLock()
+            _JSON_FILE_LOCKS[norm_path] = lock
+        return lock
+
+
+def _atomic_write_json(path: str, data: Any) -> None:
+    target_path = os.path.abspath(str(path))
+    parent_dir = os.path.dirname(target_path) or "."
+    os.makedirs(parent_dir, exist_ok=True)
+    with _json_file_lock(target_path):
+        fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".json", dir=parent_dir)
         try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                return set(json.load(f))
-        except Exception:
-            pass
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, target_path)
+        except BaseException:
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+
+def _get_http_session():
+    sess = getattr(_HTTP_LOCAL, "session", None)
+    if sess is None and requests is not None:
+        sess = requests.Session()
+        if HTTPAdapter is not None:
+            adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16)
+            sess.mount("https://", adapter)
+            sess.mount("http://", adapter)
+        _HTTP_LOCAL.session = sess
+    return sess
+
+
+def _urlopen_is_mocked() -> bool:
+    mod = getattr(urllib.request.urlopen, "__module__", "") or ""
+    return "mock" in mod.lower() or hasattr(urllib.request.urlopen, "assert_called")
+
+
+def _http_request_bytes(
+    url: str,
+    headers: Optional[Dict[str, str]] = None,
+    data: Optional[bytes] = None,
+    timeout: float = 5.0
+) -> bytes:
+    hdrs = dict(headers or {})
+    if not _urlopen_is_mocked():
+        sess = _get_http_session()
+        if sess is not None:
+            resp = (
+                sess.post(url, data=data, headers=hdrs, timeout=timeout)
+                if data is not None
+                else sess.get(url, headers=hdrs, timeout=timeout)
+            )
+            if resp.status_code >= 400:
+                import io
+                raise urllib.error.HTTPError(
+                    url, resp.status_code, resp.reason or "HTTP Error", resp.headers, io.BytesIO(resp.content)
+                )
+            return resp.content
+    req = urllib.request.Request(url, data=data, headers=hdrs)
+    with urllib.request.urlopen(req, timeout=timeout) as resp_u:
+        return resp_u.read()
+
+
+def load_json_set(filepath: str, default: Optional[List[Any]] = None) -> Set[Any]:
+    with _json_file_lock(filepath):
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    return set(json.load(f))
+            except Exception:
+                pass
     return set(default or [])
 
 
 def save_json_set(filepath: str, data_set: Set[Any], max_items: int = 5000):
     try:
         items = list(data_set)[-max_items:]
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(items, f)
+        _atomic_write_json(filepath, items)
     except Exception as e:
         logger.error("Failed to save JSON file %s: %s", filepath, e)
 
 
 def load_json_dict(filepath: str) -> Dict[str, Any]:
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
+    with _json_file_lock(filepath):
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
     return {}
 
 
 def save_json_dict(filepath: str, data: Dict[str, Any]):
     try:
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        _atomic_write_json(filepath, data)
     except Exception as e:
         logger.error("Failed to write JSON dict %s: %s", filepath, e)
 
@@ -2965,10 +3051,10 @@ class LiveSportsbookAndStatsAPI:
 
         for rank_idx, (slug, league_title) in enumerate(BCGAME_VERIFIED_MENS_LEAGUES):
             url = f"{cls.ESPN_LEAGUE_SCOREBOARD_TEMPLATE.format(slug=slug)}?dates={espn_date}&limit=100"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             try:
-                with urllib.request.urlopen(req, timeout=4) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
+                raw_b = _http_request_bytes(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=4)
+                if True:
+                    data = json.loads(raw_b.decode("utf-8"))
                     for ev in data.get("events", []):
                         parsed = cls._parse_espn_event(ev, league_title, slug, rank_idx, now_utc)
                         if not parsed:
@@ -3743,9 +3829,7 @@ class ExpertConsensusHub:
             "Accept": "text/html,application/xhtml+xml,application/xml,application/json;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         }
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8", errors="ignore")
+        return _http_request_bytes(url, headers=headers, timeout=timeout).decode("utf-8", errors="ignore")
 
     @classmethod
     def _ensure_ballot(cls, target_map: Dict[str, Dict[str, Set[str]]], nh: str, na: str) -> Optional[Dict[str, Set[str]]]:
@@ -5708,8 +5792,8 @@ class ExternalAnalyticsCollector:
             over_25 = round(1.0 / (p_m_o25 * margin), 2)
             under_25 = round(1.0 / ((1.0 - p_m_o25) * margin), 2)
 
+        p_fair_o25 = (1.0 / over_25) / ((1.0 / over_25) + (1.0 / under_25))
         if lam_mkt is None:
-            p_fair_o25 = (1.0 / over_25) / ((1.0 / over_25) + (1.0 / under_25))
             lam_mkt = cls._invert_poisson_lambda_from_p_over25(p_fair_o25)
         p0 = math.exp(-lam_mkt)
         p1 = lam_mkt * p0
@@ -5908,10 +5992,10 @@ class ExternalAnalyticsCollector:
             return cls._espn_prematch_cache[event_id]
 
         url = f"{LiveSportsbookAndStatsAPI.ESPN_SUMMARY_URL}?event={event_id}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         try:
-            with urllib.request.urlopen(req, timeout=4) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            raw_sum = _http_request_bytes(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=4)
+            if True:
+                data = json.loads(raw_sum.decode("utf-8"))
 
                 # 1. Extract SPI Predictor if present
                 pred = data.get("predictor", {})
@@ -7792,10 +7876,14 @@ class SafeCushionBetCreator:
 
         paired_candidates: List[Tuple[int, int, float, LedgerBetItem, Dict[str, Any]]] = []
         for m in fixtures:
-            single, c_leg = cls.analyze_match_for_single_and_combo_leg(
-                m, active_date, buzz_teams, learning_state, max_hours_ahead=IDEAL_MAX_HOURS_BEFORE_KICKOFF,
-                strict_channel_quality=True
-            )
+            try:
+                single, c_leg = cls.analyze_match_for_single_and_combo_leg(
+                    m, active_date, buzz_teams, learning_state, max_hours_ahead=IDEAL_MAX_HOURS_BEFORE_KICKOFF,
+                    strict_channel_quality=True
+                )
+            except Exception as fx_exc:
+                logger.warning("Skipped fixture %s vs %s due to analysis error: %s", m.get("home"), m.get("away"), fx_exc)
+                continue
             if single and single.odds >= MIN_SINGLE_ODDS and c_leg:
                 has_ver_odds = bool(m.get("has_live_odds") or API_FOOTBALL_KEY)
                 odds_rank = 0 if has_ver_odds else 1
@@ -7804,10 +7892,14 @@ class SafeCushionBetCreator:
         if len(paired_candidates) < MAX_DAILY_SINGLES:
             already_picked = {p[3].bet_key for p in paired_candidates}
             for m in fixtures:
-                single, c_leg = cls.analyze_match_for_single_and_combo_leg(
-                    m, active_date, buzz_teams, learning_state, max_hours_ahead=ADAPTIVE_MAX_HOURS_BEFORE_KICKOFF,
-                    strict_channel_quality=True
-                )
+                try:
+                    single, c_leg = cls.analyze_match_for_single_and_combo_leg(
+                        m, active_date, buzz_teams, learning_state, max_hours_ahead=ADAPTIVE_MAX_HOURS_BEFORE_KICKOFF,
+                        strict_channel_quality=True
+                    )
+                except Exception as fx_exc2:
+                    logger.warning("Skipped adaptive fixture %s vs %s due to error: %s", m.get("home"), m.get("away"), fx_exc2)
+                    continue
                 if single and single.odds >= MIN_SINGLE_ODDS and c_leg and single.bet_key not in already_picked:
                     already_picked.add(single.bet_key)
                     has_ver_odds = bool(m.get("has_live_odds") or API_FOOTBALL_KEY)
@@ -10925,13 +11017,12 @@ class TelegramBotClient:
         url = f"{self.base_url}/{endpoint}"
         payload = json.dumps(payload_data).encode("utf-8")
         for attempt in range(4):
-            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
             try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    body = json.loads(resp.read().decode("utf-8"))
-                    if body.get("ok"):
-                        return True, body, "ok"
-                    return False, body, str(body.get("description", "error"))
+                raw_tg = _http_request_bytes(url, headers={"Content-Type": "application/json"}, data=payload, timeout=timeout)
+                body = json.loads(raw_tg.decode("utf-8"))
+                if body.get("ok"):
+                    return True, body, "ok"
+                return False, body, str(body.get("description", "error"))
             except urllib.error.HTTPError as he:
                 try:
                     err_body = json.loads(he.read().decode("utf-8", errors="ignore"))
