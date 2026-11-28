@@ -2515,6 +2515,7 @@ class SelfLearningEngine:
         high_shootout_trap_leagues: Set[str] = set()
         unreliable_teams: Set[str] = set()
         lessons_learned: List[str] = []
+        lg_cat_counts: Dict[Tuple[str, str], List[int]] = {}  # (lg, cat) -> [won, lost]
 
         for item in settled:
             s_key = cls.classify_strategy_key(item)
@@ -2523,6 +2524,10 @@ class SelfLearningEngine:
 
             st = strat_stats.setdefault(s_key, {"won": 0, "lost": 0, "net_u": 0.0, "ev_mod": 0.0, "status": "ACTIVE"})
             lg = league_stats.setdefault(lg_key, {"won": 0, "lost": 0, "net_u": 0.0, "ev_mod": 0.0})
+
+            cat_grp = "1x2" if s_key == "1x2_winner" else ("over" if s_key in ("over_25", "btts_yes") else ("under" if s_key == "under_25" else s_key))
+            wl_pair = lg_cat_counts.setdefault((lg_key, cat_grp), [0, 0])
+            wl_pair[0 if is_win else 1] += 1
 
             if is_win:
                 prof = BankrollStakeSizer.get_item_r_profit(item)
@@ -2543,14 +2548,6 @@ class SelfLearningEngine:
 
                 if "1_1" in f_mode or (s_key == "over_25" and gh == 1 and ga == 1):
                     btts_preferred_leagues.add(lg_key)
-                if "DRAW_TRAP" in f_mode or (s_key == "1x2_winner" and gh == ga):
-                    draw_trap_leagues.add(lg_key)
-                if "LOW_PACE" in f_mode or "SHUTOUT" in f_mode or (s_key in ["over_25", "btts_yes"] and tot_g <= 1):
-                    low_goal_trap_leagues.add(lg_key)
-                if "SHOOTOUT" in f_mode or (s_key == "under_25" and tot_g >= 3):
-                    high_shootout_trap_leagues.add(lg_key)
-                if "DEFENSIVE_COLLAPSE" in f_mode:
-                    unreliable_teams.add(normalize_team_str(item.team_home))
 
                 if item.loss_autopsy:
                     lessons_learned.append(f"{item.team_home} vs {item.team_away} ({item.score_str}): {item.loss_autopsy}")
@@ -2569,15 +2566,26 @@ class SelfLearningEngine:
                 d["ev_mod"] = min(6.0, round(net_diff * 2.5, 1))
                 d["status"] = "🔥 HOT (Boosted)"
             elif net_diff < 0:
-                d["ev_mod"] = max(-12.0, round(net_diff * 4.5, 1))
-                d["status"] = "❄️ COOLDOWN (Tightened)" if (tot >= 2 and wr <= 35.0) else "⚠️ CAUTIOUS"
+                d["ev_mod"] = max(-6.0, round(net_diff * 2.0, 1))
+                # Only enter COOLDOWN on meaningful sample (>= 6 settled bets & <= 28% WR), never on 2-3 early bets!
+                d["status"] = "❄️ COOLDOWN (Tightened)" if (tot >= 6 and wr <= 28.0) else "⚠️ CAUTIOUS"
             else:
                 d["ev_mod"] = 0.0
                 d["status"] = "⚖️ NEUTRAL"
 
+        for (lg_k, c_grp), (cw, cl) in lg_cat_counts.items():
+            ctot = cw + cl
+            if ctot >= 4 and (cw / ctot) <= 0.25:
+                if c_grp == "1x2":
+                    draw_trap_leagues.add(lg_k)
+                elif c_grp == "over":
+                    low_goal_trap_leagues.add(lg_k)
+                elif c_grp == "under":
+                    high_shootout_trap_leagues.add(lg_k)
+
         for lg_key, d in league_stats.items():
             net_diff = d["won"] - d["lost"]
-            d["ev_mod"] = max(-8.0, min(5.0, round(net_diff * 3.0, 1)))
+            d["ev_mod"] = max(-4.0, min(5.0, round(net_diff * 2.0, 1)))
 
         state = {
             "updated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
@@ -4783,23 +4791,33 @@ class ExpertConsensusHub:
             elif "-2.5" in adv or "under 2.5" in adv:
                 combined["under_25"].add("API-Football")
 
-        # Merge ESPN Match Predictor & Team Scoring History
-        espn_hw = float(deep_stats.get("espn_home_win_prob", 0.0) or 0.0)
-        espn_aw = float(deep_stats.get("espn_away_win_prob", 0.0) or 0.0)
-        if espn_hw >= 56.0:
+        # Merge ESPN Match Predictor & Team Scoring/Form History
+        espn_hw = float(deep_stats.get("espn_home_win_prob") or deep_stats.get("spi_home_prob") or 0.0)
+        espn_aw = float(deep_stats.get("espn_away_win_prob") or deep_stats.get("spi_away_prob") or 0.0)
+        h_f_ds = str(deep_stats.get("h_form_str") or "")
+        a_f_ds = str(deep_stats.get("a_form_str") or "")
+        if espn_hw >= 54.0 or (len(h_f_ds) >= 4 and h_f_ds.count("W") >= 3 and a_f_ds.count("L") >= 2):
             combined["home_win"].add("ESPN Stats")
             combined["home_1x"].add("ESPN Stats")
-            if espn_hw >= 68.0:
+            if espn_hw >= 66.0 or (h_f_ds.count("W") >= 4 and a_f_ds.count("L") >= 3):
                 combined["home_handicap"].add("ESPN Stats")
-        elif espn_aw >= 52.0:
+        elif espn_hw >= 46.5 and espn_aw <= 26.0:
+            combined["home_1x"].add("ESPN Stats")
+        if espn_aw >= 50.0 or (len(a_f_ds) >= 4 and a_f_ds.count("W") >= 3 and h_f_ds.count("L") >= 2):
             combined["away_win"].add("ESPN Stats")
+            combined["away_x2"].add("ESPN Stats")
+        elif espn_aw >= 45.0 and espn_hw <= 27.5:
             combined["away_x2"].add("ESPN Stats")
         if deep_stats.get("has_deep_stats"):
             tot_gf_avg = float(deep_stats.get("h_gf_avg", 0.0)) + float(deep_stats.get("a_gf_avg", 0.0))
-            if tot_gf_avg >= 3.15:
+            tot_ga_avg = float(deep_stats.get("h_ga_avg", 0.0)) + float(deep_stats.get("a_ga_avg", 0.0))
+            blend_g = 0.55 * tot_gf_avg + 0.45 * tot_ga_avg if tot_ga_avg > 0 else tot_gf_avg
+            if blend_g >= 2.85 or int(deep_stats.get("games_with_3plus_goals", 0)) >= 6:
                 combined["over_25"].add("ESPN Stats")
-            elif 0 < tot_gf_avg <= 2.15:
+            elif 0 < blend_g <= 2.15 and int(deep_stats.get("high_ceiling_4plus_games", 0)) == 0:
                 combined["under_25"].add("ESPN Stats")
+            if float(deep_stats.get("btts_recent_rate", 0.0)) >= 0.60 and float(deep_stats.get("h_gf_avg", 0.0)) >= 1.2 and float(deep_stats.get("a_gf_avg", 0.0)) >= 1.1:
+                combined["btts_yes"].add("ESPN Stats")
 
         # Merge ClubElo Quantitative Feed
         if key in ExternalAnalyticsCollector._external_elo_projections:
@@ -5872,8 +5890,12 @@ class ExternalAnalyticsCollector:
             "has_deep_stats": False,
             "h_gf_avg": 0.0, "h_ga_avg": 0.0,
             "a_gf_avg": 0.0, "a_ga_avg": 0.0,
+            "h_form_str": "", "a_form_str": "",
+            "h_record_str": "", "a_record_str": "",
+            "pickcenter_odds": {},
             "h2h_avg_goals": 0.0,
             "spi_home_prob": 0.0, "spi_away_prob": 0.0,
+            "espn_home_win_prob": 0.0, "espn_away_win_prob": 0.0,
             "max_recent_match_goals": 0,
             "high_ceiling_4plus_games": 0,
             "games_with_3plus_goals": 0,
@@ -5897,6 +5919,10 @@ class ExternalAnalyticsCollector:
                 a_proj = float(pred.get("awayTeam", {}).get("gameProjection", 0.0) or 0.0)
                 default_res["spi_home_prob"] = h_proj
                 default_res["spi_away_prob"] = a_proj
+                default_res["espn_home_win_prob"] = h_proj
+                default_res["espn_away_win_prob"] = a_proj
+                if h_proj > 0 or a_proj > 0:
+                    default_res["has_deep_stats"] = True
 
                 max_goals_seen = 0
                 cnt_4plus = 0
@@ -5911,8 +5937,14 @@ class ExternalAnalyticsCollector:
                     for idx, prefix in [(0, "h"), (1, "a")]:
                         events = form_list[idx].get("events", [])
                         gf_tot, ga_tot, cnt = 0, 0, 0
+                        form_chars: List[str] = []
                         for ev_item in events[:5]:
-                            sc_str = str(ev_item.get("score", ""))
+                            sc_str = str(ev_item.get("score", "") or "")
+                            if not sc_str and ev_item.get("homeTeamScore") is not None and ev_item.get("awayTeamScore") is not None:
+                                sc_str = f"{ev_item.get('homeTeamScore')} - {ev_item.get('awayTeamScore')}"
+                            res_ch = str(ev_item.get("gameResult", "")).strip().upper()
+                            if res_ch in ("W", "D", "L"):
+                                form_chars.append(res_ch)
                             m_sc = re.search(r"(\d+)\s*-\s*(\d+)", sc_str)
                             if m_sc:
                                 g1, g2 = int(m_sc.group(1)), int(m_sc.group(2))
@@ -5926,17 +5958,26 @@ class ExternalAnalyticsCollector:
                                     btts_hits += 1
                                 total_tracked_games += 1
                                 scorelines_seen.append(f"{g1}-{g2}")
-                                res_ch = str(ev_item.get("gameResult", "")).upper()
                                 if res_ch == "W":
                                     gf_tot += max(g1, g2)
                                     ga_tot += min(g1, g2)
                                 elif res_ch == "L":
                                     gf_tot += min(g1, g2)
                                     ga_tot += max(g1, g2)
+                                elif g1 == g2:
+                                    gf_tot += g1
+                                    ga_tot += g2
+                                    if res_ch not in ("W", "D", "L"):
+                                        form_chars.append("D")
                                 else:
                                     gf_tot += g1
                                     ga_tot += g2
                                 cnt += 1
+                        if form_chars:
+                            # ESPN lists most-recent first; reverse so `[-5:]` ends with latest match
+                            default_res[f"{prefix}_form_str"] = "".join(reversed(form_chars[:5]))
+                            if len(form_chars) >= 3:
+                                default_res["has_deep_stats"] = True
                         if cnt > 0:
                             default_res[f"{prefix}_gf_avg"] = round(gf_tot / cnt, 2)
                             default_res[f"{prefix}_ga_avg"] = round(ga_tot / cnt, 2)
@@ -5960,6 +6001,48 @@ class ExternalAnalyticsCollector:
                 if h2h_cnt > 0:
                     default_res["h2h_avg_goals"] = round(h2h_goals / h2h_cnt, 2)
                     default_res["has_deep_stats"] = True
+
+                # 4. Extract `pickcenter` sportsbook odds from `/summary` when `/scoreboard` omits `odds`!
+                pc_list = data.get("pickcenter") or []
+                if isinstance(pc_list, list) and pc_list and isinstance(pc_list[0], dict):
+                    pc = pc_list[0]
+                    pc_odds: Dict[str, float] = {}
+                    h_ml_p = LiveSportsbookAndStatsAPI._american_to_decimal((pc.get("homeTeamOdds") or {}).get("moneyLine"))
+                    a_ml_p = LiveSportsbookAndStatsAPI._american_to_decimal((pc.get("awayTeamOdds") or {}).get("moneyLine"))
+                    d_ml_p = LiveSportsbookAndStatsAPI._american_to_decimal((pc.get("drawOdds") or {}).get("moneyLine"))
+                    ov_p = LiveSportsbookAndStatsAPI._american_to_decimal(pc.get("overOdds"))
+                    un_p = LiveSportsbookAndStatsAPI._american_to_decimal(pc.get("underOdds"))
+                    if h_ml_p:
+                        pc_odds["home_odds"] = h_ml_p
+                    if d_ml_p:
+                        pc_odds["draw_odds"] = d_ml_p
+                    if a_ml_p:
+                        pc_odds["away_odds"] = a_ml_p
+                    if ov_p:
+                        pc_odds["over_odds"] = ov_p
+                    if un_p:
+                        pc_odds["under_odds"] = un_p
+                    if pc.get("overUnder") is not None:
+                        try:
+                            pc_odds["ou_line"] = float(pc["overUnder"])
+                        except Exception:
+                            pass
+                    if pc_odds:
+                        default_res["pickcenter_odds"] = pc_odds
+
+                # 5. Extract `header.competitions[0].competitors` W-D-L records if present on `/summary`
+                hdr_comps = (data.get("header") or {}).get("competitions") or []
+                if hdr_comps and isinstance(hdr_comps[0], dict):
+                    for comp_tm in (hdr_comps[0].get("competitors") or []):
+                        ha_s = str(comp_tm.get("homeAway", "")).lower()
+                        recs_s = comp_tm.get("record") or comp_tm.get("records") or []
+                        if recs_s and isinstance(recs_s[0], dict):
+                            r_sum = str(recs_s[0].get("displayValue") or recs_s[0].get("summary") or "")
+                            if re.match(r"\d+\s*-\s*\d+\s*-\s*\d+", r_sum.strip()):
+                                if ha_s == "home":
+                                    default_res["h_record_str"] = r_sum.strip()
+                                elif ha_s == "away":
+                                    default_res["a_record_str"] = r_sum.strip()
 
                 default_res["max_recent_match_goals"] = max_goals_seen
                 default_res["high_ceiling_4plus_games"] = cnt_4plus
@@ -6731,11 +6814,61 @@ class SafeCushionBetCreator:
             deep_stats["a_gf_avg"] = float(apif_pred.get("a_gf_season", 0.0))
             deep_stats["a_ga_avg"] = float(apif_pred.get("a_ga_season", 0.0))
 
-        # v46.1 Verified Sample Gate: Allow verified ESPN `/summary` deep_stats OR API-Football season stats when raw `/scoreboard` omits W-D-L,
-        # while STILL strictly blocking blind Cup/unknown matches where BOTH raw form AND deep season stats are missing!
+        # v46.2 Backfill Pickcenter Odds, Season Records & Last-5 Form from ESPN `/summary` (`deep_stats`)!
+        pc_od_map = deep_stats.get("pickcenter_odds") or {}
+        if pc_od_map:
+            m = dict(m)
+            for pk_k, pk_v in pc_od_map.items():
+                if not m.get(pk_k):
+                    m[pk_k] = pk_v
+            if m.get("home_odds") or m.get("away_odds") or m.get("over_odds"):
+                m["has_live_odds"] = True
+        if raw_h_sample < 3 and deep_stats.get("h_record_str"):
+            hw, hd, hl = cls._parse_w_d_l(str(deep_stats["h_record_str"]), h_form)
+            raw_h_sample = hw + hd + hl
+        if raw_a_sample < 3 and deep_stats.get("a_record_str"):
+            aw, ad, al = cls._parse_w_d_l(str(deep_stats["a_record_str"]), a_form)
+            raw_a_sample = aw + ad + al
+        if not h_form and deep_stats.get("h_form_str"):
+            h_form = str(deep_stats["h_form_str"])[-5:]
+        if not a_form and deep_stats.get("a_form_str"):
+            a_form = str(deep_stats["a_form_str"])[-5:]
+        if raw_h_sample < 3 and len(h_form) >= 3:
+            hw, hd, hl = h_form.count("W"), h_form.count("D"), h_form.count("L")
+            raw_h_sample = hw + hd + hl
+        if raw_a_sample < 3 and len(a_form) >= 3:
+            aw, ad, al = a_form.count("W"), a_form.count("D"), a_form.count("L")
+            raw_a_sample = aw + ad + al
+
         has_verified_season_profile = bool(deep_stats.get("has_deep_stats") or apif_pred.get("advice"))
         if strict_channel_quality and (raw_h_sample < 3 or raw_a_sample < 3) and not has_verified_season_profile:
             return None, None
+
+        # Recompute rates & recent W/D/L counts after `deep_stats` backfill!
+        if raw_h_sample >= 3:
+            h_games = max(1, raw_h_sample)
+            h_win_rate = hw / h_games
+            h_loss_rate = hl / h_games
+        elif float(deep_stats.get("espn_home_win_prob") or 0.0) > 0:
+            p_eh = float(deep_stats["espn_home_win_prob"]) / 100.0
+            h_win_rate = max(0.15, min(0.80, p_eh))
+            h_loss_rate = max(0.10, min(0.65, 1.0 - p_eh - 0.24))
+        if raw_a_sample >= 3:
+            a_games = max(1, raw_a_sample)
+            a_win_rate = aw / a_games
+            a_loss_rate = al / a_games
+        elif float(deep_stats.get("espn_away_win_prob") or 0.0) > 0:
+            p_ea = float(deep_stats["espn_away_win_prob"]) / 100.0
+            a_win_rate = max(0.12, min(0.78, p_ea))
+            a_loss_rate = max(0.10, min(0.68, 1.0 - p_ea - 0.24))
+
+        h_recent_w = h_form.count("W") if h_form else int(round(h_win_rate * 5))
+        h_recent_d = h_form.count("D") if h_form else 1
+        h_recent_l = h_form.count("L") if h_form else int(round(h_loss_rate * 5))
+        a_recent_w = a_form.count("W") if a_form else int(round(a_win_rate * 5))
+        a_recent_d = a_form.count("D") if a_form else 1
+        a_recent_l = a_form.count("L") if a_form else int(round(a_loss_rate * 5))
+        combined_draws = h_recent_d + a_recent_d
 
         dc = QuantitativeEnsembleModels.run_dixon_coles_matrix(
             h_form, a_form, h_win_rate, h_loss_rate, a_win_rate, a_loss_rate,
@@ -6789,8 +6922,9 @@ class SafeCushionBetCreator:
             "market_type": "dnb", "selection": f"Draw No Bet ➔ {home}", "line": None, "odds": bc_odds["dnb_home"]
         }
 
-        # v38.0 Strict Real-Odds Gate: Never publish singles priced purely from synthetic fallback math!
-        if bc_odds.get("is_verified_on_bookmakers", 0.0) <= 0.0:
+        # v46.2 Strict Real-Odds Gate: Require verified bookmaker odds OR live Playwright BC.Game screen verification before publishing!
+        needs_live_screen_odds = bc_odds.get("is_verified_on_bookmakers", 0.0) <= 0.0
+        if needs_live_screen_odds and not (strict_channel_quality and BCGameLivePlaywrightEngine.is_available() and has_verified_season_profile):
             return None, None
 
         candidates: List[Tuple[float, LedgerBetItem, Dict[str, Any]]] = []
@@ -6803,10 +6937,10 @@ class SafeCushionBetCreator:
         if (
             ok_m1
             and MIN_SINGLE_ODDS <= bc_odds["home_1x2"] <= 2.02
-            and (not strict_channel_quality or (dc["p_draw"] < 26.8 and combined_draws <= 3))
-            and h_win_rate >= a_win_rate + 0.14
-            and h_recent_w >= 3
-            and h_recent_l <= 1
+            and (not strict_channel_quality or (dc["p_draw"] < 27.8 and combined_draws <= 4))
+            and h_win_rate >= a_win_rate + 0.11
+            and h_recent_w >= 2
+            and h_recent_l <= 2
             and league_label not in draw_traps
             and normalize_team_str(home) not in unreliable_teams
             and not is_in_cooldown("1x2_winner")
@@ -6903,10 +7037,10 @@ class SafeCushionBetCreator:
         ok_m4, n_f4, _, c_bon4, c_tag4 = ExpertConsensusHub.evaluate_market_consensus(ballot, "away_dnb", strict_channel_mode=strict_channel_quality)
         if (
             ok_m4
-            and 1.62 <= bc_odds["dnb_away"] <= 1.98
-            and a_win_rate >= h_win_rate + 0.08
-            and a_recent_l <= 1
-            and h_recent_w <= 2
+            and MIN_SINGLE_ODDS <= bc_odds["dnb_away"] <= 2.02
+            and a_win_rate >= h_win_rate + 0.06
+            and a_recent_l <= 2
+            and h_recent_w <= 3
             and not is_in_cooldown("draw_no_bet")
         ):
             odds = bc_odds["dnb_away"]
@@ -6924,10 +7058,10 @@ class SafeCushionBetCreator:
         ok_m5, n_f5, _, c_bon5, c_tag5 = ExpertConsensusHub.evaluate_market_consensus(ballot, "home_dnb", strict_channel_mode=strict_channel_quality)
         if (
             ok_m5
-            and 1.62 <= bc_odds["dnb_home"] <= 1.98
-            and h_win_rate >= a_win_rate + 0.06
-            and h_recent_l <= 1
-            and a_recent_w <= 2
+            and MIN_SINGLE_ODDS <= bc_odds["dnb_home"] <= 2.02
+            and h_win_rate >= a_win_rate + 0.05
+            and h_recent_l <= 2
+            and a_recent_w <= 3
             and not is_in_cooldown("draw_no_bet")
         ):
             odds = bc_odds["dnb_home"]
@@ -7122,6 +7256,8 @@ class SafeCushionBetCreator:
 
         vetted_candidates.sort(key=lambda x: x[0], reverse=True)
         best_score, best_single, best_combo_leg = vetted_candidates[0]
+        if needs_live_screen_odds:
+            best_single.rotation_warning = "__NEEDS_LIVE_BC_ODDS__"
         return best_single, best_combo_leg
 
     @classmethod
@@ -7728,16 +7864,19 @@ class SafeCushionBetCreator:
                 )
                 # v40.0 Strict Live-Existence Verification & Auto-Pivot (`reconcile_single_with_live_bcgame`):
                 live_sc = BCGameLivePlaywrightEngine.get_live_match_odds(s_obj.team_home, s_obj.team_away)
+                if s_obj.rotation_warning == "__NEEDS_LIVE_BC_ODDS__":
+                    s_obj.rotation_warning = None
+                    if not live_sc:
+                        # Zero synthetic odds allowed: if ESPN had no odds AND Playwright couldn't read BC.Game odds, skip!
+                        continue
                 if live_sc:
                     pre_odds = s_obj.odds
                     ok_rec = cls.reconcile_single_with_live_bcgame(s_obj, live_sc, is_raw_screen=True)
                     if not ok_rec or s_obj.odds < MIN_SINGLE_ODDS or s_obj.odds > 2.04 or s_obj.market_type == "corners_over_under":
                         continue
-                    # If live BC.Game screen steamed down > 0.09 below pre-check price, ensure EV didn't turn negative!
                     if (pre_odds - s_obj.odds) > 0.09 and (s_obj.edge_ev - ((pre_odds - s_obj.odds) * 48.0)) < 1.5:
                         continue
                 elif BCGameLivePlaywrightEngine.is_available() and s_obj.market_type in ("handicap", "corners_over_under"):
-                    # Never publish an unverified Handicap or Corners line when Playwright is online!
                     continue
                     if isinstance(c_leg_obj, dict):
                         cl_sel = str(c_leg_obj.get("selection", "")).lower()
@@ -7760,9 +7899,11 @@ class SafeCushionBetCreator:
             pool_final = exact_verified_pairs if len(exact_verified_pairs) >= 2 else (exact_verified_pairs + fallback_pairs)
             chosen_final_pairs = pool_final[: max(0, slots_left)]
             top_pairs = chosen_final_pairs
+            in_win_cnt = sum(1 for fx in fixtures if not fx.get("is_finished") and not fx.get("is_live") and MIN_HOURS_BEFORE_KICKOFF <= (fx.get("hours_until_kickoff") or -1) <= ADAPTIVE_MAX_HOURS_BEFORE_KICKOFF)
+            with_odds_cnt = sum(1 for fx in fixtures if not fx.get("is_finished") and not fx.get("is_live") and fx.get("has_live_odds"))
             logger.info(
-                "Slate builder (%s): scanned=%d upcoming fixtures -> %d raw +EV candidates -> %d final verified singles",
-                active_date, len(fixtures), len(paired_candidates), len(chosen_final_pairs)
+                "Slate builder (%s): total=%d | in_window=%d | espn_odds=%d | pw_avail=%s | raw_+EV=%d -> final=%d verified singles",
+                active_date, len(fixtures), in_win_cnt, with_odds_cnt, BCGameLivePlaywrightEngine.is_available(), len(paired_candidates), len(chosen_final_pairs)
             )
             for _, _, _, single, _ in chosen_final_pairs:
                 DailyLedgerManager.upsert_bet(single)
