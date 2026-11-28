@@ -9191,8 +9191,553 @@ class LiveChannelAdminEditor:
             return "ℹ️ I didn't catch that exact edit format. Here are the live controls:\n\n" + cls.format_admin_dashboard()
 
 
+
+class PersonalStrategyBacktestAuditor:
+    """
+    v42.0 Personal Bot-Only Main Bets vs Safe Alternatives P&L Auditor:
+    Strictly private to `@betyyyybot` DM (NEVER posts to `@Footybett`).
+    Computes exact W - P - L, Win Rate %, Non-Loss Rate %, Net R, Net $, and ROI % if a user took:
+      1. ONLY Main Bets (100% Primary Selection @ Main Odds)
+      2. ONLY Safe Alternatives (100% Safe Alt Line @ Safe Alt Odds)
+      3. BOTH Side-by-Side Comparison
+    Across:
+      • Since Start of Channel (`2026-11-15` -> Present)
+      • Monthly Breakdown (`YYYY-MM`)
+      • Weekly Breakdown (Rolling Last 7 Days + Monday-Sunday ISO Weeks)
+      • All 3 Together
+    """
+    _sessions: Dict[int, Dict[str, Any]] = {}
+
+    MODE_LABELS = {
+        "main": "🎯 Only Main Bets",
+        "safe": "🛡️ Only Safe Alternatives",
+        "both": "⚖️ Both (Main vs Safe Alt)",
+    }
+    PERIOD_LABELS = {
+        "start": "🚀 Since Start of Channel",
+        "monthly": "📅 Monthly Results",
+        "weekly": "📆 Weekly Results",
+        "all": "📋 Since Start + Monthly + Weekly",
+    }
+
+    @staticmethod
+    def build_step1_mode_keyboard() -> Dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "🎯 Only Main Bets", "callback_data": "pnl:mode:main"},
+                    {"text": "🛡️ Only Safe Alternatives", "callback_data": "pnl:mode:safe"},
+                ],
+                [
+                    {"text": "⚖️ Both (Main vs Safe Alt)", "callback_data": "pnl:mode:both"},
+                ],
+            ]
+        }
+
+    @staticmethod
+    def build_step2_period_keyboard(mode: str) -> Dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "🚀 Since Start", "callback_data": f"pnl:run:{mode}:start"},
+                    {"text": "📅 Monthly", "callback_data": f"pnl:run:{mode}:monthly"},
+                ],
+                [
+                    {"text": "📆 Weekly", "callback_data": f"pnl:run:{mode}:weekly"},
+                    {"text": "📋 Show All 3", "callback_data": f"pnl:run:{mode}:all"},
+                ],
+                [
+                    {"text": "🔙 Change Strategy (Main / Safe Alt / Both)", "callback_data": "pnl:menu"},
+                ],
+            ]
+        }
+
+    @staticmethod
+    def build_report_switcher_keyboard(mode: str, period: str) -> Dict[str, Any]:
+        other_modes = [
+            {"text": ("✅ " if m == mode else "") + lbl.split(" (")[0], "callback_data": f"pnl:run:{m}:{period}"}
+            for m, lbl in [("main", "🎯 Main Only"), ("safe", "🛡️ Safe Alt"), ("both", "⚖️ Both")]
+        ]
+        period_btns_1 = [
+            {"text": ("✅ " if p == period else "") + lbl, "callback_data": f"pnl:run:{mode}:{p}"}
+            for p, lbl in [("start", "🚀 Since Start"), ("monthly", "📅 Monthly")]
+        ]
+        period_btns_2 = [
+            {"text": ("✅ " if p == period else "") + lbl, "callback_data": f"pnl:run:{mode}:{p}"}
+            for p, lbl in [("weekly", "📆 Weekly"), ("all", "📋 All 3")]
+        ]
+        return {"inline_keyboard": [period_btns_1, period_btns_2, other_modes]}
+
+    @classmethod
+    def format_step1_prompt(cls) -> str:
+        r_usd = BankrollStakeSizer.get_unit_usd()
+        return (
+            "📊 PERSONAL P&L AUDITOR (Private Bot Only)\n"
+            "────────────────────────\n"
+            f"💵 Stake Basis: 1.00R = ${r_usd:.0f} per Single\n\n"
+            "Which strategy do you want to check?\n"
+            "1️⃣ 🎯 Only Main Bets Taken (Primary Selection @ Main Odds)\n"
+            "2️⃣ 🛡️ Only Safe Alternatives Taken (Safe Alt Line @ Safe Alt Odds)\n"
+            "3️⃣ ⚖️ Both Side-by-Side (Main Bets vs Safe Alternatives)\n\n"
+            "👇 Tap your choice below (or reply 1, 2, or 3):"
+        )
+
+    @classmethod
+    def format_step2_prompt(cls, mode: str) -> str:
+        mode_lbl = cls.MODE_LABELS.get(mode, cls.MODE_LABELS["both"])
+        return (
+            f"🗓️ Strategy Selected: {mode_lbl}\n"
+            "────────────────────────\n"
+            "Which timeframe do you want to view?\n"
+            f"• 🚀 Since Start of Channel (All-Time since {TRACKING_START_DATE})\n"
+            "• 📅 Monthly Results (Month-by-Month Breakdown)\n"
+            "• 📆 Weekly Results (Last 7 Days + Week-by-Week)\n"
+            "• 📋 All 3 Together (Since Start + Monthly + Weekly)\n\n"
+            "👇 Tap a timeframe below (or reply start, monthly, weekly, or all):"
+        )
+
+    @classmethod
+    def start_session(cls, user_id: int) -> Tuple[str, Dict[str, Any]]:
+        cls._sessions[int(user_id)] = {"step": "await_mode", "mode": "both", "ts": time.time()}
+        return cls.format_step1_prompt(), cls.build_step1_mode_keyboard()
+
+    @staticmethod
+    def _detect_mode_in_text(low: str) -> Optional[str]:
+        if low in ("1", "main", "main bets", "only main", "main only", "primary"):
+            return "main"
+        if low in ("2", "safe", "safe alt", "safe alts", "safe alternative", "safe alternatives", "only safe", "alt"):
+            return "safe"
+        if low in ("3", "both", "compare", "all strategies", "side by side"):
+            return "both"
+        has_main = any(w in low for w in ("main bet", "only main", "main only"))
+        has_safe = any(w in low for w in ("safe alt", "safe alternative", "only safe"))
+        if "both" in low or (has_main and has_safe):
+            return "both"
+        if has_safe:
+            return "safe"
+        if has_main:
+            return "main"
+        return None
+
+    @staticmethod
+    def _detect_period_in_text(low: str) -> Optional[str]:
+        if low in ("all", "all 3", "everything", "full", "4"):
+            return "all"
+        has_start = any(w in low for w in ("since start", "start of channel", "all time", "all-time", "from start")) or low == "start"
+        has_month = any(w in low for w in ("month", "monthly"))
+        has_week = any(w in low for w in ("week", "weekly", "7 days", "last 7"))
+        if sum([bool(has_start), bool(has_month), bool(has_week)]) >= 2:
+            return "all"
+        if has_week:
+            return "weekly"
+        if has_month:
+            return "monthly"
+        if has_start:
+            return "start"
+        return None
+
+    @classmethod
+    def is_trigger_command(cls, text: str) -> bool:
+        low = (text or "").strip().lower()
+        if low in (
+            "/pnl", "/compare", "/backtest", "/myresults",
+            "📊 main vs safe alt results", "main vs safe alt", "main vs safe alt results"
+        ):
+            return True
+        if any(k in low for k in ("safe alternative", "safe alt")) and any(k in low for k in ("result", "monthly", "weekly", "since start", "profit", "pnl")):
+            return True
+        if "main bet" in low and any(k in low for k in ("result", "monthly", "weekly", "since start", "profit", "pnl")):
+            return True
+        return False
+
+    @classmethod
+    def should_intercept_text_reply(cls, user_id: int, text: str) -> bool:
+        if cls.is_trigger_command(text):
+            return True
+        sess = cls._sessions.get(int(user_id or 0))
+        if not sess or (time.time() - float(sess.get("ts", 0))) > 1800:
+            return False
+        low = (text or "").strip().lower()
+        if not low or low.startswith("/"):
+            return False
+        return bool(cls._detect_mode_in_text(low) or cls._detect_period_in_text(low))
+
+    @classmethod
+    def handle_text_interaction(cls, user_id: int, text: str) -> Tuple[str, Dict[str, Any]]:
+        uid = int(user_id or 0)
+        low = (text or "").strip().lower()
+        mode_hit = cls._detect_mode_in_text(low)
+        period_hit = cls._detect_period_in_text(low)
+
+        # If user specified BOTH mode and timeframe in one message, answer immediately!
+        if mode_hit and period_hit:
+            cls._sessions[uid] = {"step": "done", "mode": mode_hit, "ts": time.time()}
+            return cls.build_pnl_report(mode_hit, period_hit), cls.build_report_switcher_keyboard(mode_hit, period_hit)
+
+        # If user tapped the main button or `/pnl` without specifying mode yet -> Step 1!
+        if low in ("/pnl", "/compare", "/backtest", "/myresults", "📊 main vs safe alt results", "main vs safe alt", "main vs safe alt results"):
+            return cls.start_session(uid)
+
+        sess = cls._sessions.get(uid) or {"step": "await_mode", "mode": "both", "ts": time.time()}
+
+        if mode_hit and not period_hit:
+            cls._sessions[uid] = {"step": "await_period", "mode": mode_hit, "ts": time.time()}
+            return cls.format_step2_prompt(mode_hit), cls.build_step2_period_keyboard(mode_hit)
+
+        if period_hit:
+            chosen_mode = sess.get("mode") or "both"
+            cls._sessions[uid] = {"step": "done", "mode": chosen_mode, "ts": time.time()}
+            return cls.build_pnl_report(chosen_mode, period_hit), cls.build_report_switcher_keyboard(chosen_mode, period_hit)
+
+        return cls.start_session(uid)
+
+    @classmethod
+    def handle_callback(cls, user_id: int, cb_data: str) -> Tuple[str, Dict[str, Any]]:
+        uid = int(user_id or 0)
+        parts = (cb_data or "").split(":")
+        if len(parts) >= 2 and parts[1] == "menu":
+            return cls.start_session(uid)
+        if len(parts) >= 3 and parts[1] == "mode":
+            mode = parts[2] if parts[2] in cls.MODE_LABELS else "both"
+            cls._sessions[uid] = {"step": "await_period", "mode": mode, "ts": time.time()}
+            return cls.format_step2_prompt(mode), cls.build_step2_period_keyboard(mode)
+        if len(parts) >= 4 and parts[1] == "run":
+            mode = parts[2] if parts[2] in cls.MODE_LABELS else "both"
+            period = parts[3] if parts[3] in cls.PERIOD_LABELS else "all"
+            cls._sessions[uid] = {"step": "done", "mode": mode, "ts": time.time()}
+            return cls.build_pnl_report(mode, period), cls.build_report_switcher_keyboard(mode, period)
+        return cls.start_session(uid)
+
+    @staticmethod
+    def _extract_score_and_corners(item: LedgerBetItem) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+        sc_raw = str(item.score_str or "")
+        st_raw = str(getattr(item, "match_stats_summary", "") or "")
+        gh, ga, corners = None, None, None
+        m_sc = re.search(r"(\d+)\s*-\s*(\d+)", sc_raw)
+        if m_sc and "LIVE" not in sc_raw.upper():
+            gh, ga = int(m_sc.group(1)), int(m_sc.group(2))
+        m_c1 = re.search(r"(\d+)\s*Corners", sc_raw, re.IGNORECASE)
+        m_c2 = re.search(r"(\d+)\s*Corners", st_raw, re.IGNORECASE)
+        if m_c1:
+            corners = int(m_c1.group(1))
+        elif m_c2:
+            corners = int(m_c2.group(1))
+        return gh, ga, corners
+
+    @staticmethod
+    def _grade_selection_with_exact_r(
+        market_type: str,
+        selection: str,
+        line: Optional[float],
+        odds: float,
+        gh: int,
+        ga: int,
+        home: str,
+        away: str,
+        tot_corners: Optional[int]
+    ) -> Optional[Tuple[str, float]]:
+        sel_low = (selection or "").lower()
+        if (market_type == "corners_over_under" or "corner" in sel_low) and (tot_corners is None or tot_corners <= 0):
+            return None
+
+        # Quarter-goal Asian Handicap exact sportsbook settlement (`-1.25`, `-0.75`, `+0.75`, `+1.25`)
+        if ("3-way handicap" not in sel_low and not re.search(r"\(\d+:\d+\)", selection)) and (market_type == "handicap" or "handicap" in sel_low):
+            m_hc = re.search(r"\(([+-]\d+(?:\.\d+)?)\)", selection) or re.search(r"([+-]\d+(?:\.\d+)?)", selection)
+            hcap_val = float(m_hc.group(1)) if m_hc else line
+            if hcap_val is not None and abs(abs(hcap_val) % 0.5 - 0.25) < 1e-6:
+                for_away = LiveSportsbookAndStatsAPI._is_away_team_selected(selection, home, away)
+                diff = (ga - gh) if for_away else (gh - ga)
+                adj = diff + hcap_val
+                if adj > 0.30:
+                    return ("WON", round(odds - 1.0, 4))
+                if abs(adj - 0.25) < 1e-6:
+                    return ("WON", round(0.5 * (odds - 1.0), 4))
+                if abs(adj + 0.25) < 1e-6:
+                    return ("LOST", -0.50)
+                return ("LOST", -1.00)
+
+        res = LiveSportsbookAndStatsAPI.grade_single_condition(
+            market_type, selection, line, gh, ga, True, home, away, tot_corners=tot_corners
+        )
+        if "WON" in res:
+            return ("WON", round(max(0.01, odds - 1.0), 4))
+        if "PUSH" in res:
+            return ("PUSH", 0.0)
+        if "LOST" in res:
+            return ("LOST", -1.00)
+        return None
+
+    @classmethod
+    def evaluate_pure_main_single(cls, item: LedgerBetItem) -> Tuple[str, float, float]:
+        """Returns `(outcome_code, profit_r, main_odds)` if ONLY the Primary Main Bet was placed."""
+        odds = max(1.01, float(item.odds or 1.70))
+        gh, ga, corners = cls._extract_score_and_corners(item)
+        if gh is not None and ga is not None:
+            graded = cls._grade_selection_with_exact_r(
+                item.market_type, item.selection, item.line, odds, gh, ga, item.team_home, item.team_away, corners
+            )
+            if graded is not None:
+                return graded[0], graded[1], odds
+
+        # Fallback if historical item had no numeric score_str saved
+        if getattr(item, "won_via_safe_alt", False):
+            if "Primary: PUSH" in str(getattr(item, "settled_note", "")):
+                return "PUSH", 0.0, odds
+            return "LOST", -1.00, odds
+        if "WON" in item.settlement:
+            return "WON", round(odds - 1.0, 4), odds
+        if "PUSH" in item.settlement:
+            return "PUSH", 0.0, odds
+        return "LOST", -1.00, odds
+
+    @classmethod
+    def evaluate_pure_safe_alt_single(cls, item: LedgerBetItem) -> Tuple[str, float, float]:
+        """Returns `(outcome_code, profit_r, alt_odds)` if ONLY the Safe Alternative was placed."""
+        raw_alt = item.alt_bcgame_line or BankrollStakeSizer.build_guaranteed_safe_alt_line(
+            item.selection, item.market_type, item.team_home, item.team_away, None, item.odds
+        )
+        m_od = re.search(r"@\s*(\d+\.\d+)", str(raw_alt or ""))
+        alt_odds = float(m_od.group(1)) if m_od else max(1.18, round(1.0 + (float(item.odds or 1.70) - 1.0) * 0.48, 2))
+        alt_clean = re.sub(r"\(\s*@\s*\d+\.\d+[^)]*\)", "", str(raw_alt or ""))
+        alt_clean = re.sub(r"\[[^\]]*\]", "", alt_clean).split("(or")[0].strip()
+        alt_low = alt_clean.lower()
+
+        alt_line: Optional[float] = None
+        if "corner" in alt_low:
+            alt_mtype = "corners_over_under"
+            m_ln = re.search(r"(?:over|under)\s+(\d+\.\d+|\d+)", alt_low)
+            alt_line = float(m_ln.group(1)) if m_ln else 8.5
+        elif "3-way handicap" in alt_low or re.search(r"\(\d+:\d+\)", alt_clean):
+            alt_mtype = "handicap"
+        elif "handicap" in alt_low or re.search(r"\([+-]\d+(?:\.\d+)?\)", alt_clean):
+            alt_mtype = "handicap"
+            m_hc = re.search(r"\(([+-]\d+(?:\.\d+)?)\)", alt_clean) or re.search(r"([+-]\d+(?:\.\d+)?)", alt_clean)
+            alt_line = float(m_hc.group(1)) if m_hc else None
+        elif "over " in alt_low or "under " in alt_low:
+            alt_mtype = "goals_over_under"
+            m_ln = re.search(r"(?:over|under)\s+(\d+\.\d+|\d+)", alt_low)
+            alt_line = float(m_ln.group(1)) if m_ln else None
+        elif "draw no bet" in alt_low:
+            alt_mtype = "dnb"
+        elif "both teams" in alt_low or "btts" in alt_low:
+            alt_mtype = "btts"
+        else:
+            alt_mtype = "1x2"
+
+        gh, ga, corners = cls._extract_score_and_corners(item)
+        if gh is not None and ga is not None:
+            graded = cls._grade_selection_with_exact_r(
+                alt_mtype, alt_clean, alt_line, alt_odds, gh, ga, item.team_home, item.team_away, corners
+            )
+            if graded is not None:
+                return graded[0], graded[1], alt_odds
+
+        # Mathematically exact fallback if numeric score_str absent on an early record:
+        if getattr(item, "won_via_safe_alt", False):
+            if "PUSH" in item.settlement or "Refund" in str(getattr(item, "settled_note", "")):
+                return "PUSH", 0.0, alt_odds
+            return "WON", round(alt_odds - 1.0, 4), alt_odds
+        if "WON" in item.settlement or "PUSH" in item.settlement:
+            return "WON", round(alt_odds - 1.0, 4), alt_odds
+        return "LOST", -1.00, alt_odds
+
+    @classmethod
+    def get_settled_official_singles(cls) -> List[LedgerBetItem]:
+        """Returns chronologically ordered settled Official Singles matching `@Footybett`'s posted slates since start."""
+        all_items = list(DailyLedgerManager.load_all_history_items().values())
+        by_date: Dict[str, List[LedgerBetItem]] = {}
+        for it in all_items:
+            if (
+                it.is_approved
+                and not BankrollStakeSizer.is_optional_combo_or_lotto(it)
+                and it.date_str >= TRACKING_START_DATE
+                and it.settlement in ["WON ✅", "LOST ❌", "PUSH ➖"]
+            ):
+                by_date.setdefault(it.date_str, []).append(it)
+
+        ordered_out: List[LedgerBetItem] = []
+        for d_str in sorted(by_date.keys()):
+            day_pool = by_date[d_str]
+            posted = [x for x in day_pool if x.published_to_channel or int(getattr(x, "channel_message_id", 0) or 0) > 1]
+            chosen = posted if posted else day_pool
+            chosen.sort(key=lambda x: (int(getattr(x, "channel_message_id", 0) or 999999999), x.bet_key))
+            ordered_out.extend(chosen)
+        return ordered_out
+
+    @classmethod
+    def summarize_bucket(cls, items: List[LedgerBetItem], strategy: str) -> Dict[str, Any]:
+        w, p, l = 0, 0, 0
+        net_r = 0.0
+        win_odds_sum = 0.0
+        cur_loss_streak = 0
+        max_loss_streak = 0
+
+        for it in items:
+            out_code, prof_r, used_od = (
+                cls.evaluate_pure_main_single(it) if strategy == "main" else cls.evaluate_pure_safe_alt_single(it)
+            )
+            net_r += prof_r
+            if out_code == "WON":
+                w += 1
+                win_odds_sum += used_od
+                cur_loss_streak = 0
+            elif out_code == "PUSH":
+                p += 1
+            else:
+                l += 1
+                cur_loss_streak += 1
+                if cur_loss_streak > max_loss_streak:
+                    max_loss_streak = cur_loss_streak
+
+        tot = w + p + l
+        decided = w + l
+        wr = (w / decided * 100.0) if decided > 0 else 0.0
+        non_loss_pct = ((w + p) / tot * 100.0) if tot > 0 else 0.0
+        roi_pct = (net_r / tot * 100.0) if tot > 0 else 0.0
+        avg_win_od = (win_odds_sum / w) if w > 0 else 0.0
+        return {
+            "total": tot,
+            "won": w,
+            "push": p,
+            "lost": l,
+            "wr": wr,
+            "non_loss_pct": non_loss_pct,
+            "net_r": round(net_r, 2),
+            "roi_pct": round(roi_pct, 1),
+            "avg_win_odds": round(avg_win_od, 2),
+            "max_loss_streak": max_loss_streak,
+        }
+
+    @classmethod
+    def _format_single_bucket_lines(cls, label: str, st: Dict[str, Any], r_usd: float, compact: bool = False) -> List[str]:
+        net_dlr = st["net_r"] * r_usd
+        sign_dlr = f"+${net_dlr:.2f}" if net_dlr >= 0 else f"-${abs(net_dlr):.2f}"
+        if compact:
+            return [
+                f"  {label}: {st['won']}W - {st['push']}P - {st['lost']}L ({st['wr']:.1f}% WR) ➔ {st['net_r']:+.2f}R ({sign_dlr} | ROI {st['roi_pct']:+.1f}%)"
+            ]
+        return [
+            f"{label}",
+            f"• Record     : {st['won']} Won ✅ | {st['push']} Refund ➖ | {st['lost']} Lost ❌ ({st['total']} Picks)",
+            f"• Win Rate   : {st['wr']:.1f}% (Safe/Refund Rate: {st['non_loss_pct']:.1f}%)",
+            f"• Net Profit : {st['net_r']:+.2f}R ({sign_dlr} at ${r_usd:.0f}/bet | ROI {st['roi_pct']:+.1f}%)",
+            f"• Avg Win @  : {st['avg_win_odds']:.2f}  |  Worst Loss Run: {st['max_loss_streak']}L",
+        ]
+
+    @classmethod
+    def build_pnl_report(cls, mode: str, period: str) -> str:
+        r_usd = BankrollStakeSizer.get_unit_usd()
+        singles = cls.get_settled_official_singles()
+        active_d = DailyLedgerManager.get_active_date_str()
+        mode_title = cls.MODE_LABELS.get(mode, cls.MODE_LABELS["both"])
+
+        lines: List[str] = [
+            f"📊 PERSONAL P&L REPORT — {mode_title.upper()}",
+            f"💵 Unit Size: 1.00R = ${r_usd:.0f} (Official Singles Only • Private Bot View)",
+            "════════════════════════"
+        ]
+
+        if not singles:
+            lines.append("ℹ️ No settled Official Singles found in ledger yet.")
+            return "\n".join(lines)
+
+        def _append_section_for_items(sec_items: List[LedgerBetItem], compact: bool = False) -> None:
+            if mode == "main":
+                st_m = cls.summarize_bucket(sec_items, "main")
+                lines.extend(cls._format_single_bucket_lines("🎯 ONLY MAIN BETS", st_m, r_usd, compact=compact))
+            elif mode == "safe":
+                st_s = cls.summarize_bucket(sec_items, "safe")
+                lines.extend(cls._format_single_bucket_lines("🛡️ ONLY SAFE ALTERNATIVES", st_s, r_usd, compact=compact))
+            else:
+                st_m = cls.summarize_bucket(sec_items, "main")
+                st_s = cls.summarize_bucket(sec_items, "safe")
+                lines.extend(cls._format_single_bucket_lines("🎯 Only Main Bets", st_m, r_usd, compact=compact))
+                if not compact:
+                    lines.append("")
+                lines.extend(cls._format_single_bucket_lines("🛡️ Only Safe Alts", st_s, r_usd, compact=compact))
+                diff_r = round(st_m["net_r"] - st_s["net_r"], 2)
+                diff_dlr = abs(diff_r) * r_usd
+                leader = "🎯 Main Bets" if diff_r > 0 else ("🛡️ Safe Alternatives" if diff_r < 0 else "⚖️ Tied")
+                saved_losses = st_m["lost"] - st_s["lost"]
+                if not compact:
+                    lines.append(
+                        f"💡 Edge Verdict: {leader} leads by ${diff_dlr:.2f} ({abs(diff_r):.2f}R) • "
+                        f"Safe Alts avoided {max(0, saved_losses)} extra full loss(es)."
+                    )
+
+        # 1. SINCE START OF CHANNEL
+        if period in ("start", "all"):
+            first_d = singles[0].date_str
+            last_d = singles[-1].date_str
+            lines.append(f"🚀 SINCE START OF CHANNEL ({first_d} ➔ {last_d})")
+            lines.append("────────────────────────")
+            _append_section_for_items(singles, compact=False)
+            lines.append("────────────────────────")
+
+        # 2. MONTHLY BREAKDOWN
+        if period in ("monthly", "all"):
+            lines.append("📅 MONTHLY RESULTS BREAKDOWN")
+            lines.append("────────────────────────")
+            by_month: Dict[str, List[LedgerBetItem]] = {}
+            for it in singles:
+                ym = it.date_str[:7]
+                by_month.setdefault(ym, []).append(it)
+            for ym in sorted(by_month.keys()):
+                try:
+                    m_dt = datetime.datetime.strptime(ym + "-01", "%Y-%m-%d")
+                    m_lbl = m_dt.strftime("%B %Y")
+                except Exception:
+                    m_lbl = ym
+                m_items = by_month[ym]
+                lines.append(f"🗓️ {m_lbl} ({len(m_items)} Settled Singles):")
+                _append_section_for_items(m_items, compact=(period == "all"))
+                lines.append("")
+            lines.append("────────────────────────")
+
+        # 3. WEEKLY BREAKDOWN (Rolling Last 7 Days + Monday-Sunday Calendar Weeks)
+        if period in ("weekly", "all"):
+            lines.append("📆 WEEKLY RESULTS BREAKDOWN")
+            lines.append("────────────────────────")
+            rolling_start = shift_date_str(active_d, -6)
+            rolling_items = [x for x in singles if rolling_start <= x.date_str <= active_d]
+            if rolling_items:
+                lines.append(f"🔥 Last 7 Days ({rolling_start} ➔ {active_d} • {len(rolling_items)} Picks):")
+                _append_section_for_items(rolling_items, compact=True)
+                lines.append("")
+
+            by_week: Dict[str, List[LedgerBetItem]] = {}
+            week_ranges: Dict[str, Tuple[str, str]] = {}
+            for it in singles:
+                try:
+                    dt_i = datetime.datetime.strptime(it.date_str, "%Y-%m-%d")
+                    mon_dt = dt_i - datetime.timedelta(days=dt_i.weekday())
+                    sun_dt = mon_dt + datetime.timedelta(days=6)
+                    wk_key = mon_dt.strftime("%Y-%m-%d")
+                    week_ranges[wk_key] = (mon_dt.strftime("%b %d"), sun_dt.strftime("%b %d"))
+                except Exception:
+                    wk_key = it.date_str
+                    week_ranges[wk_key] = (it.date_str, it.date_str)
+                by_week.setdefault(wk_key, []).append(it)
+
+            for idx_w, wk_k in enumerate(sorted(by_week.keys()), 1):
+                w_start_lbl, w_end_lbl = week_ranges[wk_k]
+                w_items = by_week[wk_k]
+                lines.append(f"• Week {idx_w} ({w_start_lbl} – {w_end_lbl} • {len(w_items)} Picks):")
+                _append_section_for_items(w_items, compact=True)
+
+        lines.append("👇 Tap any button below to switch timeframe or strategy:")
+        return "\n".join(lines).strip()
+
 class TelegramBotClient:
     REMOVE_BOTTOM_KEYBOARD = {"remove_keyboard": True}
+    PERSONAL_DM_KEYBOARD = {
+        "keyboard": [
+            [{"text": "📊 Main vs Safe Alt Results"}, {"text": "🎯 Today's Picks"}],
+            [{"text": "✏️ Live /fix Editor"}, {"text": "🏁 Refresh Scores"}]
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True
+    }
 
     def __init__(self, bot_token: str):
         self.bot_token = bot_token.strip()
@@ -9332,7 +9877,8 @@ class TelegramBotClient:
         text: str,
         remove_kb: bool = True,
         reply_to_message_id: Optional[int] = None,
-        require_valid_reply: bool = False
+        require_valid_reply: bool = False,
+        custom_reply_markup: Optional[Dict[str, Any]] = None
     ) -> Optional[int]:
         """
         Sends a Telegram message and returns the integer `message_id` on success (`None` on failure).
@@ -9351,8 +9897,11 @@ class TelegramBotClient:
         }
         if self._should_attach_partner_button(chat_id, text):
             payload_data["reply_markup"] = self._build_channel_inline_kb(text)
-        elif remove_kb and isinstance(chat_id, int) and chat_id > 0:
-            payload_data["reply_markup"] = self.REMOVE_BOTTOM_KEYBOARD
+        elif isinstance(chat_id, int) and chat_id > 0:
+            if custom_reply_markup is not None:
+                payload_data["reply_markup"] = custom_reply_markup
+            else:
+                payload_data["reply_markup"] = self.PERSONAL_DM_KEYBOARD
         if reply_to_message_id and int(reply_to_message_id) > 0:
             payload_data["reply_parameters"] = {
                 "message_id": int(reply_to_message_id),
@@ -9363,6 +9912,35 @@ class TelegramBotClient:
             return int(body.get("result", {}).get("message_id") or 1)
         logger.error("Failed to send Telegram message to %s: %s", chat_id, desc)
         return None
+
+    def answer_callback_query(self, callback_query_id: str, text: str = "") -> None:
+        if not callback_query_id:
+            return
+        payload: Dict[str, Any] = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text[:180]
+        self._call_telegram_json("answerCallbackQuery", payload, timeout=6)
+
+    def edit_dm_message(
+        self,
+        chat_id: int,
+        message_id: int,
+        new_text: str,
+        inline_kb: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        if not chat_id or int(chat_id) <= 0 or not message_id or int(message_id) <= 1:
+            return False
+        payload_data: Dict[str, Any] = {
+            "chat_id": int(chat_id),
+            "message_id": int(message_id),
+            "text": render_telegram_html(new_text),
+            "parse_mode": "HTML",
+            "link_preview_options": {"is_disabled": True},
+        }
+        if inline_kb is not None:
+            payload_data["reply_markup"] = inline_kb
+        ok, _, desc = self._call_telegram_json("editMessageText", payload_data, timeout=10)
+        return bool(ok or "message is not modified" in desc.lower())
 
     def edit_message(self, chat_id: Any, message_id: int, new_text: str) -> Tuple[bool, str]:
         """
@@ -10071,7 +10649,8 @@ class TelegramBotClient:
             return published_count
 
     def get_updates(self, offset: Optional[int] = None) -> List[Dict[str, Any]]:
-        url = f"{self.base_url}/getUpdates?timeout=10"
+        allowed_q = urllib.parse.quote(json.dumps(["message", "channel_post", "callback_query"]))
+        url = f"{self.base_url}/getUpdates?timeout=10&allowed_updates={allowed_q}"
         if offset is not None:
             url += f"&offset={offset}"
         try:
@@ -10086,6 +10665,18 @@ class TelegramBotClient:
     def background_worker_loop(self):
         logger.info("Footybett v37.0 Weighted Sharp-Consensus & Auto-Cleaner & Deep Match-Autopsy Worker started...")
         time.sleep(3)
+        if not DailyLedgerManager.is_locked_in_channel("personal_pnl_btn_v42_ready"):
+            try:
+                for sub_cid in list(load_json_set(SUBSCRIBERS_FILE)):
+                    if isinstance(sub_cid, int) and sub_cid > 0 and self.is_channel_admin(sub_cid):
+                        self.send_message(
+                            sub_cid,
+                            "✅ Personal ⟦CODE⟧📊 Main vs Safe Alt Results⟦/CODE⟧ button is now active at the bottom of your bot chat (private to you — never shown on @Footybett).\n"
+                            "Tap ⟦CODE⟧📊 Main vs Safe Alt Results⟦/CODE⟧ anytime and I'll ask which mode & timeframe you want!"
+                        )
+                DailyLedgerManager.mark_locked_in_channel("personal_pnl_btn_v42_ready")
+            except Exception:
+                pass
         if not DailyLedgerManager.is_locked_in_channel("channel_clean_v41_3_auto_done"):
             try:
                 logger.info("Running automatic one-time v41.0 @Footybett Lotto-dedup, Live Admin Editor & rate-limit-safe verified BC.Game markets, live odds, exact links & button cleanup & Partner-Button Removal & Safe Alt backfill & history upgrade...")
@@ -10101,6 +10692,7 @@ class TelegramBotClient:
 
     def set_official_menu_commands(self):
         commands = [
+            {"command": "pnl", "description": "📊 Main Bets vs Safe Alt Results (Start / Monthly / Weekly)"},
             {"command": "scan", "description": "🎯 Today's Official 1R Singles & Optional Combos"},
             {"command": "fix", "description": "✏️ Edit Live @Footybett Posts, Odds, Links & Lotto"},
             {"command": "clean", "description": "🧹 Clean Duplicates & Upgrade @Footybett History"},
@@ -10136,6 +10728,23 @@ class TelegramBotClient:
             updates = self.get_updates(offset)
             for upd in updates:
                 offset = upd["update_id"] + 1
+                if "callback_query" in upd:
+                    cb = upd.get("callback_query") or {}
+                    cb_id = str(cb.get("id") or "")
+                    cb_data = str(cb.get("data") or "")
+                    cb_msg = cb.get("message") or {}
+                    cb_cid = (cb_msg.get("chat") or {}).get("id")
+                    cb_mid = int(cb_msg.get("message_id") or 0)
+                    cb_uid = int((cb.get("from") or {}).get("id") or cb_cid or 0)
+                    self.answer_callback_query(cb_id)
+                    if isinstance(cb_cid, int) and cb_cid > 0 and cb_data.startswith("pnl:"):
+                        def handle_pnl_cb(cid_i, mid_i, uid_i, data_i):
+                            txt_r, kb_r = PersonalStrategyBacktestAuditor.handle_callback(uid_i, data_i)
+                            if not self.edit_dm_message(cid_i, mid_i, txt_r, inline_kb=kb_r):
+                                self.send_message(cid_i, txt_r, custom_reply_markup=kb_r)
+                        threading.Thread(target=handle_pnl_cb, args=[cb_cid, cb_mid, cb_uid, cb_data], daemon=True).start()
+                    continue
+
                 msg = upd.get("message") or upd.get("channel_post") or {}
                 chat_id = msg.get("chat", {}).get("id")
                 from_user_id = (msg.get("from") or {}).get("id") or (chat_id if isinstance(chat_id, int) and chat_id > 0 else 0)
@@ -10180,6 +10789,21 @@ class TelegramBotClient:
                     continue
 
                 low_t = text.lower()
+
+                # 0. Map Personal Bottom Keyboard Shortcuts (Private DM Only — NEVER affects @Footybett!)
+                if isinstance(chat_id, int) and chat_id > 0:
+                    if low_t == "✏️ live /fix editor":
+                        text = "/fix"
+                        low_t = "/fix"
+                    elif low_t in ("🎯 today's picks", "🏁 refresh scores"):
+                        text = "/scan"
+                        low_t = "/scan"
+                    elif PersonalStrategyBacktestAuditor.should_intercept_text_reply(from_user_id, text):
+                        def handle_pnl_msg(cid_p, uid_p, txt_p):
+                            out_txt, out_kb = PersonalStrategyBacktestAuditor.handle_text_interaction(uid_p, txt_p)
+                            self.send_message(cid_p, out_txt, custom_reply_markup=out_kb)
+                        threading.Thread(target=handle_pnl_msg, args=[chat_id, from_user_id, text], daemon=True).start()
+                        continue
 
                 # 1a. Handle Live In-Bot Channel Admin Edits (`/fix`, `/edit`, `/admin`, forwarded @Footybett post, or plain-English edit!)
                 if isinstance(chat_id, int) and chat_id > 0 and (
