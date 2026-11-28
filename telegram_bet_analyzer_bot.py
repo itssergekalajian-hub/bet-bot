@@ -35,7 +35,9 @@ import math
 import time
 import json
 import html
+import io
 import base64
+import tempfile
 import subprocess
 import hashlib
 import difflib
@@ -47,6 +49,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import concurrent.futures
+import requests
 from typing import Dict, Any, Optional, List, Tuple, Set
 from dataclasses import dataclass, asdict, fields
 
@@ -66,11 +69,127 @@ DEFAULT_UNIT_USD = float(os.environ.get("UNIT_STAKE_USD", "100.0"))
 
 API_FOOTBALL_KEY = os.environ.get("API_FOOTBALL_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 PUBLISH_CHANNEL_ID = os.environ.get("PUBLISH_CHANNEL_ID", "@Footybett")
 BCGAME_PARTNER_URL = os.environ.get("BCGAME_PARTNER_URL", "https://bc.game/i-97sdx2t16q-n/")
 BCGAME_SOCCER_HUB_URL = "https://bc.game/sports/soccer-1"
 BCGAME_DIRECT_URLS_CACHE_FILE = os.path.join( os.path.dirname(os.path.abspath(__file__)), "bcgame_direct_urls_cache.json" )
+
+
+_JSON_FILE_LOCKS: Dict[str, threading.RLock] = {}
+_JSON_FILE_LOCKS_GUARD = threading.Lock()
+_HTTP_LOCAL = threading.local()
+
+
+def _json_file_lock(path: str) -> threading.RLock:
+    lock_key = os.path.normcase(os.path.abspath(os.fspath(path)))
+    with _JSON_FILE_LOCKS_GUARD:
+        lock = _JSON_FILE_LOCKS.get(lock_key)
+        if lock is None:
+            lock = threading.RLock()
+            _JSON_FILE_LOCKS[lock_key] = lock
+        return lock
+
+
+def _atomic_write_json(path: str, data: Any) -> None:
+    destination = os.path.abspath(os.fspath(path))
+    directory = os.path.dirname(destination)
+    os.makedirs(directory, exist_ok=True)
+    with _json_file_lock(destination):
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(destination)}.",
+            suffix=".tmp",
+            dir=directory,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+                json.dump(data, tmp_file, indent=2)
+                tmp_file.flush()
+                os.fsync(tmp_file.fileno())
+            os.replace(tmp_path, destination)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+
+def _get_http_session() -> requests.Session:
+    session = getattr(_HTTP_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _HTTP_LOCAL.session = session
+    return session
+
+
+class _PooledHTTPResponse:
+    def __init__(self, response: requests.Response):
+        self._response = response
+        self._body = response.content
+        self._stream = io.BytesIO(self._body)
+        self.status = response.status_code
+        self.headers = response.headers
+        self.url = response.url
+
+    def read(self, size: int = -1) -> bytes:
+        return self._stream.read(size)
+
+    def json(self) -> Any:
+        return json.loads(self._body.decode("utf-8"))
+
+    def geturl(self) -> str:
+        return self.url
+
+    def close(self) -> None:
+        self._stream.close()
+        self._response.close()
+
+    def __enter__(self) -> "_PooledHTTPResponse":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        self.close()
+
+
+def _pooled_urlopen(
+    request: Any,
+    timeout: float = 10.0,
+) -> _PooledHTTPResponse:
+    if isinstance(request, urllib.request.Request):
+        url = request.full_url
+        method = request.get_method()
+        data = request.data
+        headers = dict(request.header_items())
+    else:
+        url = str(request)
+        method = "GET"
+        data = None
+        headers = {}
+
+    try:
+        response = _get_http_session().request(
+            method,
+            url,
+            data=data,
+            headers=headers,
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        raise urllib.error.URLError(exc) from exc
+
+    if response.status_code >= 300:
+        error = urllib.error.HTTPError(
+            url,
+            response.status_code,
+            response.reason,
+            response.headers,
+            io.BytesIO(response.content),
+        )
+        response.close()
+        raise error
+    return _PooledHTTPResponse(response)
+
 
 BCGAME_LEAGUE_BOARD_URLS: Dict[str, str] = {
     "eng.1": "https://bc.game/sports/soccer/england/premier-league-1669818860469096448",
@@ -1951,7 +2070,7 @@ class BCGameDirectLinkResolver:
                 return portal_entry["direct_bc_url"]
             if allow_network and portal_entry.get("detail_url"):
                 req_d = urllib.request.Request(portal_entry["detail_url"], headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req_d, timeout=3.5) as resp_d:
+                with _pooled_urlopen(req_d, timeout=3.5) as resp_d:
                     d_html = resp_d.read().decode("utf-8", errors="ignore")
                     found_u = cls.extract_best_match_url_from_blob(d_html, h_bc, a_bc)
                     if found_u:
@@ -1982,7 +2101,7 @@ class BCGameDirectLinkResolver:
                             s_ep,
                             headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"}
                         )
-                        with urllib.request.urlopen(req, timeout=3.8) as resp:
+                        with _pooled_urlopen(req, timeout=3.8) as resp:
                             body = resp.read().decode("utf-8", errors="ignore")
                             found_u = cls.extract_best_match_url_from_blob(body, h_bc, a_bc)
                             if found_u:
@@ -2004,38 +2123,38 @@ def shift_date_str(date_str: str, delta_days: int) -> str:
 
 
 def load_json_set(filepath: str, default: Optional[List[Any]] = None) -> Set[Any]:
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                return set(json.load(f))
-        except Exception:
-            pass
+    with _json_file_lock(filepath):
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    return set(json.load(f))
+            except Exception:
+                pass
     return set(default or [])
 
 
 def save_json_set(filepath: str, data_set: Set[Any], max_items: int = 5000):
     try:
         items = list(data_set)[-max_items:]
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(items, f)
+        _atomic_write_json(filepath, items)
     except Exception as e:
         logger.error("Failed to save JSON file %s: %s", filepath, e)
 
 
 def load_json_dict(filepath: str) -> Dict[str, Any]:
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
+    with _json_file_lock(filepath):
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
     return {}
 
 
 def save_json_dict(filepath: str, data: Dict[str, Any]):
     try:
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        _atomic_write_json(filepath, data)
     except Exception as e:
         logger.error("Failed to write JSON dict %s: %s", filepath, e)
 
@@ -2705,7 +2824,7 @@ class ChannelBuzzRadar:
             url = f"https://t.me/s/{ch}?_={int(now)}"
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             try:
-                with urllib.request.urlopen(req, timeout=3) as resp:
+                with _pooled_urlopen(req, timeout=3) as resp:
                     html = resp.read().decode("utf-8", errors="ignore")
                     texts = re.findall(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', html, re.DOTALL)
                     depth = 20 if is_bomb else 12
@@ -2784,7 +2903,7 @@ class LiveSportsbookAndStatsAPI:
         url = f"{cls.ESPN_SUMMARY_URL}?event={event_id}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         try:
-            with urllib.request.urlopen(req, timeout=6) as resp:
+            with _pooled_urlopen(req, timeout=6) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 teams = data.get("boxscore", {}).get("teams", [])
                 if len(teams) >= 2:
@@ -2959,7 +3078,7 @@ class LiveSportsbookAndStatsAPI:
             url = f"{cls.ESPN_LEAGUE_SCOREBOARD_TEMPLATE.format(slug=slug)}?dates={espn_date}&limit=100"
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             try:
-                with urllib.request.urlopen(req, timeout=4) as resp:
+                with _pooled_urlopen(req, timeout=4) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                     for ev in data.get("events", []):
                         parsed = cls._parse_espn_event(ev, league_title, slug, rank_idx, now_utc)
@@ -3736,7 +3855,7 @@ class ExpertConsensusHub:
             "Accept-Language": "en-US,en;q=0.9",
         }
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _pooled_urlopen(req, timeout=timeout) as resp:
             return resp.read().decode("utf-8", errors="ignore")
 
     @classmethod
@@ -5046,7 +5165,7 @@ class ExternalAnalyticsCollector:
         # 1. ClubElo Quantitative Fixtures CSV Feed (http://api.clubelo.com/Fixtures)
         try:
             req = urllib.request.Request("http://api.clubelo.com/Fixtures", headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with _pooled_urlopen(req, timeout=5) as resp:
                 csv_text = resp.read().decode("utf-8", errors="ignore")
                 for line in csv_text.splitlines()[1:]:
                     parts = line.split(",")
@@ -5064,7 +5183,7 @@ class ExternalAnalyticsCollector:
         try:
             viti_url = "https://www.vitibet.com/index.php?clanek=quicktips&sekce=fotbal&lang=en"
             req = urllib.request.Request(viti_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with _pooled_urlopen(req, timeout=5) as resp:
                 html_str = resp.read().decode("utf-8", errors="ignore")
                 for m_row in re.finditer(r"([A-Za-z\s\.\-]{3,22})\s+vs\s+([A-Za-z\s\.\-]{3,22})", html_str):
                     high_goal_teams.add(normalize_team_str(m_row.group(1)))
@@ -5076,7 +5195,7 @@ class ExternalAnalyticsCollector:
         try:
             fore_url = "https://www.forebet.com/en/football-tips-and-predictions-for-today/predictions-over-under-goals"
             req = urllib.request.Request(fore_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with _pooled_urlopen(req, timeout=5) as resp:
                 html_str = resp.read().decode("utf-8", errors="ignore")
                 for span_m in re.finditer(r"homeTeam[^>]*>\\s*<span[^>]*>([^<]+)</span>", html_str):
                     high_goal_teams.add(normalize_team_str(span_m.group(1)))
@@ -5122,7 +5241,7 @@ class ExternalAnalyticsCollector:
         ]:
             try:
                 req = urllib.request.Request(portal_url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=3) as resp:
+                with _pooled_urlopen(req, timeout=3) as resp:
                     p_html = resp.read().decode("utf-8", errors="ignore")
                     for m_vs in re.finditer(r"([A-Za-z]{4,}(?:\s+[A-Za-z]{3,})?)\s+(?:vs\.?|v\.?|-)\s+([A-Za-z]{4,}(?:\s+[A-Za-z]{3,})?)", p_html):
                         high_goal_teams.add(normalize_team_str(m_vs.group(1)))
@@ -5193,7 +5312,7 @@ class ExternalAnalyticsCollector:
         for u in urls:
             try:
                 req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/126.0 Safari/537.36"})
-                with urllib.request.urlopen(req, timeout=3.8) as resp:
+                with _pooled_urlopen(req, timeout=3.8) as resp:
                     cls._oddspedia_odds_cache.update(cls.parse_oddspedia_league_odds_html(resp.read().decode("utf-8", errors="ignore")))
             except Exception:
                 pass
@@ -5311,7 +5430,7 @@ class ExternalAnalyticsCollector:
         ]:
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with _pooled_urlopen(req, timeout=5) as resp:
                     html = resp.read().decode("utf-8", errors="ignore")
                     found = cls.parse_bcgame_predictions_text(html)
                     cls._bcgame_portal_cache.update(found)
@@ -5357,7 +5476,7 @@ class ExternalAnalyticsCollector:
         url = f"{LiveSportsbookAndStatsAPI.BASE_URL}/fixtures?date={d_str}"
         req = urllib.request.Request(url, headers={"x-apisports-key": API_FOOTBALL_KEY, "User-Agent": "Mozilla/5.0"})
         try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with _pooled_urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 for item in data.get("response", []):
                     fid = item.get("fixture", {}).get("id")
@@ -5461,7 +5580,7 @@ class ExternalAnalyticsCollector:
                     cls._last_apif_http_ts = time.time()
                     req = urllib.request.Request(o_url, headers={"x-apisports-key": API_FOOTBALL_KEY, "User-Agent": "Mozilla/5.0"})
                     try:
-                        with urllib.request.urlopen(req, timeout=5) as resp:
+                        with _pooled_urlopen(req, timeout=5) as resp:
                             data = json.loads(resp.read().decode("utf-8"))
                             errs = data.get("errors")
                             if errs and "rateLimit" in str(errs) and attempt_od == 0:
@@ -5803,7 +5922,7 @@ class ExternalAnalyticsCollector:
         req = urllib.request.Request(pred_url, headers={"x-apisports-key": API_FOOTBALL_KEY, "User-Agent": "Mozilla/5.0"})
         pred_res: Dict[str, str] = {}
         try:
-            with urllib.request.urlopen(req, timeout=4) as resp:
+            with _pooled_urlopen(req, timeout=4) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 resp_list = data.get("response", [])
                 if resp_list:
@@ -5858,7 +5977,7 @@ class ExternalAnalyticsCollector:
         url = f"{LiveSportsbookAndStatsAPI.ESPN_SUMMARY_URL}?event={event_id}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         try:
-            with urllib.request.urlopen(req, timeout=4) as resp:
+            with _pooled_urlopen(req, timeout=4) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
 
                 # 1. Extract SPI Predictor if present
@@ -6418,7 +6537,7 @@ class GeminiDeepReasoningEngine:
                             "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"}
                         }).encode("utf-8")
                         req = urllib.request.Request(api_url, data=req_body, headers={"Content-Type": "application/json"})
-                        with urllib.request.urlopen(req, timeout=4) as resp:
+                        with _pooled_urlopen(req, timeout=4) as resp:
                             r_json = json.loads(resp.read().decode("utf-8"))
                             cand_txt = (
                                 r_json.get("candidates", [{}])[0]
@@ -8312,13 +8431,13 @@ class BetSlipImageOCRAndVisionAnalyzer:
     def download_telegram_photo_bytes(cls, bot_token: str, file_id: str) -> Optional[bytes]:
         try:
             info_url = f"https://api.telegram.org/bot{bot_token}/getFile?file_id={file_id}"
-            with urllib.request.urlopen(info_url, timeout=8) as resp:
+            with _pooled_urlopen(info_url, timeout=8) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 file_path = data.get("result", {}).get("file_path")
                 if not file_path:
                     return None
             dl_url = f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
-            with urllib.request.urlopen(dl_url, timeout=12) as resp:
+            with _pooled_urlopen(dl_url, timeout=12) as resp:
                 return resp.read()
         except Exception as e:
             logger.error("Failed to download Telegram photo: %s", e)
@@ -8346,7 +8465,7 @@ class BetSlipImageOCRAndVisionAnalyzer:
                 req = urllib.request.Request(
                     g_url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}
                 )
-                with urllib.request.urlopen(req, timeout=12) as resp:
+                with _pooled_urlopen(req, timeout=12) as resp:
                     res_json = json.loads(resp.read().decode("utf-8"))
                     txt = res_json["candidates"][0]["content"]["parts"][0]["text"]
                     if txt and len(txt.strip()) >= 5:
@@ -8382,7 +8501,7 @@ class BetSlipImageOCRAndVisionAnalyzer:
                 data=form_data,
                 headers={"User-Agent": "Mozilla/5.0"}
             )
-            with urllib.request.urlopen(req, timeout=12) as resp:
+            with _pooled_urlopen(req, timeout=12) as resp:
                 ocr_json = json.loads(resp.read().decode("utf-8"))
                 parsed_results = ocr_json.get("ParsedResults", [])
                 if parsed_results:
@@ -8456,7 +8575,7 @@ class ChannelHistoryCleaner:
                 url += f"?_={int(time.time())}"
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             try:
-                with urllib.request.urlopen(req, timeout=8) as resp:
+                with _pooled_urlopen(req, timeout=8) as resp:
                     page_html = resp.read().decode("utf-8", errors="ignore")
             except Exception:
                 break
@@ -9645,7 +9764,7 @@ class PersonalStrategyBacktestAuditor:
         for idx_u, u in enumerate(urls):
             try:
                 req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=6 if idx_u == 0 else 3.5) as resp:
+                with _pooled_urlopen(req, timeout=6 if idx_u == 0 else 3.5) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                     for ev in data.get("events", []):
                         ev_id = str(ev.get("id") or "")
@@ -9673,7 +9792,7 @@ class PersonalStrategyBacktestAuditor:
         url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/all/summary?event={event_id}"
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with _pooled_urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
 
                 # 1. Real FT Corners from boxscore
@@ -9748,7 +9867,7 @@ class PersonalStrategyBacktestAuditor:
         url = f"https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d={date_str}&s=Soccer"
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with _pooled_urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 for ev in (data.get("events") or []):
                     st = str(ev.get("strStatus") or "").upper()
@@ -10461,7 +10580,7 @@ class TelegramBotClient:
         for attempt in range(4):
             req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
             try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with _pooled_urlopen(req, timeout=timeout) as resp:
                     body = json.loads(resp.read().decode("utf-8"))
                     if body.get("ok"):
                         return True, body, "ok"
@@ -11342,7 +11461,7 @@ class TelegramBotClient:
             url += f"&offset={offset}"
         try:
             req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with _pooled_urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 return data.get("result", [])
         except Exception as e:
@@ -11398,7 +11517,7 @@ class TelegramBotClient:
             headers={"Content-Type": "application/json"}
         )
         try:
-            with urllib.request.urlopen(req, timeout=6) as resp:
+            with _pooled_urlopen(req, timeout=6) as resp:
                 logger.info("Registered Telegram menu commands: %s", resp.status == 200)
         except Exception as e:
             logger.error("Failed to register menu commands: %s", e)
