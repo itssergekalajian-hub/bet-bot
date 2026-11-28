@@ -35,9 +35,7 @@ import math
 import time
 import json
 import html
-import io
 import base64
-import tempfile
 import subprocess
 import hashlib
 import difflib
@@ -49,7 +47,6 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import concurrent.futures
-import requests
 from typing import Dict, Any, Optional, List, Tuple, Set
 from dataclasses import dataclass, asdict, fields
 
@@ -69,127 +66,11 @@ DEFAULT_UNIT_USD = float(os.environ.get("UNIT_STAKE_USD", "100.0"))
 
 API_FOOTBALL_KEY = os.environ.get("API_FOOTBALL_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro")
 PUBLISH_CHANNEL_ID = os.environ.get("PUBLISH_CHANNEL_ID", "@Footybett")
 BCGAME_PARTNER_URL = os.environ.get("BCGAME_PARTNER_URL", "https://bc.game/i-97sdx2t16q-n/")
 BCGAME_SOCCER_HUB_URL = "https://bc.game/sports/soccer-1"
 BCGAME_DIRECT_URLS_CACHE_FILE = os.path.join( os.path.dirname(os.path.abspath(__file__)), "bcgame_direct_urls_cache.json" )
-
-
-_JSON_FILE_LOCKS: Dict[str, threading.RLock] = {}
-_JSON_FILE_LOCKS_GUARD = threading.Lock()
-_HTTP_LOCAL = threading.local()
-
-
-def _json_file_lock(path: str) -> threading.RLock:
-    lock_key = os.path.normcase(os.path.abspath(os.fspath(path)))
-    with _JSON_FILE_LOCKS_GUARD:
-        lock = _JSON_FILE_LOCKS.get(lock_key)
-        if lock is None:
-            lock = threading.RLock()
-            _JSON_FILE_LOCKS[lock_key] = lock
-        return lock
-
-
-def _atomic_write_json(path: str, data: Any) -> None:
-    destination = os.path.abspath(os.fspath(path))
-    directory = os.path.dirname(destination)
-    os.makedirs(directory, exist_ok=True)
-    with _json_file_lock(destination):
-        fd, tmp_path = tempfile.mkstemp(
-            prefix=f".{os.path.basename(destination)}.",
-            suffix=".tmp",
-            dir=directory,
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
-                json.dump(data, tmp_file, indent=2)
-                tmp_file.flush()
-                os.fsync(tmp_file.fileno())
-            os.replace(tmp_path, destination)
-        finally:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-
-
-def _get_http_session() -> requests.Session:
-    session = getattr(_HTTP_LOCAL, "session", None)
-    if session is None:
-        session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16)
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-        _HTTP_LOCAL.session = session
-    return session
-
-
-class _PooledHTTPResponse:
-    def __init__(self, response: requests.Response):
-        self._response = response
-        self._body = response.content
-        self._stream = io.BytesIO(self._body)
-        self.status = response.status_code
-        self.headers = response.headers
-        self.url = response.url
-
-    def read(self, size: int = -1) -> bytes:
-        return self._stream.read(size)
-
-    def json(self) -> Any:
-        return json.loads(self._body.decode("utf-8"))
-
-    def geturl(self) -> str:
-        return self.url
-
-    def close(self) -> None:
-        self._stream.close()
-        self._response.close()
-
-    def __enter__(self) -> "_PooledHTTPResponse":
-        return self
-
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        self.close()
-
-
-def _pooled_urlopen(
-    request: Any,
-    timeout: float = 10.0,
-) -> _PooledHTTPResponse:
-    if isinstance(request, urllib.request.Request):
-        url = request.full_url
-        method = request.get_method()
-        data = request.data
-        headers = dict(request.header_items())
-    else:
-        url = str(request)
-        method = "GET"
-        data = None
-        headers = {}
-
-    try:
-        response = _get_http_session().request(
-            method,
-            url,
-            data=data,
-            headers=headers,
-            timeout=timeout,
-        )
-    except requests.RequestException as exc:
-        raise urllib.error.URLError(exc) from exc
-
-    if response.status_code >= 300:
-        error = urllib.error.HTTPError(
-            url,
-            response.status_code,
-            response.reason,
-            response.headers,
-            io.BytesIO(response.content),
-        )
-        response.close()
-        raise error
-    return _PooledHTTPResponse(response)
-
 
 BCGAME_LEAGUE_BOARD_URLS: Dict[str, str] = {
     "eng.1": "https://bc.game/sports/soccer/england/premier-league-1669818860469096448",
@@ -221,7 +102,7 @@ BCGAME_LEAGUE_BOARD_URLS: Dict[str, str] = {
 }
 
 TRACKING_START_DATE = "2026-11-15"
-MIN_SINGLE_ODDS = 1.62
+MIN_SINGLE_ODDS = 1.68
 MAX_DAILY_SINGLES = 4
 
 MIN_HOURS_BEFORE_KICKOFF = 0.25
@@ -2070,7 +1951,7 @@ class BCGameDirectLinkResolver:
                 return portal_entry["direct_bc_url"]
             if allow_network and portal_entry.get("detail_url"):
                 req_d = urllib.request.Request(portal_entry["detail_url"], headers={"User-Agent": "Mozilla/5.0"})
-                with _pooled_urlopen(req_d, timeout=3.5) as resp_d:
+                with urllib.request.urlopen(req_d, timeout=3.5) as resp_d:
                     d_html = resp_d.read().decode("utf-8", errors="ignore")
                     found_u = cls.extract_best_match_url_from_blob(d_html, h_bc, a_bc)
                     if found_u:
@@ -2101,7 +1982,7 @@ class BCGameDirectLinkResolver:
                             s_ep,
                             headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"}
                         )
-                        with _pooled_urlopen(req, timeout=3.8) as resp:
+                        with urllib.request.urlopen(req, timeout=3.8) as resp:
                             body = resp.read().decode("utf-8", errors="ignore")
                             found_u = cls.extract_best_match_url_from_blob(body, h_bc, a_bc)
                             if found_u:
@@ -2123,38 +2004,38 @@ def shift_date_str(date_str: str, delta_days: int) -> str:
 
 
 def load_json_set(filepath: str, default: Optional[List[Any]] = None) -> Set[Any]:
-    with _json_file_lock(filepath):
-        if os.path.exists(filepath):
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    return set(json.load(f))
-            except Exception:
-                pass
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception:
+            pass
     return set(default or [])
 
 
 def save_json_set(filepath: str, data_set: Set[Any], max_items: int = 5000):
     try:
         items = list(data_set)[-max_items:]
-        _atomic_write_json(filepath, items)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(items, f)
     except Exception as e:
         logger.error("Failed to save JSON file %s: %s", filepath, e)
 
 
 def load_json_dict(filepath: str) -> Dict[str, Any]:
-    with _json_file_lock(filepath):
-        if os.path.exists(filepath):
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
     return {}
 
 
 def save_json_dict(filepath: str, data: Dict[str, Any]):
     try:
-        _atomic_write_json(filepath, data)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
     except Exception as e:
         logger.error("Failed to write JSON dict %s: %s", filepath, e)
 
@@ -2279,7 +2160,7 @@ class BankrollStakeSizer:
         rew_r = max(0.01, round(odds - 1.0, 2))
         rew_dlr = round(rew_r * r_usd, 2)
         tot_dlr = round(r_usd + rew_dlr, 2)
-        return f"${r_usd:.0f} Stake (1.00R) ➔ Payout ${tot_dlr:.2f} (+${rew_dlr:.2f} Profit / +{rew_r:.2f}R)"
+        return f"${r_usd:.0f} ➔ Payout ${tot_dlr:.2f} (+${rew_dlr:.2f} Profit)"
 
     @classmethod
     def format_safe_alt_display(cls, alt_line_str: str) -> str:
@@ -2373,9 +2254,9 @@ class BankrollStakeSizer:
                 return f"Main Tab ➔ Double Chance ➔ {a_bc} or Draw (X2) (@ {_od('dc_x2', 0.28):.2f})"
             return f"Main Tab ➔ Double Chance ➔ {h_bc} or Draw (1X) (@ {_od('dc_1x', 0.28):.2f})"
         if "both teams" in sel_l or market_type == "btts":
-            if _has_line("over_20"):
-                return f"Main Tab ➔ Total ➔ Over 2.0 (@ {_od('over_20', 0.34):.2f}) [2 goals = refund]"
-            return f"Main Tab ➔ Total ➔ Over 1.5 (@ {_od('over_15', 0.42):.2f})"
+            if (not odds_map) or _has_line("over_20"):
+                return f"Main Tab ➔ Total ➔ Over 2.0 (@ {_od('over_20', 0.32):.2f}) [2 goals = refund]"
+            return f"Main Tab ➔ Total ➔ Over 1.5 (@ {_od('over_15', 0.38):.2f})"
         if "corner" in sel_l or market_type == "corners_over_under":
             if "10.5" in sel_l and _has_line("corners_over_95"):
                 return f"Stats Tab ➔ Total corners ➔ Over 9.5 (@ {float(odds_map['corners_over_95']):.2f})"
@@ -2824,7 +2705,7 @@ class ChannelBuzzRadar:
             url = f"https://t.me/s/{ch}?_={int(now)}"
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             try:
-                with _pooled_urlopen(req, timeout=3) as resp:
+                with urllib.request.urlopen(req, timeout=3) as resp:
                     html = resp.read().decode("utf-8", errors="ignore")
                     texts = re.findall(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', html, re.DOTALL)
                     depth = 20 if is_bomb else 12
@@ -2903,7 +2784,7 @@ class LiveSportsbookAndStatsAPI:
         url = f"{cls.ESPN_SUMMARY_URL}?event={event_id}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         try:
-            with _pooled_urlopen(req, timeout=6) as resp:
+            with urllib.request.urlopen(req, timeout=6) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 teams = data.get("boxscore", {}).get("teams", [])
                 if len(teams) >= 2:
@@ -3078,7 +2959,7 @@ class LiveSportsbookAndStatsAPI:
             url = f"{cls.ESPN_LEAGUE_SCOREBOARD_TEMPLATE.format(slug=slug)}?dates={espn_date}&limit=100"
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             try:
-                with _pooled_urlopen(req, timeout=4) as resp:
+                with urllib.request.urlopen(req, timeout=4) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                     for ev in data.get("events", []):
                         parsed = cls._parse_espn_event(ev, league_title, slug, rank_idx, now_utc)
@@ -3855,7 +3736,7 @@ class ExpertConsensusHub:
             "Accept-Language": "en-US,en;q=0.9",
         }
         req = urllib.request.Request(url, headers=headers)
-        with _pooled_urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read().decode("utf-8", errors="ignore")
 
     @classmethod
@@ -4952,7 +4833,8 @@ class ExpertConsensusHub:
     def evaluate_market_consensus(
         cls,
         ballot: Dict[str, Set[str]],
-        candidate_kind: str
+        candidate_kind: str,
+        strict_channel_mode: bool = False
     ) -> Tuple[bool, int, int, float, str]:
         """
         v37.0 Weighted Trusted-Sharp Majority Rule for `candidate_kind`:
@@ -5006,9 +4888,18 @@ class ExpertConsensusHub:
         if n_tot >= 2 and w_for <= w_against:
             return False, n_for, n_tot, -28.0, ""
 
-        # 2. ELITE TIER-1 SHARP DESK VETO: Never fade 2+ Tier-1 Sharp Desks when 0 Tier-1 Desks agree!
-        if elite_against >= 2 and elite_for == 0:
+        # 2. ELITE TIER-1 SHARP DESK VETO: Never fade Tier-1 Sharp Desks when 0 Tier-1 Desks agree!
+        if (elite_against >= 2 and elite_for == 0) or (strict_channel_mode and elite_against >= 1 and elite_for == 0):
             return False, n_for, n_tot, -25.0, ""
+
+        # 3. v45.0 SYNDICATE CHANNEL QUALITY GATE: Zero unstudied (`n_for == 0`) or weak 1-source guesses on `@Footybett`!
+        if strict_channel_mode:
+            if n_for == 0:
+                return False, 0, n_tot, -30.0, ""
+            if n_for == 1 and elite_for == 0:
+                return False, n_for, n_tot, -20.0, ""
+            if w_tot > 0 and (w_for / w_tot) < 0.65:
+                return False, n_for, n_tot, -22.0, ""
 
         # Sort agreeing sources by Trust Tier & Editorial Prominence
         def _src_rank(s_name: str) -> Tuple[float, int]:
@@ -5165,7 +5056,7 @@ class ExternalAnalyticsCollector:
         # 1. ClubElo Quantitative Fixtures CSV Feed (http://api.clubelo.com/Fixtures)
         try:
             req = urllib.request.Request("http://api.clubelo.com/Fixtures", headers={"User-Agent": "Mozilla/5.0"})
-            with _pooled_urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 csv_text = resp.read().decode("utf-8", errors="ignore")
                 for line in csv_text.splitlines()[1:]:
                     parts = line.split(",")
@@ -5183,7 +5074,7 @@ class ExternalAnalyticsCollector:
         try:
             viti_url = "https://www.vitibet.com/index.php?clanek=quicktips&sekce=fotbal&lang=en"
             req = urllib.request.Request(viti_url, headers={"User-Agent": "Mozilla/5.0"})
-            with _pooled_urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 html_str = resp.read().decode("utf-8", errors="ignore")
                 for m_row in re.finditer(r"([A-Za-z\s\.\-]{3,22})\s+vs\s+([A-Za-z\s\.\-]{3,22})", html_str):
                     high_goal_teams.add(normalize_team_str(m_row.group(1)))
@@ -5195,7 +5086,7 @@ class ExternalAnalyticsCollector:
         try:
             fore_url = "https://www.forebet.com/en/football-tips-and-predictions-for-today/predictions-over-under-goals"
             req = urllib.request.Request(fore_url, headers={"User-Agent": "Mozilla/5.0"})
-            with _pooled_urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 html_str = resp.read().decode("utf-8", errors="ignore")
                 for span_m in re.finditer(r"homeTeam[^>]*>\\s*<span[^>]*>([^<]+)</span>", html_str):
                     high_goal_teams.add(normalize_team_str(span_m.group(1)))
@@ -5241,7 +5132,7 @@ class ExternalAnalyticsCollector:
         ]:
             try:
                 req = urllib.request.Request(portal_url, headers={"User-Agent": "Mozilla/5.0"})
-                with _pooled_urlopen(req, timeout=3) as resp:
+                with urllib.request.urlopen(req, timeout=3) as resp:
                     p_html = resp.read().decode("utf-8", errors="ignore")
                     for m_vs in re.finditer(r"([A-Za-z]{4,}(?:\s+[A-Za-z]{3,})?)\s+(?:vs\.?|v\.?|-)\s+([A-Za-z]{4,}(?:\s+[A-Za-z]{3,})?)", p_html):
                         high_goal_teams.add(normalize_team_str(m_vs.group(1)))
@@ -5312,7 +5203,7 @@ class ExternalAnalyticsCollector:
         for u in urls:
             try:
                 req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/126.0 Safari/537.36"})
-                with _pooled_urlopen(req, timeout=3.8) as resp:
+                with urllib.request.urlopen(req, timeout=3.8) as resp:
                     cls._oddspedia_odds_cache.update(cls.parse_oddspedia_league_odds_html(resp.read().decode("utf-8", errors="ignore")))
             except Exception:
                 pass
@@ -5430,7 +5321,7 @@ class ExternalAnalyticsCollector:
         ]:
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with _pooled_urlopen(req, timeout=5) as resp:
+                with urllib.request.urlopen(req, timeout=5) as resp:
                     html = resp.read().decode("utf-8", errors="ignore")
                     found = cls.parse_bcgame_predictions_text(html)
                     cls._bcgame_portal_cache.update(found)
@@ -5476,7 +5367,7 @@ class ExternalAnalyticsCollector:
         url = f"{LiveSportsbookAndStatsAPI.BASE_URL}/fixtures?date={d_str}"
         req = urllib.request.Request(url, headers={"x-apisports-key": API_FOOTBALL_KEY, "User-Agent": "Mozilla/5.0"})
         try:
-            with _pooled_urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 for item in data.get("response", []):
                     fid = item.get("fixture", {}).get("id")
@@ -5580,7 +5471,7 @@ class ExternalAnalyticsCollector:
                     cls._last_apif_http_ts = time.time()
                     req = urllib.request.Request(o_url, headers={"x-apisports-key": API_FOOTBALL_KEY, "User-Agent": "Mozilla/5.0"})
                     try:
-                        with _pooled_urlopen(req, timeout=5) as resp:
+                        with urllib.request.urlopen(req, timeout=5) as resp:
                             data = json.loads(resp.read().decode("utf-8"))
                             errs = data.get("errors")
                             if errs and "rateLimit" in str(errs) and attempt_od == 0:
@@ -5922,7 +5813,7 @@ class ExternalAnalyticsCollector:
         req = urllib.request.Request(pred_url, headers={"x-apisports-key": API_FOOTBALL_KEY, "User-Agent": "Mozilla/5.0"})
         pred_res: Dict[str, str] = {}
         try:
-            with _pooled_urlopen(req, timeout=4) as resp:
+            with urllib.request.urlopen(req, timeout=4) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 resp_list = data.get("response", [])
                 if resp_list:
@@ -5977,7 +5868,7 @@ class ExternalAnalyticsCollector:
         url = f"{LiveSportsbookAndStatsAPI.ESPN_SUMMARY_URL}?event={event_id}"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         try:
-            with _pooled_urlopen(req, timeout=4) as resp:
+            with urllib.request.urlopen(req, timeout=4) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
 
                 # 1. Extract SPI Predictor if present
@@ -6537,7 +6428,7 @@ class GeminiDeepReasoningEngine:
                             "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"}
                         }).encode("utf-8")
                         req = urllib.request.Request(api_url, data=req_body, headers={"Content-Type": "application/json"})
-                        with _pooled_urlopen(req, timeout=4) as resp:
+                        with urllib.request.urlopen(req, timeout=4) as resp:
                             r_json = json.loads(resp.read().decode("utf-8"))
                             cand_txt = (
                                 r_json.get("candidates", [{}])[0]
@@ -6608,13 +6499,143 @@ class SafeCushionBetCreator:
         return form_str.count("W"), form_str.count("D"), form_str.count("L")
 
     @classmethod
+    def calculate_true_calibrated_ev(
+        cls,
+        market_type: str,
+        selection: str,
+        line: Optional[float],
+        odds: float,
+        dc: Dict[str, float],
+        bc_odds: Dict[str, float],
+        home: str,
+        away: str,
+        n_for: int = 2,
+        elite_for: int = 0
+    ) -> Tuple[float, float, float]:
+        """
+        v45.0 Institutional De-Vigged Expected Value Calculator:
+        Blends 50% de-vigged sharp bookmaker probability + 50% Dixon-Coles Poisson matrix + bounded
+        multi-source sharp consensus edge (zero fake 72% floors!).
+        Returns `(true_win_prob_pct, true_push_prob_pct, ev_pct)` where:
+            EV % = (P_win * (odds - 1.0) - P_loss * 1.0) * 100
+        """
+        if odds <= 1.02:
+            return 0.0, 0.0, -100.0
+
+        sel_l = (selection or "").lower()
+        for_away = LiveSportsbookAndStatsAPI._is_away_team_selected(selection, home, away)
+
+        # 1. De-vigged sharp 1x2 market probabilities
+        h_od = float(bc_odds.get("home_1x2") or 2.10)
+        d_od = float(bc_odds.get("draw_1x2") or 3.40)
+        a_od = float(bc_odds.get("away_1x2") or 3.40)
+        inv_1x2 = (1.0 / max(1.04, h_od)) + (1.0 / max(1.04, d_od)) + (1.0 / max(1.04, a_od))
+        mkt_p_h = (1.0 / max(1.04, h_od)) / inv_1x2
+        mkt_p_d = (1.0 / max(1.04, d_od)) / inv_1x2
+        mkt_p_a = (1.0 / max(1.04, a_od)) / inv_1x2
+
+        # De-vigged sharp Over/Under 2.5 probabilities
+        o25_od = float(bc_odds.get("over_25") or 1.90)
+        u25_od = float(bc_odds.get("under_25") or 1.90)
+        inv_ou = (1.0 / max(1.04, o25_od)) + (1.0 / max(1.04, u25_od))
+        mkt_p_o25 = (1.0 / max(1.04, o25_od)) / inv_ou
+        mkt_p_u25 = 1.0 - mkt_p_o25
+
+        # Dixon-Coles statistical probabilities (0..1)
+        dc_h = float(dc.get("p_home_win", 45.0)) / 100.0
+        dc_d = float(dc.get("p_draw", 26.0)) / 100.0
+        dc_a = float(dc.get("p_away_win", 29.0)) / 100.0
+        dc_o25 = float(dc.get("p_over_25", 52.0)) / 100.0
+        dc_u25 = float(dc.get("p_under_25", 48.0)) / 100.0
+        dc_btts = float(dc.get("p_btts_yes", 52.0)) / 100.0
+        lam_tot = max(1.2, float(dc.get("lam_total", 2.55)))
+        lam_h = max(0.4, float(dc.get("lam_h", 1.40)))
+        lam_a = max(0.3, float(dc.get("lam_a", 1.10)))
+
+        # Blended true underlying 1x2 & goal probabilities
+        p_h = 0.50 * mkt_p_h + 0.50 * dc_h
+        p_d = 0.50 * mkt_p_d + 0.50 * dc_d
+        p_a = max(0.03, 1.0 - p_h - p_d)
+        p_o25 = 0.50 * mkt_p_o25 + 0.50 * dc_o25
+        p_u25 = 1.0 - p_o25
+
+        p_win = 0.50
+        p_push = 0.0
+
+        if market_type == "1x2":
+            p_win = p_a if for_away else p_h
+            p_push = 0.0
+        elif market_type == "dnb" or "draw no bet" in sel_l:
+            p_win = p_a if for_away else p_h
+            p_push = p_d
+        elif market_type == "btts" or "both teams" in sel_l:
+            btts_od = float(bc_odds.get("btts_yes") or odds)
+            mkt_btts = min(0.75, (1.0 / max(1.05, btts_od)) * 0.945)
+            p_win = 0.45 * mkt_btts + 0.55 * dc_btts
+            p_push = 0.0
+        elif market_type == "goals_over_under" or "over " in sel_l or "under " in sel_l:
+            p2_exact = math.exp(-lam_tot) * (lam_tot ** 2) / 2.0
+            p3_exact = math.exp(-lam_tot) * (lam_tot ** 3) / 6.0
+            if "over 2.0" in sel_l or (line == 2.0 and "over" in sel_l):
+                p_win = p_o25
+                p_push = p2_exact
+            elif "over 2.5" in sel_l or (line == 2.5 and "over" in sel_l):
+                p_win = p_o25
+                p_push = 0.0
+            elif "under 2.5" in sel_l or (line == 2.5 and "under" in sel_l):
+                p_win = p_u25
+                p_push = 0.0
+            elif "under 3.0" in sel_l or (line == 3.0 and "under" in sel_l):
+                p_win = p_u25
+                p_push = p3_exact
+            else:
+                p_win = min(0.75, (1.0 / odds) * 0.95)
+        elif market_type == "handicap" or "handicap" in sel_l:
+            side_p = p_a if for_away else p_h
+            # Estimate P(win by exactly 1 goal) from Poisson skellam slice (~37% of favorite wins)
+            side_lam = lam_a if for_away else lam_h
+            opp_lam = lam_h if for_away else lam_a
+            p_win_by_1 = sum(
+                (math.exp(-side_lam) * (side_lam ** (g + 1)) / math.factorial(g + 1))
+                * (math.exp(-opp_lam) * (opp_lam ** g) / math.factorial(g))
+                for g in range(6)
+            )
+            p_win_2plus = max(0.12, side_p - p_win_by_1)
+            if "(-1.0)" in sel_l or line == -1.0:
+                p_win = p_win_2plus
+                p_push = p_win_by_1
+            elif "(-1.25)" in sel_l or line == -1.25:
+                # Half-loss on 1-goal win = equivalent to p_push = 0.5 * p_win_by_1
+                p_win = p_win_2plus
+                p_push = 0.5 * p_win_by_1
+            else:
+                # Raw -1.5 or 3-way (0:1)
+                p_win = p_win_2plus
+                p_push = 0.0
+        else:
+            p_win = min(0.70, (1.0 / odds) * 0.95)
+
+        # Bounded Sharp Analyst Consensus Tilt (rewards genuine multi-source independent conviction)
+        non_push_mass = max(0.10, 1.0 - p_push)
+        sharp_edge_add = min(0.052, max(0.0, (n_for - 1) * 0.014 + elite_for * 0.012))
+        p_win = min(non_push_mass - 0.04, p_win + sharp_edge_add * non_push_mass)
+        p_loss = max(0.04, 1.0 - p_win - p_push)
+
+        ev_pct = (p_win * (odds - 1.0) - p_loss * 1.0) * 100.0
+        # Decided win rate (excluding pushes) for intuitive subscriber display
+        decided_wr_pct = (p_win / max(0.05, p_win + p_loss)) * 100.0
+        return round(decided_wr_pct, 1), round(p_push * 100.0, 1), round(ev_pct, 2)
+
+
+    @classmethod
     def analyze_match_for_single_and_combo_leg(
         cls,
         m: Dict[str, Any],
         date_str: str,
         buzz_teams: Set[str],
         learning_state: Dict[str, Any],
-        max_hours_ahead: float = IDEAL_MAX_HOURS_BEFORE_KICKOFF
+        max_hours_ahead: float = IDEAL_MAX_HOURS_BEFORE_KICKOFF,
+        strict_channel_quality: bool = False
     ) -> Tuple[Optional[LedgerBetItem], Optional[Dict[str, Any]]]:
         if m["is_finished"] or m["is_live"]:
             return None, None
@@ -6631,8 +6652,12 @@ class SafeCushionBetCreator:
         hw, hd, hl = cls._parse_w_d_l(m.get("home_record", ""), h_form)
         aw, ad, al = cls._parse_w_d_l(m.get("away_record", ""), a_form)
 
-        h_games = max(1, hw + hd + hl)
-        a_games = max(1, aw + ad + al)
+        raw_h_sample = hw + hd + hl
+        raw_a_sample = aw + ad + al
+        if strict_channel_quality and (raw_h_sample < 3 or raw_a_sample < 3):
+            return None, None
+        h_games = max(1, raw_h_sample)
+        a_games = max(1, raw_a_sample)
         h_win_rate = hw / h_games if (hw + hd + hl) > 0 else 0.45
         a_win_rate = aw / a_games if (aw + ad + al) > 0 else 0.35
         h_loss_rate = hl / h_games if (hw + hd + hl) > 0 else 0.30
@@ -6750,10 +6775,11 @@ class SafeCushionBetCreator:
             return f"{tag_str} • {base_why}" if tag_str else base_why
 
         # ── 1. Home Winner (`Main Tab ➔ 1x2 ➔ {Home}` @ 1.62 – 2.02) ──
-        ok_m1, n_f1, _, c_bon1, c_tag1 = ExpertConsensusHub.evaluate_market_consensus(ballot, "home_1x2")
+        ok_m1, n_f1, _, c_bon1, c_tag1 = ExpertConsensusHub.evaluate_market_consensus(ballot, "home_1x2", strict_channel_mode=strict_channel_quality)
         if (
             ok_m1
-            and 1.62 <= bc_odds["home_1x2"] <= 2.02
+            and MIN_SINGLE_ODDS <= bc_odds["home_1x2"] <= 2.02
+            and (not strict_channel_quality or (dc["p_draw"] < 26.8 and combined_draws <= 3))
             and h_win_rate >= a_win_rate + 0.14
             and h_recent_w >= 3
             and h_recent_l <= 1
@@ -6774,7 +6800,7 @@ class SafeCushionBetCreator:
             candidates.append((score, cls._build_single(date_str, home, away, "1x2", sel, None, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, alt_line=real_alt1, expert_sources=max(3, n_f1)), c_leg))
 
         # ── 2. Dominant Home Favorite Handicap (`Handicap -1.0/-1.5`, `3-way handicap 0:1`, or `Handicap (Asian) -1.25` — ONLY if verified on BC.Game!) ──
-        ok_m2, n_f2, _, c_bon2, c_tag2 = ExpertConsensusHub.evaluate_market_consensus(ballot, "home_handicap")
+        ok_m2, n_f2, _, c_bon2, c_tag2 = ExpertConsensusHub.evaluate_market_consensus(ballot, "home_handicap", strict_channel_mode=strict_channel_quality)
         if (
             ok_m2
             and 1.22 <= bc_odds["home_1x2"] <= 1.61
@@ -6794,7 +6820,7 @@ class SafeCushionBetCreator:
                     f"{home} dominate at home ({h_form}) vs {away} ({a_form}) — "
                     f"-1.0 Handicap cashes on a 2+ goal win and refunds 100% of stake if {home} win by 1."
                 )
-            elif bc_odds.get("avail_ah_home_m15", 0.0) > 0 and 1.60 <= bc_odds["ah_home_m15"] <= 2.18:
+            elif bc_odds.get("avail_ah_home_m15", 0.0) > 0 and 1.84 <= bc_odds["ah_home_m15"] <= 2.05 and (not strict_channel_quality or (dc["lam_h"] >= 2.00 and n_f2 >= 3)):
                 odds = bc_odds["ah_home_m15"]
                 hc_ln = -1.5
                 sel = f"Handicaps Tab ➔ Handicap ➔ {home} (-1.5)"
@@ -6827,10 +6853,11 @@ class SafeCushionBetCreator:
                 candidates.append((score + (3.5 if hc_ln == -1.0 else 0.0), cls._build_single(date_str, home, away, "handicap", sel, hc_ln, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, alt_line=real_alt2, expert_sources=max(3, n_f2)), c_leg))
 
         # ── 3. Strong Away Contender Winner (`Main Tab ➔ 1x2 ➔ {Away}` @ 1.62 – 2.05) ──
-        ok_m3, n_f3, _, c_bon3, c_tag3 = ExpertConsensusHub.evaluate_market_consensus(ballot, "away_1x2")
+        ok_m3, n_f3, _, c_bon3, c_tag3 = ExpertConsensusHub.evaluate_market_consensus(ballot, "away_1x2", strict_channel_mode=strict_channel_quality)
         if (
             ok_m3
-            and 1.62 <= bc_odds["away_1x2"] <= 2.05
+            and MIN_SINGLE_ODDS <= bc_odds["away_1x2"] <= 2.02
+            and (not strict_channel_quality or (dc["p_draw"] < 26.5 and combined_draws <= 3))
             and a_win_rate >= h_win_rate + 0.14
             and a_recent_w >= 3
             and a_recent_l <= 1
@@ -6849,7 +6876,7 @@ class SafeCushionBetCreator:
             candidates.append((score, cls._build_single(date_str, home, away, "1x2", sel, None, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, alt_line=real_alt3, expert_sources=max(3, n_f3)), awayx2_leg))
 
         # ── 4. Away Contender Draw No Bet (`Main Tab ➔ Draw No Bet ➔ {Away}` @ 1.62 – 1.98) ──
-        ok_m4, n_f4, _, c_bon4, c_tag4 = ExpertConsensusHub.evaluate_market_consensus(ballot, "away_dnb")
+        ok_m4, n_f4, _, c_bon4, c_tag4 = ExpertConsensusHub.evaluate_market_consensus(ballot, "away_dnb", strict_channel_mode=strict_channel_quality)
         if (
             ok_m4
             and 1.62 <= bc_odds["dnb_away"] <= 1.98
@@ -6870,7 +6897,7 @@ class SafeCushionBetCreator:
             candidates.append((score + 4.0, cls._build_single(date_str, home, away, "dnb", sel, None, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, alt_line=real_alt4, expert_sources=max(3, n_f4)), awayx2_leg))
 
         # ── 5. Home Contender Draw No Bet (`Main Tab ➔ Draw No Bet ➔ {Home}` @ 1.62 – 1.98) ──
-        ok_m5, n_f5, _, c_bon5, c_tag5 = ExpertConsensusHub.evaluate_market_consensus(ballot, "home_dnb")
+        ok_m5, n_f5, _, c_bon5, c_tag5 = ExpertConsensusHub.evaluate_market_consensus(ballot, "home_dnb", strict_channel_mode=strict_channel_quality)
         if (
             ok_m5
             and 1.62 <= bc_odds["dnb_home"] <= 1.98
@@ -6892,7 +6919,7 @@ class SafeCushionBetCreator:
 
         # ── 6. High-Siege Corners (`Corners Tab ➔ Total Corners ➔ Over 9.5` @ 1.62 – 1.95) ──
         # v38.0 Basaksehir Lesson: Strictly require REAL quoted bookmaker corner odds (`has_real_corners_odds > 0`)!
-        ok_m6, n_f6, _, c_bon6, c_tag6 = ExpertConsensusHub.evaluate_market_consensus(ballot, "corners_over_95")
+        ok_m6, n_f6, _, c_bon6, c_tag6 = ExpertConsensusHub.evaluate_market_consensus(ballot, "corners_over_95", strict_channel_mode=strict_channel_quality)
         if (
             ok_m6
             and bc_odds.get("has_real_corners_odds", 0.0) > 0.0
@@ -6915,7 +6942,7 @@ class SafeCushionBetCreator:
             candidates.append((score, cls._build_single(date_str, home, away, "corners_over_under", sel, 9.5, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, alt_line=real_alt6, expert_sources=max(3, n_f6)), c_leg))
 
         # ── 7. Genuine Two-Way Scoring (`Main Tab ➔ Both Teams to Score ➔ Yes` @ 1.62 – 1.95) ──
-        ok_m7, n_f7, _, c_bon7, c_tag7 = ExpertConsensusHub.evaluate_market_consensus(ballot, "btts_yes")
+        ok_m7, n_f7, _, c_bon7, c_tag7 = ExpertConsensusHub.evaluate_market_consensus(ballot, "btts_yes", strict_channel_mode=strict_channel_quality)
         if (
             ok_m7
             and 1.62 <= bc_odds["btts_yes"] <= 1.95
@@ -6941,7 +6968,7 @@ class SafeCushionBetCreator:
             candidates.append((score, cls._build_single(date_str, home, away, "btts", sel, None, odds, prob, score - 52.0, why, league_label, bookie, kickoff_str, alt_line=real_alt7, expert_sources=max(3, n_f7)), over15_leg))
 
         # ── 8a. Refund-Protected Asian Goal Line (`Main Tab ➔ Total ➔ Over 2.0` @ 1.62 – 1.98 — ONLY if `avail_over_20 > 0`!) ──
-        ok_m8, n_f8, _, c_bon8, c_tag8 = ExpertConsensusHub.evaluate_market_consensus(ballot, "over_25")
+        ok_m8, n_f8, _, c_bon8, c_tag8 = ExpertConsensusHub.evaluate_market_consensus(ballot, "over_25", strict_channel_mode=strict_channel_quality)
         if (
             ok_m8
             and bc_odds.get("avail_over_20", 0.0) > 0.0
@@ -6995,7 +7022,7 @@ class SafeCushionBetCreator:
 
         # ── 9. Disciplined Low-Tempo Tactical Under (`Main Tab ➔ Total ➔ Under 2.5` @ 1.62 – 1.95) ──
         # v36.0 US Avellino 4-1 Lesson: NEVER bet Under 2.5 blind without verified match-ceiling stats AND >= 2 expert votes!
-        ok_m9, n_f9, _, c_bon9, c_tag9 = ExpertConsensusHub.evaluate_market_consensus(ballot, "under_25")
+        ok_m9, n_f9, _, c_bon9, c_tag9 = ExpertConsensusHub.evaluate_market_consensus(ballot, "under_25", strict_channel_mode=strict_channel_quality)
         has_ver_ceiling = bool(deep_stats.get("has_deep_stats"))
         max_rg = int(deep_stats.get("max_recent_match_goals", 99) if has_ver_ceiling else 99)
         c_4p = int(deep_stats.get("high_ceiling_4plus_games", 99) if has_ver_ceiling else 99)
@@ -7026,8 +7053,44 @@ class SafeCushionBetCreator:
         if not candidates:
             return None, None
 
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        best_score, best_single, best_combo_leg = candidates[0]
+        # v45.0 Calibrate true de-vigged EV & filter out any negative/marginal EV or longshot (>2.04) traps on `@Footybett`!
+        vetted_candidates: List[Tuple[float, LedgerBetItem, Dict[str, Any]]] = []
+        all_elite_votes = sum(1 for s_set in ballot.values() for s in s_set if s in ExpertConsensusHub.ELITE_TIER1_SHARP_DESKS)
+        for raw_sc, cand_item, cand_cleg in candidates:
+            if strict_channel_quality and cand_item.market_type == "corners_over_under":
+                continue
+            if strict_channel_quality and (cand_item.odds < MIN_SINGLE_ODDS or cand_item.odds > 2.04):
+                continue
+            m_src_cnt = re.search(r"\((\d+)/\d+\s+Sources", cand_item.rationale or "")
+            n_src_est = int(m_src_cnt.group(1)) if m_src_cnt else (2 if "Backed by" in (cand_item.rationale or "") else 1)
+            dec_wr, push_pct, true_ev = cls.calculate_true_calibrated_ev(
+                cand_item.market_type,
+                cand_item.selection,
+                cand_item.line,
+                cand_item.odds,
+                dc,
+                bc_odds,
+                home,
+                away,
+                n_for=n_src_est,
+                elite_for=min(2, all_elite_votes)
+            )
+            if strict_channel_quality and true_ev < 3.2:
+                continue
+            cand_item.model_prob = round(dec_wr, 1)
+            cand_item.edge_ev = round(true_ev, 2)
+            conf_v = min(9.6, max(8.4, round(8.2 + (true_ev / 5.5) + (0.2 if push_pct >= 12.0 else 0.0), 1)))
+            stars_ico = "⭐️⭐️⭐️⭐️⭐️" if conf_v >= 8.9 else "⭐️⭐️⭐️⭐️"
+            cand_item.confidence_stars = f"{stars_ico} ({conf_v:.1f}/10 • +{max(0.5, true_ev):.1f}% Value Edge)"
+            # Reward true mathematical EV + refund cushion (`push_pct`) in final ranking!
+            adj_rank_score = raw_sc + (true_ev * 1.65) + (3.5 if push_pct >= 14.0 else 0.0)
+            vetted_candidates.append((adj_rank_score, cand_item, cand_cleg))
+
+        if not vetted_candidates:
+            return None, None
+
+        vetted_candidates.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_single, best_combo_leg = vetted_candidates[0]
         return best_single, best_combo_leg
 
     @classmethod
@@ -7552,7 +7615,8 @@ class SafeCushionBetCreator:
         paired_candidates: List[Tuple[int, int, float, LedgerBetItem, Dict[str, Any]]] = []
         for m in fixtures:
             single, c_leg = cls.analyze_match_for_single_and_combo_leg(
-                m, active_date, buzz_teams, learning_state, max_hours_ahead=IDEAL_MAX_HOURS_BEFORE_KICKOFF
+                m, active_date, buzz_teams, learning_state, max_hours_ahead=IDEAL_MAX_HOURS_BEFORE_KICKOFF,
+                strict_channel_quality=True
             )
             if single and single.odds >= MIN_SINGLE_ODDS and c_leg:
                 has_ver_odds = bool(m.get("has_live_odds") or API_FOOTBALL_KEY)
@@ -7563,7 +7627,8 @@ class SafeCushionBetCreator:
             already_picked = {p[3].bet_key for p in paired_candidates}
             for m in fixtures:
                 single, c_leg = cls.analyze_match_for_single_and_combo_leg(
-                    m, active_date, buzz_teams, learning_state, max_hours_ahead=ADAPTIVE_MAX_HOURS_BEFORE_KICKOFF
+                    m, active_date, buzz_teams, learning_state, max_hours_ahead=ADAPTIVE_MAX_HOURS_BEFORE_KICKOFF,
+                    strict_channel_quality=True
                 )
                 if single and single.odds >= MIN_SINGLE_ODDS and c_leg and single.bet_key not in already_picked:
                     already_picked.add(single.bet_key)
@@ -7588,9 +7653,8 @@ class SafeCushionBetCreator:
                 continue
             sel_l = s_cand.selection.lower()
             if s_cand.market_type == "corners_over_under":
-                if corners_count >= 1:
-                    continue
-                corners_count += 1
+                # v44.0 ROI Upgrade: Ban high-variance Corners from Official Daily Singles!
+                continue
             elif "under" in sel_l:
                 if under_count >= 1:
                     continue
@@ -7623,8 +7687,12 @@ class SafeCushionBetCreator:
                 # v40.0 Strict Live-Existence Verification & Auto-Pivot (`reconcile_single_with_live_bcgame`):
                 live_sc = BCGameLivePlaywrightEngine.get_live_match_odds(s_obj.team_home, s_obj.team_away)
                 if live_sc:
+                    pre_odds = s_obj.odds
                     ok_rec = cls.reconcile_single_with_live_bcgame(s_obj, live_sc, is_raw_screen=True)
-                    if not ok_rec or s_obj.odds < 1.54 or s_obj.odds > 2.20:
+                    if not ok_rec or s_obj.odds < MIN_SINGLE_ODDS or s_obj.odds > 2.04 or s_obj.market_type == "corners_over_under":
+                        continue
+                    # If live BC.Game screen steamed down > 0.09 below pre-check price, ensure EV didn't turn negative!
+                    if (pre_odds - s_obj.odds) > 0.09 and (s_obj.edge_ev - ((pre_odds - s_obj.odds) * 48.0)) < 1.5:
                         continue
                 elif BCGameLivePlaywrightEngine.is_available() and s_obj.market_type in ("handicap", "corners_over_under"):
                     # Never publish an unverified Handicap or Corners line when Playwright is online!
@@ -7646,7 +7714,9 @@ class SafeCushionBetCreator:
                     exact_verified_pairs.append(p_tup)
                 else:
                     fallback_pairs.append(p_tup)
-            chosen_final_pairs = (exact_verified_pairs + fallback_pairs)[: max(0, slots_left)]
+            # v44.0 Quality-Gated 2-4 Singles: Never dilute 2-3 exact-verified A+ picks with unverified board-URL filler!
+            pool_final = exact_verified_pairs if len(exact_verified_pairs) >= 2 else (exact_verified_pairs + fallback_pairs)
+            chosen_final_pairs = pool_final[: max(0, slots_left)]
             top_pairs = chosen_final_pairs
             for _, _, _, single, _ in chosen_final_pairs:
                 DailyLedgerManager.upsert_bet(single)
@@ -7790,12 +7860,12 @@ class SafeCushionBetCreator:
                 leg_od = round(float(c_leg.get("odds", 1.24)), 2)
                 sel_c_low = str(c_leg.get("selection", "")).lower()
                 max_leg_cap = 1.58 if ("double chance" in sel_c_low or "over 1.5" in sel_c_low) else 1.50
-                if leg_od < 1.18 or leg_od > max_leg_cap:
+                if leg_od < 1.20 or leg_od > 1.50:
                     continue
-                if len(lotto_legs) >= 7 and lotto_odds >= 7.5:
-                    if len(lotto_legs) >= 10 or (lotto_odds * leg_od > 22.0):
+                if len(lotto_legs) >= 5 and lotto_odds >= 3.80:
+                    if len(lotto_legs) >= 6 or (lotto_odds * leg_od > 7.50):
                         break
-                if len(lotto_legs) >= 10:
+                if len(lotto_legs) >= 6:
                     break
                 lotto_legs.append(c_leg)
                 lotto_odds *= leg_od
@@ -7846,6 +7916,39 @@ class SafeCushionBetCreator:
         return DailyLedgerManager.load_active_date_items()
 
 
+def clean_human_rationale(raw_text: str) -> str:
+    """Converts verbose/robotic source-tag rationales & `(WWLDW)` codes into one clean, readable sentence."""
+    txt = str(raw_text or "").strip()
+    if not txt:
+        return "Strong statistical and form edge confirmed across pre-match team metrics."
+    # Strip robotic `Unanimous Consensus (3/3 Sources: ...) •` or `Backed by X + Match Form •` prefixes
+    if "•" in txt:
+        parts = [p.strip() for p in txt.split("•") if p.strip()]
+        # Keep the actual football explanation sentence
+        txt = parts[-1] if parts else txt
+    txt = re.sub(r"\(\s*[WDL]{3,6}\s*\)", "", txt)
+    txt = re.sub(r"\(\s*[WDL]{3,6}\s+vs\s+[WDL]{3,6}\s*\)", "", txt)
+    txt = re.sub(r"\s{2,}", " ", txt).strip()
+    if txt and not txt.endswith((".", "!")):
+        txt += "."
+    return txt
+
+
+HUMAN_MARKET_NAMES = {
+    "over_25": "Over 2.5 Goals",
+    "under_25": "Under 2.5 Goals",
+    "over_20": "Over 2.0 Goals",
+    "btts_yes": "Both Teams to Score (Yes)",
+    "btts_no": "Both Teams to Score (No)",
+    "1x2_winner": "Match Winner (1x2)",
+    "home_1x2": "Home Win (1x2)",
+    "away_1x2": "Away Win (1x2)",
+    "draw_no_bet": "Draw No Bet",
+    "corners_over_95": "Total Corners",
+    "handicap": "Handicap",
+}
+
+
 class BetSlipCardFormatter:
     """
     v36.0 Singles-Only Official Record + Chronological History & Guide Formatter:
@@ -7886,22 +7989,12 @@ class BetSlipCardFormatter:
     def format_channel_pinned_guide(cls) -> str:
         r_usd = BankrollStakeSizer.get_unit_usd()
         return (
-            "📌 OFFICIAL @FOOTYBETT GUIDE — 100% FREE & TRANSPARENT\n"
-            "────────────────────────\n"
-            "🔓 NO SUBSCRIPTIONS • NO PAID VIP\n"
-            "• Every studied pick, live score settlement & post-match statistical audit here is 100% FREE. We never charge subscriptions.\n"
-            f"• 🤝 Trusted Sportsbook Partner: Play all our exact match names & lines with fast, smooth deposits & withdrawals on {partner_link_tag('BC.Game')} ➔ {BCGAME_PARTNER_URL}\n\n"
-            f"1️⃣ 🟢 OFFICIAL DAILY SINGLES (1.00R = ${r_usd:.0f} Risk)\n"
-            "• Weighted majority-consensus plays led by Tier-1 trusted football desks (Racing Post, Sporting Life, Opta Analyst, ProTipster, Action Network, Sports Mole, Wavysport, Oddschecker, OneFootball & LiveScore across 38+ portals), 35+ tipster channels & live team/player stats (1.62+ BC.Game odds).\n"
-            "• ONLY Official Singles count toward our Official Channel W-L Record & R-Multiple Profit.\n"
-            "• ⚖️ Sustainable Value: Every Official Single targets 1.62–2.05 odds (+0.62R to +1.05R profit) with refund-protected Handicap & Draw No Bet angles where appropriate.\n"
-            "• 🔗 1-Click Direct Bet: Tap the [Open on BC.Game ↗] button or link on any card to jump straight to the match board (or tap any team name to copy)!\n\n"
-            "2️⃣ 🎟️ OPTIONAL 2-LEG SAFE COMBO\n"
-            "• Built from today's Top 2 Singles stepped down to safer cushions (Over 1.5, 1X, etc.).\n"
-            "• Reported transparently as WON (W) or LOST (L), and excluded from Official Singles W-L.\n\n"
-            "3️⃣ 🚀 OPTIONAL $5 MEGA SAFE-LIST LOTTO\n"
-            "• Small $5 fun ticket stacking verified today-only ~90% cushions for 10x–25x+ upside.\n"
-            "• Reported transparently as WON (W) or LOST (L), and excluded from Official Singles W-L."
+            "📌 OFFICIAL @FOOTYBETT GUIDE — 100% FREE\n"
+            "────────────────────\n"
+            "• Zero VIP & zero paid subscriptions — every daily pick and Full-Time result here is free.\n"
+            f"• 🤝 Official Sportsbook Partner: {partner_link_tag('BC.Game')} ➔ {BCGAME_PARTNER_URL}\n\n"
+            f"🟢 Daily Singles (${r_usd:.0f} / 1 Unit): Quality-only plays (@ 1.68–2.04) verified across Racing Post, Sporting Life, Opta Analyst & ProTipster, with a 🛡️ Safe Alt line on every card. Only Singles count in our Official Record.\n"
+            "🎟️ Optional Combo & $5 Lotto: Low-stake side tickets tracked separately from Singles."
         )
 
     @classmethod
@@ -7926,12 +8019,10 @@ class BetSlipCardFormatter:
             ret_dlr = lotto_dlr * s.odds
             return (
                 f"🚀 OPTIONAL $5 MEGA SAFE-LIST LOTTO ({len(s.combo_legs)} Legs • {s.odds:.2f}x) — @Footybett\n"
-                "────────────────────────\n"
+                "────────────────────\n"
                 f"{legs_block}\n"
-                "────────────────────────\n"
-                f"💰 Total Odds : {s.odds:.2f}x (Tap [Open ↗] on any leg to open BC.Game directly, or tap team name to copy)\n"
-                f"🎟️ Fun Stake  : $5.00 ➔ Returns ${ret_dlr:.2f} (+${ret_dlr - lotto_dlr:.2f} Upside)\n"
-                f"ℹ️ Note       : Today-only verified BC.Game board — W/L reported separately & excluded from Official Singles W-L."
+                "────────────────────\n"
+                f"💰 Total Odds: {s.odds:.2f}x  |  🎟️ $5 ➔ ${ret_dlr:.2f} (+${ret_dlr - lotto_dlr:.2f})"
             )
 
         rew_r = s.odds - 1.0
@@ -7947,20 +8038,17 @@ class BetSlipCardFormatter:
                 meta_parts = [p for p in [lg.get("league", ""), lg.get("kickoff", "")] if p]
                 meta_str = f" [{ ' • '.join(meta_parts) }]" if meta_parts else ""
                 leg_lines.append(
-                    f"{idx}️⃣ {copy_tag(h_bc)} vs {copy_tag(a_bc)}{meta_str} ➔ {lg['selection']} (@ {float(lg['odds']):.2f}) {bc_link_tag(leg_url, f'[Open Leg {idx} ↗]')}"
+                    f"{idx}. {copy_tag(h_bc)} vs {copy_tag(a_bc)}{meta_str} ➔ {lg['selection']} (@ {float(lg['odds']):.2f}) {bc_link_tag(leg_url, f'[Leg {idx} ↗]')}"
                 )
             legs_block = "\n".join(leg_lines)
-            conf_str = s.confidence_stars if "/" in s.confidence_stars else "⭐️⭐️⭐️⭐️⭐️ (9.5/10)"
             opt_stake = round(r_usd * 0.50, 0)
             opt_win = opt_stake * rew_r
             return (
                 "🎟️ OPTIONAL 2-LEG SAFE COMBO — @Footybett\n"
-                "────────────────────────\n"
+                "────────────────────\n"
                 f"{legs_block}\n"
-                "────────────────────────\n"
-                f"💰 Total Odds    : {s.odds:.2f}  |  🔥 Confidence: {conf_str}\n"
-                f"💵 Optional Plan : ${opt_stake:.0f} Optional Cushion ➔ +${opt_win:.2f} Profit (Payout ${opt_stake + opt_win:.2f})\n"
-                f"ℹ️ Note          : Tap the direct leg buttons below to open on BC.Game — W/L reported separately & excluded from Official Singles Record."
+                "────────────────────\n"
+                f"💰 Odds: {s.odds:.2f}  |  💵 ${opt_stake:.0f} ➔ ${opt_stake + opt_win:.2f} (+${opt_win:.2f})"
             )
 
         num_tag = f" #{pick_number}" if pick_number else ""
@@ -7976,27 +8064,25 @@ class BetSlipCardFormatter:
             if is_exact_match_page
             else f"Open {h_bc} vs {a_bc} on BC.Game ↗"
         )
-        ko_clean = s.kickoff_str or ""
-        if s.settlement != "PENDING" and ko_clean:
-            ko_clean = re.sub(r"\s*\(In\s+[^)]+\)", "", ko_clean)
-            ko_clean = ko_clean.replace(" — Starting Soon", "").strip()
-        kickoff_line = f"\n⏰ Kickoff       : {ko_clean}" if ko_clean else ""
+        ko_clean = re.sub(r"\s*\(In\s+[^)]+\)", "", (s.kickoff_str or "")).replace(" — Starting Soon", "").strip()
+        kickoff_line = f"\n⏰ Kickoff  : {ko_clean}" if ko_clean else ""
         eff_alt_raw = s.alt_bcgame_line or BankrollStakeSizer.build_guaranteed_safe_alt_line(
             s.selection, s.market_type, h_bc, a_bc, None, s.odds
         )
         alt_disp = BankrollStakeSizer.format_safe_alt_display(eff_alt_raw)
-        alt_line = f"\n🛡️ Safe Alt      : {alt_disp}" if alt_disp else ""
-        conf_str = s.confidence_stars if "/" in s.confidence_stars else f"⭐️⭐️⭐️⭐️ ({min(9.5, max(8.2, round(s.model_prob / 8.5, 1))):.1f}/10)"
+        alt_line = f"\n🛡️ Safe Alt : {alt_disp}" if alt_disp else ""
         stake_line = BankrollStakeSizer.format_stake_plan_line(1.0, s.odds, getattr(s, "stake_tier_label", "1R Play"))
+        clean_why = clean_human_rationale(s.rationale)
+        lg_clean = (s.match_context or "").split(" - ")[-1].strip()
+        lg_part = f" ({lg_clean})" if lg_clean else ""
         return (
             f"🟢 SINGLE BET{num_tag} — @Footybett\n"
-            "────────────────────────\n"
-            f"⚽ BC.Game Match : {copy_tag(h_bc)} vs {copy_tag(a_bc)} ({s.match_context}){kickoff_line}\n"
-            f"🎯 Selection     : {s.selection}  (@ {s.odds:.2f})\n"
-            f"🔗 Direct Bet    : {bc_link_tag(direct_url, link_lbl)}\n"
-            f"🔥 Confidence    : {conf_str}\n"
-            f"💵 Stake & Return: {stake_line}{alt_line}\n"
-            f"📊 Match Read    : {s.rationale}"
+            "────────────────────\n"
+            f"⚽ Match    : {copy_tag(h_bc)} vs {copy_tag(a_bc)}{lg_part}{kickoff_line}\n"
+            f"🎯 Selection: {s.selection} (@ {s.odds:.2f})\n"
+            f"💵 Return   : {stake_line}{alt_line}\n"
+            f"📊 Why      : {clean_why}\n"
+            f"🔗 Direct   : {bc_link_tag(direct_url, link_lbl)}"
         )
 
     @classmethod
@@ -8006,92 +8092,79 @@ class BetSlipCardFormatter:
         won, lost, wr, net_r = cls.get_totals_summary_tuple(up_to_date=eff_date)
         is_lotto = s.is_lotto_combo or s.market_type == "lotto_parlay"
 
-        # 1. Optional $5 Mega Lotto Result Card (Reports W or L clearly, Excluded from Official Singles W-L)
+        net_dlr_all = net_r * r_usd
+        net_s_all = f"+${net_dlr_all:.2f}" if net_dlr_all >= 0 else f"-${abs(net_dlr_all):.2f}"
+
+        # 1. Optional $5 Mega Lotto Result Card (Clean 3-line summary)
         if is_lotto:
             if "WON" in s.settlement:
                 ret_dlr = 5.0 * s.odds
                 return (
-                    f"🎉 OPTIONAL $5 LOTTO — WON ✅ (+${ret_dlr - 5.0:.2f} Upside!) — @Footybett\n"
-                    "────────────────────────\n"
-                    f"🚀 Result : W ✅ ({s.selection} @ {s.odds:.2f}x)\n"
-                    f"ℹ️ Note   : Optional Bonus Hit (Excluded from Official Singles Calculation)\n"
-                    f"📈 Official Singles Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
+                    f"🎉 OPTIONAL $5 LOTTO — WON ✅ (+${ret_dlr - 5.0:.2f}) — @Footybett\n"
+                    "────────────────────\n"
+                    f"🚀 {s.selection} @ {s.odds:.2f}x ✅"
                 )
-            else:
-                missed_detail = f"\n🔎 Status : {s.score_str}" if s.score_str and s.score_str != "-" else ""
-                return (
-                    f"❌ OPTIONAL $5 LOTTO — LOST ❌ ($5.00 Fun Ticket) — @Footybett\n"
-                    "────────────────────────\n"
-                    f"🚀 Result : L ❌ ({s.selection} @ {s.odds:.2f}x){missed_detail}\n"
-                    f"ℹ️ Note   : Optional Bonus Ticket — Excluded from Official Singles W-L & P&L\n"
-                    f"📈 Official Singles Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
-                )
+            missed_detail = f"\n🔎 {s.score_str}" if s.score_str and s.score_str != "-" else ""
+            return (
+                f"❌ OPTIONAL $5 LOTTO — LOST ❌ — @Footybett\n"
+                "────────────────────\n"
+                f"🚀 {s.selection} @ {s.odds:.2f}x ❌{missed_detail}"
+            )
 
-        # 2. Optional 2-Leg Safe Combo Result Card (Reports W or L clearly, Excluded from Official Singles W-L)
+        # 2. Optional 2-Leg Safe Combo Result Card (Clean 3-line summary)
         if s.is_combo:
             opt_stake = round(r_usd * 0.50, 0)
             if "WON" in s.settlement:
                 opt_win = opt_stake * (s.odds - 1.0)
                 return (
-                    f"✅ OPTIONAL 2-LEG SAFE COMBO — WON ✅ (+${opt_win:.2f} Optional) — @Footybett\n"
-                    "────────────────────────\n"
-                    f"🎟️ Result : W ✅ ({s.score_str})\n"
-                    f"🎯 Ticket : {s.selection} @ {s.odds:.2f} ✅\n"
-                    f"ℹ️ Note   : Optional Combo Hit — Excluded from Official Singles W-L & P&L\n"
-                    f"📈 Official Singles Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
+                    f"✅ OPTIONAL 2-LEG SAFE COMBO — WON ✅ (+${opt_win:.2f}) — @Footybett\n"
+                    "────────────────────\n"
+                    f"🎟️ {s.score_str}\n"
+                    f"🎯 {s.selection} @ {s.odds:.2f} ✅"
                 )
-            else:
-                return (
-                    f"❌ OPTIONAL 2-LEG SAFE COMBO — LOST ❌ (Optional Cushion) — @Footybett\n"
-                    "────────────────────────\n"
-                    f"🎟️ Result : L ❌ ({s.score_str})\n"
-                    f"🎯 Ticket : {s.selection} @ {s.odds:.2f} ❌\n"
-                    f"ℹ️ Note   : Optional Combo — Excluded from Official Singles W-L & P&L\n"
-                    f"📈 Official Singles Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
-                )
+            return (
+                f"❌ OPTIONAL 2-LEG SAFE COMBO — LOST ❌ — @Footybett\n"
+                "────────────────────\n"
+                f"🎟️ {s.score_str}\n"
+                f"🎯 {s.selection} @ {s.odds:.2f} ❌"
+            )
 
-        # 3. Official Single Bet Result Card (Counts in Official Singles W-L & 1R P&L)
+        # 3. Official Single Bet Result Card (Clean, scannable 4-line update)
         match_line = f"⚽ {s.team_home} vs {s.team_away} ➔ {s.score_str}"
-        stats_line = f"\n📊 Match Details : {s.match_stats_summary}" if getattr(s, "match_stats_summary", "") else ""
 
         if "WON" in s.settlement:
             prof_r = BankrollStakeSizer.get_item_r_profit(s)
             prof_dlr = prof_r * r_usd
-            if getattr(s, "won_via_safe_alt", False) and getattr(s, "settled_note", ""):
-                bet_hit_line = f"🎯 {s.settled_note} ✅"
-                hdr_tag = f"✅ SINGLE BET WON (SAFE ALT HIT: +{prof_r:.2f}R / +${prof_dlr:.2f})"
-            else:
-                bet_hit_line = f"🎯 {s.selection} @ {s.odds:.2f} ✅"
-                hdr_tag = f"✅ SINGLE BET WON (+{prof_r:.2f}R / +${prof_dlr:.2f})"
+            bet_hit_line = f"🎯 {s.selection.split('➔')[-1].strip()} @ {s.odds:.2f} ✅"
             return (
-                f"{hdr_tag} — @Footybett\n"
-                "────────────────────────\n"
+                f"✅ SINGLE BET WON (+${prof_dlr:.2f}) — @Footybett\n"
+                "────────────────────\n"
                 f"{match_line}\n"
-                f"{bet_hit_line}{stats_line}\n"
-                f"📈 Official Singles Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
+                f"{bet_hit_line}\n"
+                f"📈 Singles Record: {won}W - {lost}L ({wr:.0f}%) | {net_s_all}"
             )
         elif "PUSH" in s.settlement:
             if getattr(s, "won_via_safe_alt", False) and getattr(s, "settled_note", ""):
                 push_target = f"🎯 {s.settled_note} ➖"
-                push_hdr = f"➖ SINGLE BET REFUNDED (SAFE ALT PUSH: 0.00R / ${r_usd:.0f} Refunded)"
+                push_hdr = f"➖ SINGLE BET REFUNDED (${r_usd:.0f} Returned)"
             else:
-                push_target = f"🎯 {s.selection} @ {s.odds:.2f} ➖ (Full Refund)"
-                push_hdr = f"➖ SINGLE BET PUSH (0.00R / ${r_usd:.0f} Stake Refunded)"
+                push_target = f"🎯 {s.selection.split('➔')[-1].strip()} @ {s.odds:.2f} ➖ (Stake Refunded)"
+                push_hdr = f"➖ SINGLE BET REFUNDED (${r_usd:.0f} Returned)"
             return (
                 f"{push_hdr} — @Footybett\n"
-                "────────────────────────\n"
+                "────────────────────\n"
                 f"{match_line}\n"
-                f"{push_target}{stats_line}\n"
-                f"📈 Official Singles Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
+                f"{push_target}\n"
+                f"📈 Singles Record: {won}W - {lost}L ({wr:.0f}%) | {net_s_all}"
             )
         else:
             autopsy_line = f"\n{s.loss_autopsy}" if s.loss_autopsy else ""
             return (
-                f"❌ SINGLE BET LOST (-1.00R / -${r_usd:.2f}) — @Footybett\n"
-                "────────────────────────\n"
+                f"❌ SINGLE BET LOST (-${r_usd:.2f}) — @Footybett\n"
+                "────────────────────\n"
                 f"{match_line}\n"
-                f"🎯 {s.selection} @ {s.odds:.2f} ❌{stats_line}{autopsy_line}\n"
-                f"📈 Official Singles Record : {won}W - {lost}L ({wr:.0f}%) | {net_r:+.2f}R (${net_r * r_usd:+.2f})"
+                f"🎯 {s.selection.split('➔')[-1].strip()} @ {s.odds:.2f} ❌{autopsy_line}\n"
+                f"📈 Singles Record: {won}W - {lost}L ({wr:.0f}%) | {net_s_all}"
             )
 
     @classmethod
@@ -8129,53 +8202,49 @@ class BetSlipCardFormatter:
         won_all, lost_all, wr_all, net_all_r = cls.get_totals_summary_tuple(up_to_date=target_date)
 
         lines = [
-            f"📊 END OF DAY SINGLES RESULTS — @Footybett ({target_date})",
-            "────────────────────────"
+            f"📊 END OF DAY RESULTS — @Footybett ({target_date})",
+            "────────────────────"
         ]
         for idx, s in enumerate(day_singles, 1):
-            label = f"⚽ {s.team_home} vs {s.team_away}"
+            label = f"{s.team_home} vs {s.team_away}"
+            sc_tag = f" ({s.score_str.split('(')[0].strip()})" if s.score_str and s.score_str != "-" else ""
             if "WON" in s.settlement:
                 p_r = BankrollStakeSizer.get_item_r_profit(s)
                 if getattr(s, "won_via_safe_alt", False) and getattr(s, "settled_note", ""):
-                    lines.append(f"{idx}. ✅ {label} ➔ {s.settled_note} (+{p_r:.2f}R / +${p_r * r_usd:.2f})")
+                    lines.append(f"{idx}. ✅ {label}{sc_tag} ➔ {s.settled_note} (+${p_r * r_usd:.2f})")
                 else:
-                    lines.append(f"{idx}. ✅ {label} ➔ {s.selection} @ {s.odds:.2f} (+{p_r:.2f}R / +${p_r * r_usd:.2f})")
+                    lines.append(f"{idx}. ✅ {label}{sc_tag} ➔ {s.selection} @ {s.odds:.2f} (+${p_r * r_usd:.2f})")
             elif "LOST" in s.settlement:
-                lines.append(f"{idx}. ❌ {label} ➔ {s.selection} @ {s.odds:.2f} (-1.00R / -${r_usd:.2f})")
-                if s.loss_autopsy:
-                    lines.append(f"   ↳ {s.loss_autopsy}")
+                lines.append(f"{idx}. ❌ {label}{sc_tag} ➔ {s.selection} @ {s.odds:.2f} (-${r_usd:.2f})")
             else:
-                if getattr(s, "won_via_safe_alt", False) and getattr(s, "settled_note", ""):
-                    lines.append(f"{idx}. ➖ {label} ➔ {s.settled_note}")
-                else:
-                    lines.append(f"{idx}. ➖ {label} ➔ {s.selection} @ {s.odds:.2f} (0.00R / REFUND)")
+                lines.append(f"{idx}. ➖ {label}{sc_tag} ➔ {s.selection} @ {s.odds:.2f} (Refund $0.00)")
 
-        # Explicitly report W or L for Optional Combo & Optional Lotto WITHOUT counting them in Official W-L!
         if day_safe_combos or day_lottos:
-            lines.append("────────────────────────")
-            lines.append("🎟️ Optional Combos & Lotto (Not Counted in Official Singles W-L):")
+            lines.append("────────────────────")
+            lines.append("🎟️ Optional Side Tickets (Tracked Separately):")
             for sc in day_safe_combos:
                 if "WON" in sc.settlement:
-                    lines.append(f"• 2-Leg Safe Combo (@ {sc.odds:.2f}) : ✅ WON (W)")
+                    lines.append(f"• 2-Leg Safe Combo (@ {sc.odds:.2f}) : ✅ WON")
                 elif "LOST" in sc.settlement:
-                    lines.append(f"• 2-Leg Safe Combo (@ {sc.odds:.2f}) : ❌ LOST (L — {sc.score_str})")
+                    lines.append(f"• 2-Leg Safe Combo (@ {sc.odds:.2f}) : ❌ LOST")
                 else:
                     lines.append(f"• 2-Leg Safe Combo (@ {sc.odds:.2f}) : ⏳ PENDING")
             for lc in day_lottos:
                 if "WON" in lc.settlement:
-                    lines.append(f"• $5 Mega Lotto ({lc.odds:.2f}x)    : 🎉 WON (W — +${5.0 * (lc.odds - 1.0):.2f} Bonus!)")
+                    lines.append(f"• $5 Mega Lotto ({lc.odds:.2f}x) : 🎉 WON (+${5.0 * (lc.odds - 1.0):.2f})")
                 elif "LOST" in lc.settlement:
-                    lines.append(f"• $5 Mega Lotto ({lc.odds:.2f}x)    : ❌ LOST (L — $5 Fun Ticket)")
+                    lines.append(f"• $5 Mega Lotto ({lc.odds:.2f}x) : ❌ LOST (-$5.00)")
                 else:
-                    lines.append(f"• $5 Mega Lotto ({lc.odds:.2f}x)    : ⏳ PENDING")
+                    lines.append(f"• $5 Mega Lotto ({lc.odds:.2f}x) : ⏳ PENDING")
 
+        d_net_dlr = d_net_r * r_usd
+        d_net_str = f"+${d_net_dlr:.2f}" if d_net_dlr >= 0 else f"-${abs(d_net_dlr):.2f}"
+        all_net_dlr = net_all_r * r_usd
+        all_net_str = f"+${all_net_dlr:.2f}" if all_net_dlr >= 0 else f"-${abs(all_net_dlr):.2f}"
         lines.extend([
-            "────────────────────────",
-            f"📅 Singles Day Result   : {d_won} Won ✅" + (f" | {d_push} Refund ➖" if d_push > 0 else "") + f" | {d_lost} Lost ❌ ({d_net_r:+.2f}R / ${d_net_r * r_usd:+.2f})",
-            f"📈 Official Singles W-L : {won_all}W - {lost_all}L ({wr_all:.1f}% Win Rate) [Singles Only]",
-            f"💰 Official Singles P&L : {net_all_r:+.2f}R (1R = ${r_usd:.0f} Risk ➔ ${net_all_r * r_usd:+.2f} Net Profit)",
-            "────────────────────────",
-            "🔔 Full-Time Match Reviews Complete • Next Studied Slate Tomorrow"
+            "────────────────────",
+            f"📅 Today's Singles  : {d_won}W" + (f" - {d_push}R" if d_push > 0 else "") + f" - {d_lost}L ({d_net_str})",
+            f"📈 Official Record  : {won_all}W - {lost_all}L ({wr_all:.1f}%) | {all_net_str} (${r_usd:.0f}/bet)"
         ])
         return "\n".join(lines)
 
@@ -8196,48 +8265,44 @@ class BetSlipCardFormatter:
         d_net_r = sum(BankrollStakeSizer.get_item_r_profit(i) for i in singles)
 
         lines = [
-            f"🎯 TODAY'S OFFICIAL 1R SINGLES SLATE ({active_date})",
-            f"💵 Single Unit: 1.00R = ${r_usd:.0f} (Change via `/setunit 100`) | Official Risk: {len(singles)}.00R (${len(singles) * r_usd:.0f})",
-            "────────────────────────"
+            f"🎯 @FOOTYBETT DAILY SLATE ({active_date})",
+            f"💵 Unit Stake: ${r_usd:.0f} per Single ({len(singles)} Posted Today)",
+            "────────────────────"
         ]
 
         if singles:
             for idx, s in enumerate(singles, 1):
                 st_icon = "✅ WON" if "WON" in s.settlement else ("❌ LOST" if "LOST" in s.settlement else ("➖ REFUND" if "PUSH" in s.settlement else "🟢 OPEN"))
-                sc = f" | {s.score_str}" if s.score_str != "-" else ""
-                ko = f" [{s.kickoff_str}]" if s.kickoff_str else ""
-                rew_r = s.odds - 1.0
+                sc = f" • {s.score_str.split('(')[0].strip()}" if s.score_str and s.score_str != "-" else ""
+                ko = f" ({s.kickoff_str.split('(')[0].strip()})" if s.kickoff_str else ""
+                prof = (s.odds - 1.0) * r_usd
                 lines.append(f"{idx}. [{st_icon}{sc}] {s.team_home} vs {s.team_away}{ko}")
-                lines.append(f"   🎯 {s.selection} @ {s.odds:.2f} | 🔥 {s.confidence_stars}")
-                lines.append(f"   💵 Risk 1.00R (${r_usd:.0f}) ➔ Reward +{rew_r:.2f}R (+${rew_r * r_usd:.2f})")
+                lines.append(f"   🎯 {s.selection} (@ {s.odds:.2f} ➔ +${prof:.2f})")
                 if s.alt_bcgame_line:
-                    lines.append(f"   🛡️ Safe Alt: {s.alt_bcgame_line}")
-                if getattr(s, "won_via_safe_alt", False) and getattr(s, "settled_note", ""):
-                    lines.append(f"   ✅ Credited: {s.settled_note}")
+                    lines.append(f"   🛡️ Safe Alt: {s.alt_bcgame_line.split('➔')[0].strip() if '(' in s.alt_bcgame_line else s.alt_bcgame_line}")
         else:
-            lines.append("• Waiting for 15:00 Local pre-match tipster & odds verification window.")
+            lines.append("• Next slate publishes at 15:00 Local after live BC.Game odds & sharp verification.")
 
         if safe_combos:
             c = safe_combos[0]
-            st_icon = "✅ W" if "WON" in c.settlement else ("❌ L" if "LOST" in c.settlement else "🎟️ OPEN")
+            st_icon = "✅ WON" if "WON" in c.settlement else ("❌ LOST" if "LOST" in c.settlement else "🎟️ OPEN")
             lines.append("")
-            lines.append(f"🎟️ OPTIONAL 2-LEG SAFE COMBO [{st_icon} • Excluded from Singles W-L] — Odds: {c.odds:.2f}:")
-            for lg in (c.combo_legs or []):
-                lines.append(f"   • {lg['home']} vs {lg['away']} ➔ {lg['selection']} (@ {lg['odds']:.2f})")
+            lines.append(f"🎟️ 2-Leg Safe Combo [{st_icon}] — @ {c.odds:.2f}")
 
         if lotto_combos:
             lc = lotto_combos[0]
-            st_icon = "🎉 W" if "WON" in lc.settlement else ("❌ L" if "LOST" in lc.settlement else "🚀 OPEN")
-            lines.append("")
-            lines.append(f"🚀 OPTIONAL $5 LOTTO [{st_icon} • Excluded from Singles W-L] — {lc.odds:.2f}x ({len(lc.combo_legs or [])} Legs)")
+            st_icon = "🎉 WON" if "WON" in lc.settlement else ("❌ LOST" if "LOST" in lc.settlement else "🚀 OPEN")
+            lines.append(f"🚀 $5 Lotto [{st_icon}] — {lc.odds:.2f}x ({len(lc.combo_legs or [])} Legs)")
 
+        d_dlr = d_net_r * r_usd
+        d_dlr_s = f"+${d_dlr:.2f}" if d_dlr >= 0 else f"-${abs(d_dlr):.2f}"
+        tot_dlr = net_all_r * r_usd
+        tot_dlr_s = f"+${tot_dlr:.2f}" if tot_dlr >= 0 else f"-${abs(tot_dlr):.2f}"
         lines.extend([
-            "",
-            f"📊 OFFICIAL SINGLES RECORD (Since {TRACKING_START_DATE} • Combos & Lotto Excluded)",
-            "────────────────────────",
-            f"• Today Singles : {d_won}W - {d_lost}L ({d_open} Open) | {d_net_r:+.2f}R (${d_net_r * r_usd:+.2f})",
-            f"• Total Singles : {won_all}W - {lost_all}L ({wr_all:.1f}%) | {net_all_r:+.2f}R (${net_all_r * r_usd:+.2f})",
-            "• Desk          : Senior Football Analysis • Sustainable 1.62+ Value Singles"
+            "────────────────────",
+            f"📊 Today : {d_won}W" + (f"-{d_push}R" if d_push else "") + f"-{d_lost}L ({d_open} Open) | {d_dlr_s}",
+            f"📈 Total : {won_all}W-{lost_all}L ({wr_all:.1f}%) | {tot_dlr_s}",
+            "💡 Use Menu ➔ /pnl for full scraped ROI or /fix to edit channel posts."
         ])
         return "\n".join(lines)
 
@@ -8330,8 +8395,8 @@ class InstantCustomBetAuditor:
         fixtures.extend(LiveSportsbookAndStatsAPI.fetch_mens_fixtures_with_odds(shift_date_str(active_date, 1)))
 
         out_blocks = [
-            f"📋 SENIOR MATCH ANALYST BET REVIEW ({source_label})",
-            "═════════════════════════════════════════"
+            "📋 BET SLIP REVIEW",
+            "────────────────────"
         ]
 
         for t1, t2, ctx_snippet in pairs:
@@ -8388,31 +8453,30 @@ class InstantCustomBetAuditor:
             votes_line = ExpertConsensusHub.format_ballot_summary_for_audit(ballot_aud, h_bc_aud, a_bc_aud)
             direct_u_aud = BCGameDirectLinkResolver.resolve_match_url(h_bc_aud, a_bc_aud, lg_name, allow_network=True)
 
+            lg_short_aud = (lg_name or "").split(" - ")[-1].strip()
+            human_hint = HUMAN_MARKET_NAMES.get(user_mkt_hint or "", user_mkt_hint or "")
             if best_single:
                 rec_mkt_key = SelfLearningEngine.classify_strategy_key(best_single)
                 if user_mkt_hint and user_mkt_hint == rec_mkt_key:
-                    verdict_line = "✅ VERDICT: APPROVED — Your pick matches our Majority Analyst Consensus!"
+                    verdict_line = f"✅ Verdict  : TAKE IT — {human_hint} aligns with form & analyst consensus."
                 elif user_mkt_hint:
-                    verdict_line = f"⚠️ VERDICT: CAUTION — `{user_mkt_hint}` faces split/opposing analyst views; stronger majority play below:"
+                    verdict_line = f"⚠️ Verdict  : SKIP {human_hint} — Better value angle below:"
                 else:
-                    verdict_line = "🎯 VERDICT: #1 Majority-Consensus BC.Game Play:"
+                    verdict_line = "🎯 Top Play :"
 
                 out_blocks.extend([
-                    f"⚽ {copy_tag(h_bc_aud)} vs {copy_tag(a_bc_aud)} ({lg_name})",
+                    f"⚽ {copy_tag(h_bc_aud)} vs {copy_tag(a_bc_aud)} ({lg_short_aud})",
                     f"{verdict_line}",
-                    f"🗳️ Expert Split: {votes_line}",
-                    f"📍 Best Single : {best_single.selection}  |  Odds: {best_single.odds:.2f}",
-                    f"🔗 Direct Bet  : {bc_link_tag(direct_u_aud, f'Open {h_bc_aud} vs {a_bc_aud} on BC.Game ↗')}",
-                    f"🎟️ Safe Cushion: {best_combo_leg['selection']} (@ {best_combo_leg['odds']:.2f})" if best_combo_leg else "",
-                    f"📊 Match Read  : {best_single.rationale}",
-                    "─────────────────────────────────────────"
+                    f"🎯 Best Pick: {best_single.selection} (@ {best_single.odds:.2f}) {bc_link_tag(direct_u_aud, '[Open ↗]')}",
+                    f"🛡️ Safe Alt : {best_combo_leg['selection']} (@ {best_combo_leg['odds']:.2f})" if best_combo_leg else "",
+                    f"📊 Why      : {clean_human_rationale(best_single.rationale)}",
+                    "────────────────────"
                 ])
             else:
                 out_blocks.extend([
-                    f"⚽ {copy_tag(h_bc_aud)} vs {copy_tag(a_bc_aud)} ({lg_name})",
-                    f"🗳️ Expert Split: {votes_line}",
-                    "⚠️ VERDICT: NO MAJORITY EDGE — Analysts & match stats are split or odds are below 1.62; recommended to SKIP.",
-                    "─────────────────────────────────────────"
+                    f"⚽ {copy_tag(h_bc_aud)} vs {copy_tag(a_bc_aud)} ({lg_short_aud})",
+                    f"⛔ Verdict  : SKIP — Split analyst read or price below value ({MIN_SINGLE_ODDS:.2f}+ required).",
+                    "────────────────────"
                 ])
 
         return "\n".join(ln for ln in out_blocks if ln)
@@ -8431,13 +8495,13 @@ class BetSlipImageOCRAndVisionAnalyzer:
     def download_telegram_photo_bytes(cls, bot_token: str, file_id: str) -> Optional[bytes]:
         try:
             info_url = f"https://api.telegram.org/bot{bot_token}/getFile?file_id={file_id}"
-            with _pooled_urlopen(info_url, timeout=8) as resp:
+            with urllib.request.urlopen(info_url, timeout=8) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 file_path = data.get("result", {}).get("file_path")
                 if not file_path:
                     return None
             dl_url = f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
-            with _pooled_urlopen(dl_url, timeout=12) as resp:
+            with urllib.request.urlopen(dl_url, timeout=12) as resp:
                 return resp.read()
         except Exception as e:
             logger.error("Failed to download Telegram photo: %s", e)
@@ -8465,7 +8529,7 @@ class BetSlipImageOCRAndVisionAnalyzer:
                 req = urllib.request.Request(
                     g_url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}
                 )
-                with _pooled_urlopen(req, timeout=12) as resp:
+                with urllib.request.urlopen(req, timeout=12) as resp:
                     res_json = json.loads(resp.read().decode("utf-8"))
                     txt = res_json["candidates"][0]["content"]["parts"][0]["text"]
                     if txt and len(txt.strip()) >= 5:
@@ -8501,7 +8565,7 @@ class BetSlipImageOCRAndVisionAnalyzer:
                 data=form_data,
                 headers={"User-Agent": "Mozilla/5.0"}
             )
-            with _pooled_urlopen(req, timeout=12) as resp:
+            with urllib.request.urlopen(req, timeout=12) as resp:
                 ocr_json = json.loads(resp.read().decode("utf-8"))
                 parsed_results = ocr_json.get("ParsedResults", [])
                 if parsed_results:
@@ -8575,7 +8639,7 @@ class ChannelHistoryCleaner:
                 url += f"?_={int(time.time())}"
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             try:
-                with _pooled_urlopen(req, timeout=8) as resp:
+                with urllib.request.urlopen(req, timeout=8) as resp:
                     page_html = resp.read().decode("utf-8", errors="ignore")
             except Exception:
                 break
@@ -9391,8 +9455,9 @@ class PersonalStrategyBacktestAuditor:
             for p, lbl in [("weekly", "📆 Weekly"), ("all", "📋 All 3")]
         ]
         audit_row = [
-            {"text": "📜 Match-by-Match Scraped Log", "callback_data": f"pnl:log:{mode}:{period}:1"},
-            {"text": "🔄 Re-Scrape Live", "callback_data": f"pnl:rescrape:{mode}:{period}"},
+            {"text": "📜 Match Log", "callback_data": f"pnl:log:{mode}:{period}:1"},
+            {"text": "🔬 Market & Odds ROI", "callback_data": f"pnl:leaks:{mode}:{period}"},
+            {"text": "🔄 Re-Scrape", "callback_data": f"pnl:rescrape:{mode}:{period}"},
         ]
         return {"inline_keyboard": [period_btns_1, period_btns_2, other_modes, audit_row]}
 
@@ -9764,7 +9829,7 @@ class PersonalStrategyBacktestAuditor:
         for idx_u, u in enumerate(urls):
             try:
                 req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
-                with _pooled_urlopen(req, timeout=6 if idx_u == 0 else 3.5) as resp:
+                with urllib.request.urlopen(req, timeout=6 if idx_u == 0 else 3.5) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                     for ev in data.get("events", []):
                         ev_id = str(ev.get("id") or "")
@@ -9792,7 +9857,7 @@ class PersonalStrategyBacktestAuditor:
         url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/all/summary?event={event_id}"
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with _pooled_urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
 
                 # 1. Real FT Corners from boxscore
@@ -9867,7 +9932,7 @@ class PersonalStrategyBacktestAuditor:
         url = f"https://www.thesportsdb.com/api/v1/json/3/eventsday.php?d={date_str}&s=Soccer"
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with _pooled_urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 for ev in (data.get("events") or []):
                     st = str(ev.get("strStatus") or "").upper()
@@ -10480,6 +10545,95 @@ class PersonalStrategyBacktestAuditor:
         return "\n".join(lines), cls.build_log_pagination_keyboard(mode, period, cur_p, total_pages)
 
     @classmethod
+    def build_market_and_odds_breakdown(cls, mode: str, period: str) -> Tuple[str, Dict[str, Any]]:
+        """Breaks down real scraped `@Footybett` ROI by Market Type AND Odds Band (`<1.68`, `1.68-1.84`, `1.85+`)."""
+        stake_usd = BankrollStakeSizer.get_unit_usd()
+        records, _ = cls.scrape_real_footybett_channel_singles(force_refresh=False)
+        settled = cls._filter_records_for_period(records, period)
+        strat = "safe" if mode == "safe" else "main"
+        strat_lbl = "🛡️ SAFE ALTERNATIVES" if strat == "safe" else "🎯 MAIN BETS"
+
+        by_mkt: Dict[str, List[Dict[str, Any]]] = {}
+        by_band: Dict[str, List[Dict[str, Any]]] = {
+            "1️⃣ Low Odds (< 1.68)" if strat == "main" else "1️⃣ Heavy Juice (< 1.34)": [],
+            "2️⃣ Core Sweet Spot (1.68 – 1.84)" if strat == "main" else "2️⃣ Core Cushion (1.34 – 1.44)": [],
+            "3️⃣ High Value (1.85+)" if strat == "main" else "3️⃣ Plus Cushion (1.45+)": [],
+        }
+
+        for r in settled:
+            ev = cls.evaluate_record_strategy(r, strat, stake_usd)
+            if not ev:
+                continue
+            sel_l = ev["selection"].lower()
+            if "corner" in sel_l:
+                m_lbl = "Corners O/U"
+            elif "draw no bet" in sel_l:
+                m_lbl = "Draw No Bet (DNB)"
+            elif "double chance" in sel_l or "(1x)" in sel_l or "(x2)" in sel_l:
+                m_lbl = "Double Chance (1X/X2)"
+            elif "handicap" in sel_l:
+                m_lbl = "Handicap (-1.0)" if ("(-1.0)" in sel_l or "(-1)" in sel_l) else "Handicap (-1.5 / Other)"
+            elif "both teams" in sel_l or "btts" in sel_l:
+                m_lbl = "BTTS: Yes"
+            elif "over 2.0" in sel_l or "under 3.0" in sel_l:
+                m_lbl = "Asian Total (O2.0 / U3.0)"
+            elif "over " in sel_l or "under " in sel_l:
+                m_lbl = "Goal Totals (O2.5 / O1.5)"
+            else:
+                m_lbl = "1x2 Match Winner"
+            by_mkt.setdefault(m_lbl, []).append(r)
+
+            od = ev["odds"]
+            keys_b = list(by_band.keys())
+            if strat == "main":
+                b_k = keys_b[0] if od < 1.68 else (keys_b[1] if od < 1.85 else keys_b[2])
+            else:
+                b_k = keys_b[0] if od < 1.34 else (keys_b[1] if od < 1.45 else keys_b[2])
+            by_band[b_k].append(r)
+
+        lines = [
+            f"🔬 REAL ROI BY MARKET & ODDS BAND — {strat_lbl}",
+            f"💵 Stake: ${stake_usd:.0f}/bet • {len(settled)} Settled Singles",
+            "════════════════════════",
+            "📌 BY MARKET TYPE (Sorted by Profit):",
+        ]
+        mkt_rows = []
+        for m_k, m_list in by_mkt.items():
+            st_m = cls.summarize_records(m_list, strat, stake_usd)
+            mkt_rows.append((st_m["net_usd"], m_k, st_m))
+        mkt_rows.sort(key=lambda x: x[0], reverse=True)
+        for _, m_k, st_m in mkt_rows:
+            lines.append(
+                f"• {m_k}: {st_m['won']}W-{st_m['push']}R-{st_m['lost']}L ({st_m['wr_pct']:.0f}% WR) ➔ "
+                f"{cls._fmt_dlr(st_m['net_usd'])} ({st_m['roi_pct']:+.1f}% ROI)"
+            )
+
+        lines.append("────────────────────────")
+        lines.append("🎯 BY ODDS BAND:")
+        for b_k, b_list in by_band.items():
+            if not b_list:
+                continue
+            st_b = cls.summarize_records(b_list, strat, stake_usd)
+            lines.append(
+                f"• {b_k}: {st_b['won']}W-{st_b['push']}R-{st_b['lost']}L ({st_b['wr_pct']:.0f}% WR | Avg @{st_b['avg_odds']:.2f})\n"
+                f"   💵 Net: {cls._fmt_dlr(st_b['net_usd'])} (Real ROI: {st_b['roi_pct']:+.2f}%)"
+            )
+
+        kb = {
+            "inline_keyboard": [
+                [
+                    {"text": "🎯 Main Breakdown", "callback_data": f"pnl:leaks:main:{period}"},
+                    {"text": "🛡️ Safe Alt Breakdown", "callback_data": f"pnl:leaks:safe:{period}"},
+                ],
+                [
+                    {"text": "📊 Back to ROI Summary", "callback_data": f"pnl:run:{mode}:{period}"},
+                    {"text": "📜 Match Log", "callback_data": f"pnl:log:{mode}:{period}:1"},
+                ],
+            ]
+        }
+        return "\n".join(lines), kb
+
+    @classmethod
     def handle_text_interaction(cls, user_id: int, text: str) -> Tuple[str, Dict[str, Any]]:
         uid = int(user_id or 0)
         low = (text or "").strip().lower()
@@ -10526,6 +10680,10 @@ class PersonalStrategyBacktestAuditor:
             period = parts[3] if parts[3] in cls.PERIOD_LABELS else "all"
             cls._sessions[uid] = {"step": "done", "mode": mode, "ts": time.time()}
             return cls.build_pnl_report(mode, period, force_refresh=True), cls.build_report_switcher_keyboard(mode, period)
+        if len(parts) >= 4 and parts[1] == "leaks":
+            mode = parts[2] if parts[2] in cls.MODE_LABELS else "main"
+            period = parts[3] if parts[3] in cls.PERIOD_LABELS else "start"
+            return cls.build_market_and_odds_breakdown(mode, period)
         if len(parts) >= 5 and parts[1] == "log":
             mode = parts[2] if parts[2] in cls.MODE_LABELS else "both"
             period = parts[3] if parts[3] in cls.PERIOD_LABELS else "all"
@@ -10550,6 +10708,8 @@ class TelegramBotClient:
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
         self.channel_publish_lock = threading.Lock()
         self._admin_cache: Dict[int, Tuple[bool, float]] = {}
+        self._photo_batch_lock = threading.Lock()
+        self._pending_photo_batches: Dict[int, Dict[str, Any]] = {}
         DailyLedgerManager.load_all_history_items()
         SelfLearningEngine.recalibrate_from_ledger()
 
@@ -10580,7 +10740,7 @@ class TelegramBotClient:
         for attempt in range(4):
             req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
             try:
-                with _pooled_urlopen(req, timeout=timeout) as resp:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
                     body = json.loads(resp.read().decode("utf-8"))
                     if body.get("ok"):
                         return True, body, "ok"
@@ -10706,8 +10866,8 @@ class TelegramBotClient:
         elif isinstance(chat_id, int) and chat_id > 0:
             if custom_reply_markup is not None:
                 payload_data["reply_markup"] = custom_reply_markup
-            else:
-                payload_data["reply_markup"] = self.PERSONAL_DM_KEYBOARD
+            elif remove_kb:
+                payload_data["reply_markup"] = self.REMOVE_BOTTOM_KEYBOARD
         if reply_to_message_id and int(reply_to_message_id) > 0:
             payload_data["reply_parameters"] = {
                 "message_id": int(reply_to_message_id),
@@ -11295,7 +11455,8 @@ class TelegramBotClient:
                 if it.date_str == active_date and it.is_approved and not it.published_to_channel and it.settlement == "PENDING" and it.match_status != "FT"
             ]
             lotto_lock_key = f"daily_lotto_locked_v32:{active_date}"
-            if len(today_pending) >= 2 and not DailyLedgerManager.is_locked_in_channel(batch_lock_key):
+            today_pending_singles = [x for x in today_pending if not x[1].is_combo and not x[1].is_lotto_combo]
+            if len(today_pending_singles) >= 1 and not DailyLedgerManager.is_locked_in_channel(batch_lock_key):
                 DailyLedgerManager.mark_locked_in_channel(batch_lock_key)
                 single_idx = 0
                 for fk, it in today_pending:
@@ -11431,7 +11592,7 @@ class TelegramBotClient:
                 if not day_picks:
                     continue
                 settled_day = [i for i in day_picks if i.settlement in ["WON ✅", "LOST ❌", "PUSH ➖"]]
-                if len(settled_day) == len(day_picks) and len(settled_day) >= 2:
+                if len(settled_day) == len(day_picks) and len(settled_day) >= 1:
                     recap_card = BetSlipCardFormatter.format_end_of_day_channel_recap(check_d)
                     eod_lock_key = f"eod_recap_v31:{check_d}"
                     recap_hash = hashlib.md5(recap_card.encode("utf-8")).hexdigest()[:8]
@@ -11461,7 +11622,7 @@ class TelegramBotClient:
             url += f"&offset={offset}"
         try:
             req = urllib.request.Request(url)
-            with _pooled_urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 return data.get("result", [])
         except Exception as e:
@@ -11471,16 +11632,16 @@ class TelegramBotClient:
     def background_worker_loop(self):
         logger.info("Footybett v37.0 Weighted Sharp-Consensus & Auto-Cleaner & Deep Match-Autopsy Worker started...")
         time.sleep(3)
-        if not DailyLedgerManager.is_locked_in_channel("personal_pnl_btn_v42_ready"):
+        if not DailyLedgerManager.is_locked_in_channel("clean_bottom_kb_v44_done"):
             try:
                 for sub_cid in list(load_json_set(SUBSCRIBERS_FILE)):
                     if isinstance(sub_cid, int) and sub_cid > 0 and self.is_channel_admin(sub_cid):
                         self.send_message(
                             sub_cid,
-                            "✅ Personal ⟦CODE⟧📊 Main vs Safe Alt Results⟦/CODE⟧ button is now active at the bottom of your bot chat (private to you — never shown on @Footybett).\n"
-                            "Tap ⟦CODE⟧📊 Main vs Safe Alt Results⟦/CODE⟧ anytime and I'll ask which mode & timeframe you want!"
+                            "✅ Removed bottom buttons under the bar — use ⟦CODE⟧Menu ➔ /pnl⟦/CODE⟧ anytime for your live scraped Main vs Safe Alt ROI!",
+                            remove_kb=True
                         )
-                DailyLedgerManager.mark_locked_in_channel("personal_pnl_btn_v42_ready")
+                DailyLedgerManager.mark_locked_in_channel("clean_bottom_kb_v44_done")
             except Exception:
                 pass
         if not DailyLedgerManager.is_locked_in_channel("channel_clean_v41_3_auto_done"):
@@ -11510,17 +11671,11 @@ class TelegramBotClient:
             {"command": "setunit", "description": "💵 Set 1R Single Stake (e.g. /setunit 100)"},
             {"command": "poststats", "description": "📢 Post/Update End-of-Day Recap on @Footybett"}
         ]
-        url = f"{self.base_url}/setMyCommands"
-        req = urllib.request.Request(
-            url,
-            data=json.dumps({"commands": commands}).encode("utf-8"),
-            headers={"Content-Type": "application/json"}
-        )
-        try:
-            with _pooled_urlopen(req, timeout=6) as resp:
-                logger.info("Registered Telegram menu commands: %s", resp.status == 200)
-        except Exception as e:
-            logger.error("Failed to register menu commands: %s", e)
+        ok_c, _, desc_c = self._call_telegram_json("setMyCommands", {"commands": commands}, timeout=6)
+        if ok_c:
+            logger.info("Registered Telegram menu commands: True")
+        else:
+            logger.error("Failed to register menu commands: %s", desc_c)
 
     def run_polling_loop(self):
         self.set_official_menu_commands()
@@ -11580,20 +11735,53 @@ class TelegramBotClient:
                     subs.add(chat_id)
                     save_json_set(SUBSCRIBERS_FILE, subs)
 
-                # 1. Handle Bet Slip Image / Screenshot Uploads
+                # 1. Handle Bet Slip Image / Album Uploads (Debounced into ONE clean in-place reply — zero multi-message spam!)
                 if photos:
                     best_photo_id = photos[-1].get("file_id", "")
-                    def handle_photo_audit(cid, fid, cap_txt):
-                        self.send_message(cid, "🔎 Reading bet slip image & checking match form, tactical matchup & live BC.Game odds...")
-                        img_bytes = BetSlipImageOCRAndVisionAnalyzer.download_telegram_photo_bytes(self.bot_token, fid)
-                        ocr_text = BetSlipImageOCRAndVisionAnalyzer.extract_text_from_image_bytes(img_bytes or b"")
-                        combined_txt = f"{cap_txt}\n{ocr_text}".strip()
-                        report = InstantCustomBetAuditor.audit_user_bet_text(combined_txt, source_label="Bet Slip Image OCR")
-                        if ocr_text:
-                            preview = " | ".join(ln.strip() for ln in ocr_text.splitlines() if ln.strip())[:180]
-                            report = f"🖼 Extracted from Image: ⟦CODE⟧{preview}⟦/CODE⟧\n\n{report}"
-                        self.send_message(cid, report)
-                    threading.Thread(target=handle_photo_audit, args=[chat_id, best_photo_id, text], daemon=True).start()
+                    start_worker = False
+                    with self._photo_batch_lock:
+                        batch = self._pending_photo_batches.get(chat_id)
+                        if not batch:
+                            batch = {"file_ids": [], "captions": [], "last_ts": time.time()}
+                            self._pending_photo_batches[chat_id] = batch
+                            start_worker = True
+                        if best_photo_id and best_photo_id not in batch["file_ids"]:
+                            batch["file_ids"].append(best_photo_id)
+                        if text:
+                            batch["captions"].append(text)
+                        batch["last_ts"] = time.time()
+
+                    if start_worker:
+                        def handle_photo_album_audit(cid):
+                            # Wait briefly to collect all images in a Telegram photo album (`media_group_id`)
+                            while True:
+                                time.sleep(0.6)
+                                with self._photo_batch_lock:
+                                    b_cur = self._pending_photo_batches.get(cid)
+                                    if not b_cur or (time.time() - b_cur["last_ts"]) >= 1.3:
+                                        final_batch = self._pending_photo_batches.pop(cid, None)
+                                        break
+                            if not final_batch:
+                                return
+                            fids = final_batch["file_ids"][:8]
+                            status_mid = self.send_message(
+                                cid,
+                                f"🔎 Reviewing {len(fids)} bet slip screenshot{'s' if len(fids) > 1 else ''}..."
+                            )
+                            ocr_chunks: List[str] = list(final_batch["captions"])
+                            for fid in fids:
+                                img_bytes = BetSlipImageOCRAndVisionAnalyzer.download_telegram_photo_bytes(self.bot_token, fid)
+                                ocr_t = BetSlipImageOCRAndVisionAnalyzer.extract_text_from_image_bytes(img_bytes or b"")
+                                if ocr_t:
+                                    ocr_chunks.append(ocr_t)
+                            combined_txt = "\n".join(ocr_chunks).strip()
+                            report = InstantCustomBetAuditor.audit_user_bet_text(combined_txt, source_label="Slip Review")
+                            if status_mid and status_mid > 1 and isinstance(cid, int) and cid > 0:
+                                if not self.edit_dm_message(cid, status_mid, report):
+                                    self.send_message(cid, report)
+                            else:
+                                self.send_message(cid, report)
+                        threading.Thread(target=handle_photo_album_audit, args=[chat_id], daemon=True).start()
                     continue
 
                 low_t = text.lower()
@@ -11643,9 +11831,10 @@ class TelegramBotClient:
                 # 1b. Handle /clean (Full Channel Deduplication & History Upgrade)
                 if low_t in ["/clean", "/cleanchannel", "/fixhistory"]:
                     def handle_clean_cmd(cid):
-                        self.send_message(cid, "🧹 Scanning ⟦CODE⟧@Footybett⟦/CODE⟧ history, deleting duplicates, and upgrading all posts & live BC.Game links/odds to v39.1...")
+                        smid = self.send_message(cid, "🧹 Cleaning & syncing ⟦CODE⟧@Footybett⟦/CODE⟧...")
                         rep = self.clean_and_upgrade_channel_history(auto_startup=False)
-                        self.send_message(cid, rep)
+                        if not (smid and isinstance(cid, int) and cid > 0 and self.edit_dm_message(cid, smid, rep)):
+                            self.send_message(cid, rep)
                     threading.Thread(target=handle_clean_cmd, args=[chat_id], daemon=True).start()
                     continue
 
@@ -11705,21 +11894,20 @@ class TelegramBotClient:
                         val_u = BankrollStakeSizer.set_unit_usd(float(arg_u))
                         self.send_message(
                             chat_id,
-                            f"✅ Official 1.00R Single Risk Unit updated to ⟦CODE⟧${val_u:.0f}⟦/CODE⟧!\n"
-                            f"• Every Official Single = ⟦CODE⟧1.00R (${val_u:.0f} Risk)⟦/CODE⟧\n"
-                            f"• Reward = ⟦CODE⟧(Odds - 1.0) × 1R⟦/CODE⟧ (e.g. @ 1.68 = ⟦CODE⟧+0.68R / +${val_u * 0.68:.2f}⟦/CODE⟧)\n"
-                            f"• 2-Leg Safe Combo & $5 Lotto = Optional (W/L reported separately, excluded from Official Singles W-L)"
+                            f"✅ Official Single stake updated to ⟦CODE⟧${val_u:.0f}⟦/CODE⟧ per bet."
                         )
                     except Exception:
                         cur_u = BankrollStakeSizer.get_unit_usd()
-                        self.send_message(chat_id, f"💵 Current 1.00R = ⟦CODE⟧${cur_u:.0f}⟦/CODE⟧.\nTo change it, send e.g. ⟦CODE⟧/setunit 50⟦/CODE⟧ or ⟦CODE⟧/setunit 100⟦/CODE⟧.")
+                        self.send_message(chat_id, f"💵 Current stake: ⟦CODE⟧${cur_u:.0f}⟦/CODE⟧ per Single. Send e.g. ⟦CODE⟧/setunit 100⟦/CODE⟧ to change.")
                     continue
 
                 # 2c. Handle /sources (Live Multi-Portal Expert Consensus Status)
                 if low_t in ["/sources", "/sites", "/experts"]:
                     def handle_sources_cmd(cid):
-                        self.send_message(cid, "🌐 Refreshing all 32+ prediction websites, Substack feeds & stats APIs...")
-                        self.send_message(cid, ExpertConsensusHub.format_live_sources_report())
+                        smid = self.send_message(cid, "🌐 Checking live analyst feeds...")
+                        rep_s = ExpertConsensusHub.format_live_sources_report()
+                        if not (smid and isinstance(cid, int) and cid > 0 and self.edit_dm_message(cid, smid, rep_s)):
+                            self.send_message(cid, rep_s)
                     threading.Thread(target=handle_sources_cmd, args=[chat_id], daemon=True).start()
                     continue
 
